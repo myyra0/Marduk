@@ -5,16 +5,17 @@
 //! the catalog changes visibility, never payload paths.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[cfg(test)]
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 #[cfg(test)]
 use std::io::Write as _;
 
+#[cfg(test)]
 use marduk_archive::{M1_ZIP_LIMITS, admit_zip};
 use marduk_core::ids::{InstalledRevisionId, MemberId, ProfileId, ProfileRevision};
 #[cfg(test)]
@@ -24,20 +25,27 @@ use marduk_core::import::{
     ProfileEditError,
 };
 use marduk_core::profiles::{ProfileMember, ProfileSnapshot};
+#[cfg(test)]
 use marduk_core::root_identity::{NativeIdentity, RootIdentity};
+use marduk_core::targets::RelativePath;
 #[cfg(test)]
 use marduk_core::targets::{RootRole, TargetFile};
 use marduk_platform::{GateError, WriterGate, WriterGuard};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
 #[cfg(test)]
 mod contract_tests;
+#[cfg(test)]
+mod stage_tests;
 
 const CATALOG_FILE: &str = "catalog.sqlite3";
 const LOCK_FILE: &str = "library.lock";
 const REVISIONS_DIR: &str = "revisions";
+#[cfg(test)]
 const PAYLOAD_DIR: &str = "payload";
+#[cfg(test)]
 const ARCHIVE_FILE: &str = "archive.zip";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MIGRATION_VERSION: i64 = 1;
@@ -144,7 +152,13 @@ impl Catalog {
             return Err(ImportError::ImportNotPrepared);
         }
 
-        verify_stage(&self.connection, &self.root, &record)?;
+        let stage = StageRecord {
+            id,
+            archive_sha256: record.archive_sha256,
+            owner: record.owner.clone(),
+            files: stored_files(&self.connection, id)?,
+        };
+        self.stage.reobserve(&self.root, &stage)?;
 
         let revision = read_profile_revision(&self.connection, record.profile)?;
         if revision.get() != record.expected_revision.get() {
@@ -174,59 +188,107 @@ impl Catalog {
         let _guard = self.lock()?;
         let record = load_import(&self.connection, id)?;
         match record.state {
-            ImportState::Committed | ImportState::Discarded => {
-                return Err(ImportError::ImportNotPrepared);
-            }
-            ImportState::Writing | ImportState::Prepared => {}
+            ImportState::Committed => return Err(ImportError::ImportNotPrepared),
+            ImportState::Writing | ImportState::Prepared | ImportState::Discarded => {}
         }
 
-        // Tombstone first; reclamation below is best-effort and only removes
-        // bytes whose recorded ownership and digests still verify.
-        let changed = self
-            .connection
-            .execute(
-                "UPDATE imports SET state = 'discarded' \
-                 WHERE id = ?1 AND state IN ('writing', 'prepared')",
-                [sql_import_id(id)?],
-            )
-            .map_err(storage_error)?;
-        if changed != 1 {
-            return Err(ImportError::Storage);
+        // Without a stage adapter there is no ownership receipt, so nothing can
+        // be proven or removed; leave the row untouched.
+        if !self.stage.available() {
+            return Err(ImportError::StageUnavailable);
         }
 
-        if !is_published(&self.connection, id)? {
-            let files = stored_files(&self.connection, id)?;
-            if verify_stage(&self.connection, &self.root, &record).is_ok() {
-                reclaim_stage(&self.root, id, &files)?;
+        if record.state != ImportState::Discarded {
+            // Tombstone before any reclamation so an interruption is retryable.
+            let changed = self
+                .connection
+                .execute(
+                    "UPDATE imports SET state = 'discarded' \
+                     WHERE id = ?1 AND state IN ('writing', 'prepared')",
+                    [sql_import_id(id)?],
+                )
+                .map_err(storage_error)?;
+            if changed != 1 {
+                return Err(ImportError::Storage);
             }
         }
-        Ok(())
+
+        if is_published(&self.connection, id)? {
+            return Err(ImportError::ImportNotPrepared);
+        }
+
+        let stage = StageRecord {
+            id,
+            archive_sha256: record.archive_sha256,
+            owner: record.owner,
+            files: stored_files(&self.connection, id)?,
+        };
+        self.stage.reclaim(&self.root, &stage)
     }
 
-    /// Account for abandoned reservations and retain durable prepared stages.
+    /// Verify prepared stages and account for abandoned reservations.
     ///
-    /// A `Writing` row without a proven ownership receipt is left quarantined;
-    /// it is not pending and cannot publish. `Prepared` stages are returned in
-    /// ID order for explicit Apply or discard.
+    /// Only stages that the private adapter re-observes intact are returned as
+    /// pending. A changed or unavailable stage stays `prepared` in the catalog
+    /// but is not presented as intact. Owned `writing` reservations are
+    /// tombstoned before the adapter reclaims them; unowned ones remain
+    /// quarantined. Committed and prepared bytes are never reclaimed here.
     pub fn reconcile(&mut self) -> Result<Vec<ImportId>, ImportError> {
         let _guard = self.lock()?;
-        let rows = {
-            let mut statement = self
-                .connection
-                .prepare("SELECT id FROM imports WHERE state = 'prepared' ORDER BY id")
-                .map_err(storage_error)?;
-            let rows = statement
-                .query_map([], |row| row.get::<_, i64>(0))
-                .map_err(storage_error)?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(storage_error)?
-        };
 
-        let mut ids = Vec::with_capacity(rows.len());
-        for value in rows {
-            let value = u64::try_from(value).map_err(|_| ImportError::Storage)?;
-            ids.push(ImportId::try_from_u64(value)?);
+        let prepared = import_ids_in_state(&self.connection, "prepared")?;
+        let writing = import_ids_in_state(&self.connection, "writing")?;
+
+        for id in writing {
+            let record = load_import(&self.connection, id)?;
+            if record.owner.is_none() || record.archive_sha256.is_none() {
+                // No ownership receipt: quarantine rather than guess.
+                continue;
+            }
+            if !self.stage.available() {
+                continue;
+            }
+
+            let changed = self
+                .connection
+                .execute(
+                    "UPDATE imports SET state = 'discarded' \
+                     WHERE id = ?1 AND state = 'writing'",
+                    [sql_import_id(id)?],
+                )
+                .map_err(storage_error)?;
+            if changed != 1 {
+                continue;
+            }
+
+            let stage = StageRecord {
+                id,
+                archive_sha256: record.archive_sha256,
+                owner: record.owner,
+                files: stored_files(&self.connection, id)?,
+            };
+            match self.stage.reclaim(&self.root, &stage) {
+                Ok(()) | Err(ImportError::StageChanged) | Err(ImportError::StageUnavailable) => {}
+                Err(error) => return Err(error),
+            }
         }
-        Ok(ids)
+
+        let mut retained = Vec::with_capacity(prepared.len());
+        for id in prepared {
+            let record = load_import(&self.connection, id)?;
+            let stage = StageRecord {
+                id,
+                archive_sha256: record.archive_sha256,
+                owner: record.owner,
+                files: stored_files(&self.connection, id)?,
+            };
+            match self.stage.reobserve(&self.root, &stage) {
+                Ok(()) => retained.push(id),
+                Err(ImportError::StageChanged) | Err(ImportError::StageUnavailable) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(retained)
     }
 
     pub fn reorder(
@@ -447,6 +509,14 @@ impl Catalog {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+struct StageRecord {
+    id: ImportId,
+    archive_sha256: Option<[u8; 32]>,
+    owner: Option<Vec<u8>>,
+    files: Vec<StoredFile>,
+}
+
 /// Private stage seam. There is no public constructor or product feature that
 /// can substitute another adapter.
 enum StageAdapter {
@@ -455,12 +525,54 @@ enum StageAdapter {
     Fixture(FixtureStage),
 }
 
+impl StageAdapter {
+    fn available(&self) -> bool {
+        #[cfg(test)]
+        {
+            matches!(self, Self::Fixture(_))
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    fn reobserve(&mut self, root: &Path, stage: &StageRecord) -> Result<(), ImportError> {
+        #[cfg(not(test))]
+        let _ = (root, stage);
+        match self {
+            Self::Unavailable(adapter) => adapter.reobserve(),
+            #[cfg(test)]
+            Self::Fixture(adapter) => adapter.reobserve(root, stage),
+        }
+    }
+
+    fn reclaim(&mut self, root: &Path, stage: &StageRecord) -> Result<(), ImportError> {
+        #[cfg(not(test))]
+        let _ = (root, stage);
+        match self {
+            Self::Unavailable(adapter) => adapter.reclaim(),
+            #[cfg(test)]
+            Self::Fixture(adapter) => adapter.reclaim(root, stage),
+        }
+    }
+}
+
 /// Production seam. Native payload publication arrives in Task 5; until a
-/// qualified adapter exists every prepare attempt is refused rather than faked.
+/// qualified adapter exists every prepare attempt is refused rather than faked,
+/// and no persisted stage can be re-observed or reclaimed.
 struct UnavailableStage;
 
 impl UnavailableStage {
     fn prepare(&mut self) -> Result<PreparedImport, ImportError> {
+        Err(ImportError::StageUnavailable)
+    }
+
+    fn reobserve(&mut self) -> Result<(), ImportError> {
+        Err(ImportError::StageUnavailable)
+    }
+
+    fn reclaim(&mut self) -> Result<(), ImportError> {
         Err(ImportError::StageUnavailable)
     }
 }
@@ -544,6 +656,14 @@ impl FixtureStage {
             });
         }
 
+        // Flush every new payload parent up through the library root. Native
+        // directory durability on Windows remains Task 5.
+        sync_parent_chain(&directory.join(ARCHIVE_FILE), root)?;
+        for file in &payload_files {
+            let path = payload_file(&directory, file.target.relative.as_str());
+            sync_parent_chain(&path, root)?;
+        }
+
         let evidence = StageEvidence {
             allocation: ImportAllocation {
                 id,
@@ -580,6 +700,38 @@ impl FixtureStage {
             archive_sha256: evidence.archive_sha256,
             files: evidence.files.into_iter().map(|file| file.target).collect(),
         })
+    }
+
+    fn reobserve(&mut self, root: &Path, stage: &StageRecord) -> Result<(), ImportError> {
+        let (archive_sha256, _) = fixture_receipt(stage)?;
+        verify_files(
+            &revision_dir(root, stage.id),
+            archive_sha256,
+            &expected_files(&stage.files),
+        )
+    }
+
+    fn reclaim(&mut self, root: &Path, stage: &StageRecord) -> Result<(), ImportError> {
+        let directory = revision_dir(root, stage.id);
+        if !directory.exists() {
+            return Ok(());
+        }
+
+        let (archive_sha256, owner) = fixture_receipt(stage)?;
+        let expected_owner = encode_owner(&synthetic_owner(stage.id, archive_sha256));
+        if owner != expected_owner.as_slice() {
+            return Err(ImportError::StageChanged);
+        }
+
+        remove_file_if_present(&directory.join(ARCHIVE_FILE))?;
+        for file in &stage.files {
+            remove_file_if_present(&payload_file(&directory, file.path.as_str()))?;
+        }
+        prune_empty_directories(&directory)?;
+        if directory.exists() {
+            return Err(ImportError::StageChanged);
+        }
+        Ok(())
     }
 }
 
@@ -1118,8 +1270,9 @@ fn load_import(connection: &Connection, id: ImportId) -> Result<ImportRecord, Im
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 struct StoredFile {
-    path: String,
+    path: RelativePath,
     len: u64,
     sha: [u8; 32],
 }
@@ -1148,7 +1301,7 @@ fn stored_files(connection: &Connection, id: ImportId) -> Result<Vec<StoredFile>
     let mut files = Vec::with_capacity(rows.len());
     for (path, len, sha) in rows {
         files.push(StoredFile {
-            path,
+            path: RelativePath::parse(&path).map_err(|_| ImportError::Storage)?,
             len: nonnegative_value(len)?,
             sha: sha_from_blob(sha)?,
         });
@@ -1156,35 +1309,14 @@ fn stored_files(connection: &Connection, id: ImportId) -> Result<Vec<StoredFile>
     Ok(files)
 }
 
+#[cfg(test)]
 struct ExpectedFile {
     path: String,
     len: u64,
     sha: [u8; 32],
 }
 
-fn verify_stage(
-    connection: &Connection,
-    root: &Path,
-    record: &ImportRecord,
-) -> Result<(), ImportError> {
-    let archive_sha256 = record.archive_sha256.ok_or(ImportError::StageChanged)?;
-    let owner = record.owner.as_deref().ok_or(ImportError::StageChanged)?;
-    let expected_owner = encode_owner(&synthetic_owner(record.id, &archive_sha256));
-    if owner != expected_owner.as_slice() {
-        return Err(ImportError::StageChanged);
-    }
-
-    let expected = stored_files(connection, record.id)?
-        .into_iter()
-        .map(|file| ExpectedFile {
-            path: file.path,
-            len: file.len,
-            sha: file.sha,
-        })
-        .collect::<Vec<_>>();
-    verify_files(&revision_dir(root, record.id), &archive_sha256, &expected)
-}
-
+#[cfg(test)]
 fn verify_files(
     directory: &Path,
     archive_sha256: &[u8; 32],
@@ -1239,6 +1371,7 @@ fn verify_files(
     Ok(())
 }
 
+#[cfg(test)]
 fn collect_payload_files(
     root: &Path,
     prefix: &str,
@@ -1269,6 +1402,7 @@ fn collect_payload_files(
     Ok(())
 }
 
+#[cfg(test)]
 fn hash_file(path: &Path) -> std::io::Result<([u8; 32], u64)> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
@@ -1300,19 +1434,47 @@ fn is_published(connection: &Connection, id: ImportId) -> Result<bool, ImportErr
     Ok(found.is_some())
 }
 
-fn reclaim_stage(root: &Path, id: ImportId, files: &[StoredFile]) -> Result<(), ImportError> {
-    let directory = revision_dir(root, id);
-    remove_if_present(&directory.join(ARCHIVE_FILE))?;
-    for file in files {
-        remove_if_present(&payload_file(&directory, &file.path))?;
-    }
+fn import_ids_in_state(connection: &Connection, state: &str) -> Result<Vec<ImportId>, ImportError> {
+    let rows = {
+        let mut statement = connection
+            .prepare("SELECT id FROM imports WHERE state = ?1 ORDER BY id")
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([state], |row| row.get::<_, i64>(0))
+            .map_err(storage_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(storage_error)?
+    };
 
-    let payload_root = directory.join(PAYLOAD_DIR);
-    remove_directory_if_empty(&payload_root)?;
-    remove_directory_if_empty(&directory)
+    let mut ids = Vec::with_capacity(rows.len());
+    for value in rows {
+        let value = u64::try_from(value).map_err(|_| ImportError::Storage)?;
+        ids.push(ImportId::try_from_u64(value)?);
+    }
+    Ok(ids)
 }
 
-fn remove_if_present(path: &Path) -> Result<(), ImportError> {
+#[cfg(test)]
+fn fixture_receipt(stage: &StageRecord) -> Result<(&[u8; 32], &[u8]), ImportError> {
+    match (stage.archive_sha256.as_ref(), stage.owner.as_deref()) {
+        (Some(archive_sha256), Some(owner)) => Ok((archive_sha256, owner)),
+        _ => Err(ImportError::StageChanged),
+    }
+}
+
+#[cfg(test)]
+fn expected_files(files: &[StoredFile]) -> Vec<ExpectedFile> {
+    files
+        .iter()
+        .map(|file| ExpectedFile {
+            path: file.path.as_str().to_owned(),
+            len: file.len,
+            sha: file.sha,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn remove_file_if_present(path: &Path) -> Result<(), ImportError> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1320,19 +1482,57 @@ fn remove_if_present(path: &Path) -> Result<(), ImportError> {
     }
 }
 
-fn remove_directory_if_empty(path: &Path) -> Result<(), ImportError> {
-    match fs::remove_dir(path) {
-        Ok(()) => Ok(()),
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
-            ) =>
-        {
-            Ok(())
+#[cfg(test)]
+fn prune_empty_directories(directory: &Path) -> Result<(), ImportError> {
+    prune_empty_children(directory)?;
+    // Best effort: a non-empty directory is reported by the caller.
+    let _ = fs::remove_dir(directory);
+    Ok(())
+}
+
+#[cfg(test)]
+fn prune_empty_children(directory: &Path) -> Result<(), ImportError> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(ImportError::Storage),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|_| ImportError::Storage)?;
+        let kind = entry.file_type().map_err(|_| ImportError::Storage)?;
+        if kind.is_dir() {
+            prune_empty_children(&entry.path())?;
+            let _ = fs::remove_dir(entry.path());
         }
-        Err(_) => Err(ImportError::Storage),
     }
+    Ok(())
+}
+
+#[cfg(test)]
+fn sync_parent_chain(path: &Path, root: &Path) -> Result<(), ImportError> {
+    let mut current = path.parent();
+    while let Some(directory) = current {
+        sync_directory(directory)?;
+        if directory == root {
+            break;
+        }
+        current = directory.parent();
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+fn sync_directory(directory: &Path) -> Result<(), ImportError> {
+    File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(|_| ImportError::Storage)
+}
+
+#[cfg(all(test, not(unix)))]
+fn sync_directory(_directory: &Path) -> Result<(), ImportError> {
+    // Windows does not expose directory handles through std; best-effort only.
+    // Native namespace durability is a Task 5 qualification, not claimed here.
+    Ok(())
 }
 
 fn validate_permutation(members: &[MemberRow], order: &[MemberId]) -> Result<(), ProfileEditError> {
@@ -1402,10 +1602,12 @@ fn read_member_rows(
     Ok(members)
 }
 
+#[cfg(test)]
 fn revision_dir(root: &Path, id: ImportId) -> PathBuf {
     root.join(REVISIONS_DIR).join(id.get().to_string())
 }
 
+#[cfg(test)]
 fn payload_file(revision_directory: &Path, relative: &str) -> PathBuf {
     let mut path = revision_directory.join(PAYLOAD_DIR);
     for component in relative.split('/') {
@@ -1414,6 +1616,7 @@ fn payload_file(revision_directory: &Path, relative: &str) -> PathBuf {
     path
 }
 
+#[cfg(test)]
 fn synthetic_owner(id: ImportId, archive_sha256: &[u8; 32]) -> RootIdentity {
     let mut fs_id = [0u8; 16];
     fs_id.copy_from_slice(&archive_sha256[..16]);
@@ -1441,6 +1644,7 @@ fn synthetic_owner(id: ImportId, archive_sha256: &[u8; 32]) -> RootIdentity {
     }
 }
 
+#[cfg(test)]
 fn encode_owner(owner: &RootIdentity) -> Vec<u8> {
     let mut encoded = vec![1u8];
     match owner.evidence() {
