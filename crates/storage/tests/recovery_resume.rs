@@ -128,6 +128,7 @@ struct MemEffects {
     mutations: usize,
     root_gate: Rc<Cell<bool>>,
     unreadable_retains: BTreeSet<BackupRef>,
+    unreadable_target: bool,
 }
 
 impl MemEffects {
@@ -154,6 +155,7 @@ impl MemEffects {
             mutations: 0,
             root_gate: Rc::default(),
             unreadable_retains: BTreeSet::new(),
+            unreadable_target: false,
         }
     }
 
@@ -190,6 +192,13 @@ impl MemEffects {
 
     fn inspect(&mut self, step: &PreparedStep) -> Evidence {
         self.remember(step.clone());
+        if self.unreadable_target {
+            return Evidence {
+                target: Observation::Unavailable(RootError::TargetUnavailable),
+                stage: Artifact::Unavailable,
+                retained: Artifact::Unavailable,
+            };
+        }
         Evidence {
             target: self.observe_file(step.spec.target.target.relative.as_str()),
             stage: self.artifact(self.staged.get(

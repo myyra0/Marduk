@@ -139,6 +139,8 @@ struct Effects {
     retain_reads: BTreeMap<u32, usize>,
     unreadable_retain_after: Option<(u32, usize)>,
     unreadable_retains: BTreeSet<BackupRef>,
+    target_reads: BTreeMap<String, usize>,
+    unreadable_target_after: Option<(&'static str, usize)>,
 }
 
 impl Effects {
@@ -175,6 +177,8 @@ impl Effects {
             retain_reads: BTreeMap::new(),
             unreadable_retain_after: None,
             unreadable_retains: BTreeSet::new(),
+            target_reads: BTreeMap::new(),
+            unreadable_target_after: None,
         }
     }
 
@@ -374,6 +378,15 @@ impl CopyEffects for Effects {
     fn observe(&mut self, target: &BoundTarget) -> Observation {
         if let Err(error) = self.check_target(target) {
             return Observation::Unavailable(error);
+        }
+        let path = target.target.relative.as_str();
+        let reads = self.target_reads.entry(path.to_owned()).or_insert(0);
+        *reads += 1;
+        if self
+            .unreadable_target_after
+            .is_some_and(|(at, after)| at == path && *reads >= after)
+        {
+            return Observation::Unavailable(RootError::TargetUnavailable);
         }
         self.reads += 1;
         self.visible
@@ -1528,6 +1541,46 @@ fn unreadable_canonical_retain_during_recovery_runs_no_effect() {
     f.mutations(&[]);
     f.files(None, BASE);
     f.root_state(Some(op), None);
+}
+
+#[test]
+fn unreadable_target_after_preflight_is_not_a_displacement() {
+    let mut f = Fixture::new(WINNER);
+    let plan = f.plan();
+    // Preview and the commit preflight each observe the winner; the sealed
+    // validation read then finds the whole namespace unreadable.
+    f.effects.unreadable_target_after = Some((WINNER, 3));
+    assert_eq!(f.commit(plan), Err(DeployError::TargetUnavailable));
+    f.mutations(&[]);
+    f.files(None, BASE);
+    let op = f.journal.visible.pending.unwrap();
+    assert_eq!(f.state(op).blocker, Some(DeployError::TargetUnavailable));
+    f.root_state(Some(op), None);
+}
+
+#[test]
+fn unreadable_target_during_recovery_is_not_a_displacement() {
+    let mut f = Fixture::new(WINNER);
+    let plan = f.plan();
+    let op = f.cut_apply(plan, Cut::BeforeFirstPublish);
+    f.boot();
+    f.effects.unreadable_target_after = Some((WINNER, 1));
+    let status = f.recover().unwrap();
+    f.assert_status(
+        &status,
+        OperationKind::Deploy,
+        Phase::RollingBack,
+        Some(DeployError::TargetUnavailable),
+    );
+    f.mutations(&[]);
+    f.files(None, BASE);
+    f.root_state(Some(op), None);
+
+    // Once the target is readable again the same pending operation rolls back.
+    f.effects.unreadable_target_after = None;
+    f.assert_resolved(op, OperationKind::Deploy, Phase::RolledBack, None);
+    f.mutations(&[]);
+    f.files(None, BASE);
 }
 
 #[test]

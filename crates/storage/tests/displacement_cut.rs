@@ -141,3 +141,75 @@ fn unreadable_canonical_retain_blocks_recovery_without_effect() {
         }
     );
 }
+
+#[test]
+fn unreadable_target_is_not_reported_as_displacement() {
+    let dir = fixture_v1();
+    let mut journal = open_fixture(&dir);
+    let mut effects = MemEffects::new();
+    let plan = save_plan(&mut journal);
+    let op = journal.claim(Claim::Deploy(plan)).unwrap();
+    let step = deploy_step(op);
+    journal.seal(op, vec![step.clone()]).unwrap();
+    journal
+        .set_phase(op, Phase::Prepared, Phase::Applying)
+        .unwrap();
+    journal
+        .record_step(op, 0, StepPhase::Ready, StepPhase::Attempting, None)
+        .unwrap();
+
+    effects.staged.insert(
+        StageRef::from_record(op, 0, StepDirection::Forward),
+        MemFile {
+            bytes: POST.to_vec(),
+            fingerprint: fingerprint(POST, 0),
+        },
+    );
+    for slot in [BackupSlot::Original, BackupSlot::Step] {
+        effects.store_backup(
+            BackupRef::from_record(op, 0, StepDirection::Forward, slot),
+            MemFile {
+                bytes: BASE.to_vec(),
+                fingerprint: fingerprint(BASE, 10),
+            },
+        );
+    }
+    effects.unreadable_target = true;
+    drop(journal);
+    let mut journal = OperationJournal::open(dir.path()).unwrap();
+    let status = recover_pending(&mut journal, &mut effects, &root(1), &root(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.blocker, Some(DeployError::TargetUnavailable));
+    assert!(journal.unexpected_displacements(op).unwrap().is_empty());
+    assert!(!status.retained.contains(&step.retain));
+    assert!(!status.retained.contains(&step.alternate_displacement()));
+    assert_eq!(effects.mutations, 0);
+    assert_eq!(effects.public[FILE].bytes, BASE);
+    assert_eq!(
+        journal.root_state(&root(2)).unwrap(),
+        RootState {
+            pending: Some(op),
+            active: None
+        }
+    );
+
+    // A readable target lets the same pending operation roll back.
+    effects.unreadable_target = false;
+    let resolved = recover_pending(&mut journal, &mut effects, &root(1), &root(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (resolved.phase, resolved.blocker),
+        (Phase::RolledBack, None)
+    );
+    assert_eq!(effects.mutations, 0);
+    assert_eq!(effects.public[FILE].bytes, BASE);
+    assert_eq!(
+        journal.root_state(&root(2)).unwrap(),
+        RootState {
+            pending: None,
+            active: None
+        }
+    );
+}

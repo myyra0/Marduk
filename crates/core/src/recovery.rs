@@ -404,6 +404,12 @@ fn preserve_displacements<J: Journal, P: CopyEffects>(
     step: &PreparedStep,
     evidence: &Evidence,
 ) -> Result<bool, DeployError> {
+    // A failed target read says nothing about either private slot, so no
+    // displacement can be attributed to this step yet. The target error path
+    // classifies it instead of wedging the operation on invented evidence.
+    if matches!(evidence.target, Observation::Unavailable(_)) {
+        return Ok(false);
+    }
     let mut found = preserve_canonical_displacement(journal, step, evidence)?;
     match port.inspect_alternate_displacement(step) {
         Artifact::Absent => {}
@@ -424,6 +430,9 @@ pub(crate) fn preserve_canonical_displacement<J: Journal>(
     step: &PreparedStep,
     evidence: &Evidence,
 ) -> Result<bool, DeployError> {
+    if matches!(evidence.target, Observation::Unavailable(_)) {
+        return Ok(false);
+    }
     // An unreadable canonical slot proves nothing about its contents, so it
     // can never pass the displacement check and let an effect run.
     if evidence.retained == Artifact::Unavailable {
