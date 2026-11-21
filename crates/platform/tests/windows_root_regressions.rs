@@ -94,18 +94,9 @@ fn pinned_ancestor_refuses_a_write_handle() {
     drop(open_writer().expect("write handle permitted once pins are dropped"));
 }
 
-#[test]
-#[ignore = "requires NTFS scratch with 8.3 generation enabled; run explicitly on hosted Windows"]
-fn short_name_alias_is_never_an_absent_or_admitted_leaf() {
+fn short_path(path: &Path) -> std::path::PathBuf {
     use std::os::windows::ffi::OsStrExt;
 
-    let tmp = match std::env::var_os("MARDUK_M1_GAME_SCRATCH") {
-        Some(dir) => tempfile::tempdir_in(dir).unwrap(),
-        None => tempfile::tempdir().unwrap(),
-    };
-    layout(tmp.path());
-    let path = tmp.path().join("Data/Original long filename.dds");
-    fs::write(&path, b"inert").unwrap();
     let wide: Vec<_> = path.as_os_str().encode_wide().chain([0]).collect();
     let mut short = [0u16; 2048];
     let len = unsafe { GetShortPathNameW(wide.as_ptr(), short.as_mut_ptr(), short.len() as u32) };
@@ -113,18 +104,56 @@ fn short_name_alias_is_never_an_absent_or_admitted_leaf() {
         len > 0 && (len as usize) < short.len(),
         "get native short path"
     );
-    let short = String::from_utf16(&short[..len as usize]).unwrap();
-    let alias = Path::new(&short).file_name().unwrap().to_str().unwrap();
+    String::from_utf16(&short[..len as usize]).unwrap().into()
+}
+
+#[test]
+#[ignore = "requires NTFS scratch with 8.3 generation enabled; run explicitly on hosted Windows"]
+fn short_name_alias_is_never_an_absent_or_admitted_leaf() {
+    let tmp = match std::env::var_os("MARDUK_M1_GAME_SCRATCH") {
+        Some(dir) => tempfile::tempdir_in(dir).unwrap(),
+        None => tempfile::tempdir().unwrap(),
+    };
+    let install = tmp
+        .path()
+        .join("Installation parent")
+        .join("Long game installation");
+    layout(&install);
+    let short_install = short_path(&install);
+    for (long, short) in [
+        (install.as_path(), short_install.as_path()),
+        (install.parent().unwrap(), short_install.parent().unwrap()),
+    ] {
+        assert!(
+            !long
+                .file_name()
+                .unwrap()
+                .eq_ignore_ascii_case(short.file_name().unwrap()),
+            "scratch must generate distinct 8.3 directory names"
+        );
+    }
+    let long_binding = bind_installation(&install, &LAYOUT).unwrap();
+    let binding = bind_installation(&short_install, &LAYOUT).unwrap();
+    let (installation, data) = long_binding.identities();
+    assert_eq!(binding.identities(), (installation, data));
+    assert_eq!(
+        reopen_installation(&short_install, &LAYOUT, installation, data)
+            .unwrap()
+            .identities(),
+        (installation, data)
+    );
+
+    let data = install.join("Data");
+    let path = data.join("Original long filename.dds");
+    fs::write(&path, b"inert").unwrap();
+    let short = short_path(&path);
+    let alias = short.file_name().unwrap().to_str().unwrap();
     assert!(
         !alias.eq_ignore_ascii_case("Original long filename.dds"),
         "scratch must generate distinct 8.3 names"
     );
-    assert_eq!(
-        fs::read(tmp.path().join("Data").join(alias)).unwrap(),
-        b"inert"
-    );
+    assert_eq!(fs::read(data.join(alias)).unwrap(), b"inert");
 
-    let binding = bind_installation(tmp.path(), &LAYOUT).unwrap();
     assert!(matches!(
         resolve_existing_parent(&binding, &RelativePath::parse(alias).unwrap()),
         Err(RootError::AmbiguousName)
@@ -133,10 +162,7 @@ fn short_name_alias_is_never_an_absent_or_admitted_leaf() {
     let relative = RelativePath::parse(alias).unwrap();
     let target = resolve_existing_parent(&binding, &relative).unwrap();
     fs::write(path, b"inert").unwrap();
-    assert_eq!(
-        fs::read(tmp.path().join("Data").join(alias)).unwrap(),
-        b"inert"
-    );
+    assert_eq!(fs::read(data.join(alias)).unwrap(), b"inert");
     assert_eq!(observe_target(&target), Err(RootError::AmbiguousName));
 }
 

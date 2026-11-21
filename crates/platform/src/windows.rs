@@ -534,7 +534,7 @@ mod root {
                 return Err(RootError::TargetUnavailable);
             };
             let name = name.to_str().ok_or(RootError::TargetUnavailable)?;
-            let child = pin_directory(chain.last().expect("volume root is pinned"), name)?;
+            let child = pin_selected_directory(chain.last().expect("volume root is pinned"), name)?;
             chain.push(child);
         }
         Ok(chain)
@@ -596,6 +596,35 @@ mod root {
             || child.identity == parent.identity
         {
             return Err(RootError::OutsideBoundary);
+        }
+        Ok(child)
+    }
+
+    fn pin_selected_directory(parent: &RootDir, name: &str) -> Result<RootDir, RootError> {
+        if !ordinary_component(name) {
+            return Err(RootError::TargetUnavailable);
+        }
+        check_locator(parent).map_err(|_| RootError::TargetUnavailable)?;
+        // Canonicalize one component at a time. A single open of the whole
+        // selection with OPEN_REPARSE_POINT only protects its final component.
+        let file = open_path(&join(&parent.final_path, name), DIRECTORY_ACCESS)
+            .map_err(|_| RootError::TargetUnavailable)?;
+        let child = verify_root(file).map_err(|_| RootError::TargetUnavailable)?;
+        let canonical = child
+            .final_path
+            .strip_prefix(&join(&parent.final_path, ""))
+            .filter(|name| ordinary_component(name))
+            .ok_or(RootError::TargetUnavailable)?;
+        let entry = leaf_match(parent, canonical)
+            .map_err(|_| RootError::TargetUnavailable)?
+            .ok_or(RootError::TargetUnavailable)?;
+        if entry.name != canonical
+            || entry.is_reparse()
+            || entry.attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+            || entry_identity(parent.volume, &entry) != *child.identity.evidence()
+            || child.identity == parent.identity
+        {
+            return Err(RootError::TargetUnavailable);
         }
         Ok(child)
     }
