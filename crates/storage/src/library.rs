@@ -18,17 +18,17 @@ use std::io::Write as _;
 use marduk_archive::{M1_ZIP_LIMITS, admit_zip};
 use marduk_core::ids::{InstalledRevisionId, MemberId, ProfileId, ProfileRevision};
 #[cfg(test)]
-use marduk_core::import::{ArchiveError, ImportAllocation, PayloadFile, StageEvidence};
+use marduk_core::import::ArchiveError;
 use marduk_core::import::{
     BeginImport, ImportError, ImportId, ImportTarget, NamedProfile, PreparedImport,
     ProfileEditError,
 };
+use marduk_core::import::{ImportAllocation, PayloadFile, StageEvidence};
 use marduk_core::profiles::{ProfileMember, ProfileSnapshot};
-#[cfg(test)]
 use marduk_core::root_identity::{NativeIdentity, RootIdentity};
 use marduk_core::targets::RelativePath;
-#[cfg(test)]
 use marduk_core::targets::{RootRole, TargetFile};
+use marduk_platform::library_stage::NativeStage;
 use marduk_platform::{GateError, WriterGate, WriterGuard};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 #[cfg(test)]
@@ -72,7 +72,10 @@ impl Catalog {
             root: root.to_path_buf(),
             connection,
             gate,
-            stage: StageAdapter::Unavailable(UnavailableStage),
+            stage: match NativeStage::open(root) {
+                Ok(stage) => StageAdapter::Native(stage),
+                Err(_) => StageAdapter::Unavailable(UnavailableStage),
+            },
         })
     }
 
@@ -106,28 +109,65 @@ impl Catalog {
         };
 
         let _guard = self.lock()?;
+        let mut input = input;
 
-        #[cfg(test)]
-        {
-            let mut input = input;
-            match &mut self.stage {
-                StageAdapter::Unavailable(stage) => stage.prepare(),
-                StageAdapter::Fixture(stage) => stage.prepare(
+        match &mut self.stage {
+            StageAdapter::Unavailable(stage) => stage.prepare(),
+            StageAdapter::Native(stage) => {
+                let id = reserve_import(
                     &mut self.connection,
-                    &self.root,
-                    &mut input,
                     plan.profile,
                     plan.expected_revision,
-                    target,
-                ),
+                    &target,
+                )?;
+                let allocation = ImportAllocation {
+                    id,
+                    revision: InstalledRevisionId::new(id.get()),
+                };
+                let connection = &mut self.connection;
+                let receipt = stage.stage(&_guard, allocation, &mut input, &mut |owner| {
+                    let owner = encode_owner(owner);
+                    let changed = connection
+                        .execute(
+                            "UPDATE imports SET owner = ?1 \
+                             WHERE id = ?2 AND state = 'writing'",
+                            params![owner.as_slice(), sql_import_id(id)?],
+                        )
+                        .map_err(storage_error)?;
+                    if changed != 1 {
+                        return Err(ImportError::Storage);
+                    }
+                    Ok(())
+                })?;
+                let evidence = receipt.evidence();
+                persist_stage(
+                    &mut self.connection,
+                    id,
+                    &evidence.archive_sha256,
+                    &encode_owner(&evidence.owner),
+                    &evidence.files,
+                )?;
+                Ok(PreparedImport {
+                    id,
+                    profile: plan.profile,
+                    expected_revision: plan.expected_revision,
+                    archive_sha256: evidence.archive_sha256,
+                    files: evidence
+                        .files
+                        .iter()
+                        .map(|file| file.target.clone())
+                        .collect(),
+                })
             }
-        }
-        #[cfg(not(test))]
-        {
-            let _ = (input, target);
-            match &mut self.stage {
-                StageAdapter::Unavailable(stage) => stage.prepare(),
-            }
+            #[cfg(test)]
+            StageAdapter::Fixture(stage) => stage.prepare(
+                &mut self.connection,
+                &self.root,
+                &mut input,
+                plan.profile,
+                plan.expected_revision,
+                target,
+            ),
         }
     }
 
@@ -150,7 +190,7 @@ impl Catalog {
             owner: record.owner.clone(),
             files: stored_files(&self.connection, id)?,
         };
-        self.stage.reobserve(&self.root, &stage)?;
+        self.stage.reobserve(&_guard, &self.root, &stage)?;
 
         let revision = read_profile_revision(&self.connection, record.profile)?;
         if revision.get() != record.expected_revision.get() {
@@ -215,7 +255,7 @@ impl Catalog {
             owner: record.owner,
             files: stored_files(&self.connection, id)?,
         };
-        self.stage.reclaim(&self.root, &stage)
+        self.stage.reclaim(&_guard, &self.root, &stage)
     }
 
     /// Verify prepared stages and account for abandoned reservations.
@@ -259,7 +299,7 @@ impl Catalog {
                 owner: record.owner,
                 files: stored_files(&self.connection, id)?,
             };
-            match self.stage.reclaim(&self.root, &stage) {
+            match self.stage.reclaim(&_guard, &self.root, &stage) {
                 Ok(()) | Err(ImportError::StageChanged) | Err(ImportError::StageUnavailable) => {}
                 Err(error) => return Err(error),
             }
@@ -274,7 +314,7 @@ impl Catalog {
                 owner: record.owner,
                 files: stored_files(&self.connection, id)?,
             };
-            match self.stage.reobserve(&self.root, &stage) {
+            match self.stage.reobserve(&_guard, &self.root, &stage) {
                 Ok(()) => retained.push(id),
                 Err(ImportError::StageChanged) | Err(ImportError::StageUnavailable) => {}
                 Err(error) => return Err(error),
@@ -503,7 +543,6 @@ impl Catalog {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 struct StageRecord {
     id: ImportId,
     archive_sha256: Option<[u8; 32]>,
@@ -515,39 +554,52 @@ struct StageRecord {
 /// can substitute another adapter.
 enum StageAdapter {
     Unavailable(UnavailableStage),
+    Native(NativeStage),
     #[cfg(test)]
     Fixture(FixtureStage),
 }
 
 impl StageAdapter {
     fn available(&self) -> bool {
-        #[cfg(test)]
-        {
-            matches!(self, Self::Fixture(_))
-        }
-        #[cfg(not(test))]
-        {
-            false
+        match self {
+            Self::Unavailable(_) => false,
+            Self::Native(_) => true,
+            #[cfg(test)]
+            Self::Fixture(_) => true,
         }
     }
 
-    fn reobserve(&mut self, root: &Path, stage: &StageRecord) -> Result<(), ImportError> {
-        #[cfg(not(test))]
-        let _ = (root, stage);
+    fn reobserve(
+        &mut self,
+        guard: &WriterGuard,
+        _root: &Path,
+        stage: &StageRecord,
+    ) -> Result<(), ImportError> {
         match self {
             Self::Unavailable(adapter) => adapter.reobserve(),
+            Self::Native(adapter) => {
+                let evidence = native_evidence(stage)?;
+                adapter.reobserve(guard, &evidence)
+            }
             #[cfg(test)]
-            Self::Fixture(adapter) => adapter.reobserve(root, stage),
+            Self::Fixture(adapter) => adapter.reobserve(_root, stage),
         }
     }
 
-    fn reclaim(&mut self, root: &Path, stage: &StageRecord) -> Result<(), ImportError> {
-        #[cfg(not(test))]
-        let _ = (root, stage);
+    fn reclaim(
+        &mut self,
+        guard: &WriterGuard,
+        _root: &Path,
+        stage: &StageRecord,
+    ) -> Result<(), ImportError> {
         match self {
             Self::Unavailable(adapter) => adapter.reclaim(),
+            Self::Native(adapter) => {
+                let evidence = native_evidence(stage)?;
+                adapter.reclaim(guard, &evidence)
+            }
             #[cfg(test)]
-            Self::Fixture(adapter) => adapter.reclaim(root, stage),
+            Self::Fixture(adapter) => adapter.reclaim(_root, stage),
         }
     }
 }
@@ -743,7 +795,6 @@ fn validate_label(raw: &str) -> Result<String, ImportError> {
     Ok(trimmed.to_owned())
 }
 
-#[cfg(test)]
 fn reserve_import(
     connection: &mut Connection,
     profile: ProfileId,
@@ -873,7 +924,6 @@ impl std::io::Write for HashingWriter {
     }
 }
 
-#[cfg(test)]
 fn persist_stage(
     connection: &mut Connection,
     id: ImportId,
@@ -1605,7 +1655,6 @@ fn synthetic_owner(id: ImportId, archive_sha256: &[u8; 32]) -> RootIdentity {
     }
 }
 
-#[cfg(test)]
 fn encode_owner(owner: &RootIdentity) -> Vec<u8> {
     let mut encoded = vec![1u8];
     match owner.evidence() {
@@ -1644,6 +1693,107 @@ fn encode_owner(owner: &RootIdentity) -> Vec<u8> {
         }
     }
     encoded
+}
+
+fn native_evidence(stage: &StageRecord) -> Result<StageEvidence, ImportError> {
+    let archive_sha256 = stage.archive_sha256.ok_or(ImportError::StageChanged)?;
+    let owner = decode_owner(stage.owner.as_deref().ok_or(ImportError::StageChanged)?)?;
+    let files = stage
+        .files
+        .iter()
+        .map(|file| PayloadFile {
+            target: TargetFile {
+                root: RootRole::Data,
+                relative: file.path.clone(),
+            },
+            len: file.len,
+            sha256: file.sha,
+        })
+        .collect();
+    Ok(StageEvidence {
+        allocation: ImportAllocation {
+            id: stage.id,
+            revision: InstalledRevisionId::new(stage.id.get()),
+        },
+        archive_sha256,
+        files,
+        owner,
+    })
+}
+
+struct OwnerReader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> OwnerReader<'a> {
+    fn take(&mut self, len: usize) -> Result<&'a [u8], ImportError> {
+        let end = self.at.checked_add(len).ok_or(ImportError::Storage)?;
+        let slice = self.bytes.get(self.at..end).ok_or(ImportError::Storage)?;
+        self.at = end;
+        Ok(slice)
+    }
+
+    fn u64(&mut self) -> Result<u64, ImportError> {
+        Ok(u64::from_le_bytes(
+            self.take(8)?.try_into().map_err(|_| ImportError::Storage)?,
+        ))
+    }
+
+    fn i64(&mut self) -> Result<i64, ImportError> {
+        Ok(i64::from_le_bytes(
+            self.take(8)?.try_into().map_err(|_| ImportError::Storage)?,
+        ))
+    }
+
+    fn array16(&mut self) -> Result<[u8; 16], ImportError> {
+        self.take(16)?.try_into().map_err(|_| ImportError::Storage)
+    }
+}
+
+fn decode_owner(bytes: &[u8]) -> Result<RootIdentity, ImportError> {
+    let mut reader = OwnerReader { bytes, at: 0 };
+    if reader.take(1)?[0] != 1 {
+        return Err(ImportError::Storage);
+    }
+    let identity = match reader.take(1)?[0] {
+        0 => {
+            let fs_magic = reader.u64()?;
+            let fs_id = reader.array16()?;
+            let view_id = reader.u64()?;
+            let tree_id = match reader.take(1)?[0] {
+                0 => None,
+                1 => Some(reader.u64()?),
+                _ => return Err(ImportError::Storage),
+            };
+            let ino = reader.u64()?;
+            let seconds = reader.i64()?;
+            let nanos = u32::from_le_bytes(
+                reader
+                    .take(4)?
+                    .try_into()
+                    .map_err(|_| ImportError::Storage)?,
+            );
+            NativeIdentity::Linux {
+                fs_magic,
+                fs_id,
+                view_id,
+                tree_id,
+                ino,
+                birth: (seconds, nanos),
+            }
+        }
+        1 => NativeIdentity::Windows {
+            volume_serial: reader.u64()?,
+            file_id: reader.array16()?,
+            creation_100ns: reader.i64()?,
+        },
+        _ => return Err(ImportError::Storage),
+    };
+    if reader.at != bytes.len() {
+        return Err(ImportError::Storage);
+    }
+    Ok(RootIdentity::from_adapter_evidence(identity))
 }
 
 fn sha_from_blob(blob: Vec<u8>) -> Result<[u8; 32], ImportError> {

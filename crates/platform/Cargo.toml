@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+marduk-archive = { path = "../archive" }
 marduk-core = { path = "../core" }
 sha2 = { version = "=0.11.1", default-features = false }
 

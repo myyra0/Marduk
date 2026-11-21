@@ -53,6 +53,10 @@ use linux as native;
 #[cfg(windows)]
 use windows as native;
 
+pub mod library_stage;
+#[doc(hidden)]
+pub mod native_proof;
+
 /// A live, verified installation pair owned by the platform adapter.
 ///
 /// The handles pin the selected installation and its direct data directory.

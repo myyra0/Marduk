@@ -238,6 +238,7 @@ name = "marduk-platform"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "marduk-archive",
  "marduk-core",
  "sha2",
  "tempfile",

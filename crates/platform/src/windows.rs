@@ -223,6 +223,17 @@ mod root {
         pub(crate) fn identities(&self) -> (&RootIdentity, &RootIdentity) {
             (&self.installation.identity, &self.data.identity)
         }
+
+        pub(crate) fn check_roots(&self) -> Result<(), RootError> {
+            for root in self
+                .ancestors
+                .iter()
+                .chain([&self.installation, &self.data])
+            {
+                check_locator(root)?;
+            }
+            Ok(())
+        }
     }
 
     #[derive(Clone)]
@@ -269,6 +280,10 @@ mod root {
 
         pub(crate) fn parent_identity(&self) -> &RootIdentity {
             &self.parent().identity
+        }
+
+        pub(crate) fn parent_dir(&self) -> Result<File, RootError> {
+            self.parent().file.try_clone().map_err(|_| RootError::Io)
         }
 
         pub(crate) fn leaf(&self) -> &str {
@@ -1231,9 +1246,85 @@ mod root {
             ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION | ERROR_ACCESS_DENIED
         )
     }
+
+    /// Fingerprint an operation-owned artifact outside the installation tree.
+    /// Synthetic proof only; the caller is responsible for its own binding.
+    pub(crate) fn fingerprint_path(path: &Path) -> Result<Fingerprint, RootError> {
+        let text = path.to_str().ok_or(RootError::TargetUnavailable)?;
+        let metadata = open_path(text, METADATA_ACCESS).map_err(|code| {
+            if matches!(code, ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) {
+                RootError::TargetUnavailable
+            } else {
+                RootError::Io
+            }
+        })?;
+        let tag = attribute_tag(&metadata)?;
+        let standard = standard_info(&metadata)?;
+        let basic = basic_info(&metadata)?;
+        if is_reparse(&tag) || standard.Directory {
+            return Err(RootError::UnsupportedTarget(UnsupportedReason::ObjectKind));
+        }
+        let identity = identity(&metadata)?;
+        let Some(security_sha256) = eligible_metadata(&metadata, &basic, &standard) else {
+            return Err(RootError::UnsupportedTarget(UnsupportedReason::Metadata));
+        };
+        let handle = unsafe {
+            ReOpenFile(
+                metadata.as_raw_handle() as HANDLE,
+                GENERIC_READ,
+                FILE_SHARE_READ,
+                NO_FOLLOW,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(RootError::Io);
+        }
+        let file = unsafe { File::from_raw_handle(handle) };
+
+        let mut hasher = Sha256::new();
+        let mut reader = &file;
+        let mut buffer = [0u8; 64 * 1024];
+        let mut len = 0u64;
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    hasher.update(&buffer[..read]);
+                    len += read as u64;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err(RootError::Io),
+            }
+        }
+        check_original(&file, &identity, &basic, &standard)?;
+        if len != standard.EndOfFile as u64
+            || eligible_metadata(&file, &basic, &standard) != Some(security_sha256)
+        {
+            return Err(RootError::Io);
+        }
+        let mut sha256 = [0u8; 32];
+        sha256.copy_from_slice(&hasher.finalize());
+        Ok(Fingerprint {
+            identity,
+            len,
+            sha256,
+            metadata: FileMetadata::Windows {
+                attributes: basic.FileAttributes,
+                last_write_100ns: basic.LastWriteTime,
+                links: standard.NumberOfLinks,
+                security_sha256,
+            },
+        })
+    }
+
+    pub(crate) fn directory_identity(path: &Path) -> Result<RootIdentity, RootError> {
+        let text = path.to_str().ok_or(RootError::TargetUnavailable)?;
+        let file = open_path(text, DIRECTORY_ACCESS).map_err(|_| RootError::TargetUnavailable)?;
+        Ok(verify_root(file)?.identity)
+    }
 }
 
 pub(crate) use root::{
-    Binding, ResolvedTarget, bind_installation, observe_target, reopen_installation,
-    resolve_existing_parent,
+    Binding, ResolvedTarget, bind_installation, directory_identity, fingerprint_path,
+    observe_target, reopen_installation, resolve_existing_parent,
 };

@@ -195,7 +195,7 @@ impl Binding {
         (&self.installation.identity, &self.data.identity)
     }
 
-    fn check_roots(&self) -> Result<(), RootError> {
+    pub(crate) fn check_roots(&self) -> Result<(), RootError> {
         let parent = self.ancestors.check(NO_LINKS)?;
         check_directory(
             parent,
@@ -269,10 +269,16 @@ pub(crate) struct ResolvedTarget<'a> {
 }
 
 impl ResolvedTarget<'_> {
-    fn check_chain(&self) -> Result<(), RootError> {
+    pub(crate) fn check_chain(&self) -> Result<(), RootError> {
         self.binding.check_roots()?;
         self.parents.check(OPEN_RESOLVE)?;
         Ok(())
+    }
+
+    /// A fresh descriptor for the verified parent. It is used directory-relative
+    /// by the proof's rename calls, never as standalone authority.
+    pub(crate) fn parent_dir(&self) -> Result<File, RootError> {
+        self.parents.parent().try_clone().map_err(|_| RootError::Io)
     }
 
     pub(crate) fn parent_identity(&self) -> &RootIdentity {
@@ -806,6 +812,138 @@ fn supported_metadata(file: &File) -> bool {
             && flags_are_supported(flags)
             && libc::flistxattr(file.as_raw_fd(), std::ptr::null_mut(), 0) == 0
     }
+}
+
+/// Fingerprint an already verified handle without assuming a root boundary.
+/// Used only by synthetic proof witnesses for operation-owned artifacts.
+pub(crate) fn fingerprint_file(file: &File) -> Result<Fingerprint, RootError> {
+    let before = statx_fd(file)?;
+    if before.stx_mode as u32 & libc::S_IFMT != libc::S_IFREG {
+        return Err(RootError::UnsupportedTarget(UnsupportedReason::ObjectKind));
+    }
+    if before.stx_mask & libc::STATX_BASIC_STATS != libc::STATX_BASIC_STATS
+        || before.stx_nlink != 1
+        || before.stx_uid != unsafe { libc::geteuid() } as u32
+        || !group_is_current(before.stx_gid)
+        || before.stx_mode as u32 & 0o7000 != 0
+        || !supported_metadata(file)
+    {
+        return Err(RootError::UnsupportedTarget(UnsupportedReason::Metadata));
+    }
+
+    let identity = identity_from(file, &before)?;
+    let mut hasher = Sha256::new();
+    let mut reader = file;
+    let mut buffer = [0u8; 64 * 1024];
+    let mut len = 0u64;
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                hasher.update(&buffer[..read]);
+                len += read as u64;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(RootError::Io),
+        }
+    }
+    let after = statx_fd(file)?;
+    if !same_object(&before, &after) || len != before.stx_size || !supported_metadata(file) {
+        return Err(RootError::Io);
+    }
+
+    let mut sha256 = [0u8; 32];
+    sha256.copy_from_slice(&hasher.finalize());
+    Ok(Fingerprint {
+        identity,
+        len,
+        sha256,
+        metadata: FileMetadata::Linux {
+            mode: before.stx_mode as u32,
+            uid: before.stx_uid,
+            gid: before.stx_gid,
+            mtime: (before.stx_mtime.tv_sec, before.stx_mtime.tv_nsec),
+            nlink: u64::from(before.stx_nlink),
+        },
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic proof support. These helpers expose no new authority: callers
+// still re-verify the live binding before every effect.
+// ---------------------------------------------------------------------------
+
+pub(crate) fn directory_identity(path: &Path) -> Result<RootIdentity, RootError> {
+    let (_chain, _name, file) = open_absolute(path, DIRECTORY_FLAGS)?;
+    let stx = statx_fd(&file)?;
+    if stx.stx_mode as u32 & libc::S_IFMT != libc::S_IFDIR {
+        return Err(RootError::TargetUnavailable);
+    }
+    Ok(RootIdentity::from_adapter_evidence(identity_from(
+        &file, &stx,
+    )?))
+}
+
+pub(crate) fn open_directory(path: &Path) -> Result<File, RootError> {
+    let (_chain, _name, file) = open_absolute(path, DIRECTORY_FLAGS)?;
+    let stx = statx_fd(&file)?;
+    if stx.stx_mode as u32 & libc::S_IFMT != libc::S_IFDIR {
+        return Err(RootError::TargetUnavailable);
+    }
+    Ok(file)
+}
+
+pub(crate) fn open_file(path: &Path) -> Result<File, RootError> {
+    let (_chain, _name, file) = open_absolute(
+        path,
+        (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64,
+    )?;
+    Ok(file)
+}
+
+pub(crate) fn sync_directory(path: &Path) -> Result<(), RootError> {
+    open_directory(path)?.sync_all().map_err(|_| RootError::Io)
+}
+
+pub(crate) fn renameat2(
+    from_dir: &File,
+    from: &str,
+    to_dir: &File,
+    to: &str,
+    flags: u32,
+) -> io::Result<()> {
+    let from = CString::new(from).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    let to = CString::new(to).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            from_dir.as_raw_fd(),
+            from.as_ptr(),
+            to_dir.as_raw_fd(),
+            to.as_ptr(),
+            flags,
+        ) as c_int
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Library staging is connected only where this packet can qualify the whole
+/// private boundary. The Btrfs rename-domain proof is the intended target;
+/// tmpfs is not connected because the frozen catalog-refusal oracle expects an
+/// unqualified production catalog on that volume class, and this packet has no
+/// runtime library evidence to replace that oracle.
+pub(crate) fn library_volume_qualified(root: &Path) -> bool {
+    let Ok(file) = open_directory(root) else {
+        return false;
+    };
+    let Ok((magic, _)) = statfs_of(&file) else {
+        return false;
+    };
+    magic == BTRFS_SUPER_MAGIC
 }
 
 /// The effective group and every supplementary group can be restored without
