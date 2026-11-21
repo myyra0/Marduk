@@ -703,7 +703,7 @@ impl FixtureStage {
     }
 
     fn reobserve(&mut self, root: &Path, stage: &StageRecord) -> Result<(), ImportError> {
-        let (archive_sha256, _) = fixture_receipt(stage)?;
+        let archive_sha256 = verified_owner(stage)?;
         verify_files(
             &revision_dir(root, stage.id),
             archive_sha256,
@@ -717,22 +717,28 @@ impl FixtureStage {
             return Ok(());
         }
 
-        let (archive_sha256, owner) = fixture_receipt(stage)?;
-        let expected_owner = encode_owner(&synthetic_owner(stage.id, archive_sha256));
-        if owner != expected_owner.as_slice() {
-            return Err(ImportError::StageChanged);
-        }
+        verified_owner(stage)?;
 
         remove_file_if_present(&directory.join(ARCHIVE_FILE))?;
         for file in &stage.files {
             remove_file_if_present(&payload_file(&directory, file.path.as_str()))?;
         }
-        prune_empty_directories(&directory)?;
+        prune_known_directories(&directory, &stage.files)?;
         if directory.exists() {
             return Err(ImportError::StageChanged);
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+fn verified_owner(stage: &StageRecord) -> Result<&[u8; 32], ImportError> {
+    let (archive_sha256, owner) = fixture_receipt(stage)?;
+    let expected_owner = encode_owner(&synthetic_owner(stage.id, archive_sha256));
+    if owner != expected_owner.as_slice() {
+        return Err(ImportError::StageChanged);
+    }
+    Ok(archive_sha256)
 }
 
 fn validate_label(raw: &str) -> Result<String, ImportError> {
@@ -1483,26 +1489,77 @@ fn remove_file_if_present(path: &Path) -> Result<(), ImportError> {
 }
 
 #[cfg(test)]
-fn prune_empty_directories(directory: &Path) -> Result<(), ImportError> {
-    prune_empty_children(directory)?;
-    // Best effort: a non-empty directory is reported by the caller.
-    let _ = fs::remove_dir(directory);
-    Ok(())
+fn prune_known_directories(directory: &Path, files: &[StoredFile]) -> Result<(), ImportError> {
+    // Allowed directories are exactly the payload root and the parents of
+    // staged files. The archive's parent is the revision root itself.
+    let mut allowed = BTreeSet::new();
+    allowed.insert(PAYLOAD_DIR.to_owned());
+    for file in files {
+        let components = file.path.as_str().split('/').collect::<Vec<_>>();
+        let mut prefix = String::new();
+        for component in &components[..components.len().saturating_sub(1)] {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            allowed.insert(format!("{PAYLOAD_DIR}/{prefix}"));
+        }
+    }
+
+    prune_children(directory, "", &allowed)?;
+    match fs::remove_dir(directory) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+            Err(ImportError::StageChanged)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(ImportError::Storage),
+    }
 }
 
 #[cfg(test)]
-fn prune_empty_children(directory: &Path) -> Result<(), ImportError> {
+fn prune_children(
+    directory: &Path,
+    relative: &str,
+    allowed: &BTreeSet<String>,
+) -> Result<(), ImportError> {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(_) => return Err(ImportError::Storage),
     };
+
     for entry in entries {
         let entry = entry.map_err(|_| ImportError::Storage)?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .map(str::to_owned)
+            .ok_or(ImportError::StageChanged)?;
+        let child = if relative.is_empty() {
+            name
+        } else {
+            format!("{relative}/{name}")
+        };
         let kind = entry.file_type().map_err(|_| ImportError::Storage)?;
+
         if kind.is_dir() {
-            prune_empty_children(&entry.path())?;
-            let _ = fs::remove_dir(entry.path());
+            if !allowed.contains(&child) {
+                // Unexpected directory: refuse and leave it untouched.
+                return Err(ImportError::StageChanged);
+            }
+            prune_children(&entry.path(), &child, allowed)?;
+            match fs::remove_dir(entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                    return Err(ImportError::StageChanged);
+                }
+                Err(_) => return Err(ImportError::Storage),
+            }
+        } else {
+            // Known files were removed before pruning; a remaining entry is
+            // unexpected and must be preserved.
+            return Err(ImportError::StageChanged);
         }
     }
     Ok(())

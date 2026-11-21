@@ -207,6 +207,50 @@ fn prepare_refuses_stale_plan_and_unknown_member_without_reserving() {
 }
 
 #[test]
+fn altered_owner_receipt_is_not_published_or_reconciled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut catalog = Catalog::open_for_test(tmp.path()).unwrap();
+    let id = prepare(&mut catalog, 0, append("A"), A).id;
+    catalog
+        .connection
+        .execute(
+            "UPDATE imports SET owner = x'00' WHERE id = ?1",
+            [i64::try_from(id.get()).unwrap()],
+        )
+        .unwrap();
+
+    assert_eq!(
+        catalog.publish_import(id).unwrap_err(),
+        ImportError::StageChanged
+    );
+    assert!(catalog.reconcile().unwrap().is_empty());
+    assert_eq!(state(&catalog, id), "prepared");
+    assert!(published(&catalog).is_empty());
+    assert_named(&mut catalog, 0, &[]);
+}
+
+#[test]
+fn discard_preserves_unexpected_empty_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let mut catalog = Catalog::open_for_test(root).unwrap();
+    let id = prepare(&mut catalog, 0, append("A"), A).id;
+    let directory = revision_dir(root, id);
+    let unexpected = directory.join("unexpected-empty");
+    std::fs::create_dir(&unexpected).unwrap();
+
+    assert_eq!(catalog.discard_import(id), Err(ImportError::StageChanged));
+    assert_eq!(state(&catalog, id), "discarded");
+    assert!(unexpected.is_dir());
+    assert!(!directory.join("archive.zip").exists());
+    assert!(!payload(root, id).exists());
+
+    std::fs::remove_dir(&unexpected).unwrap();
+    catalog.discard_import(id).unwrap();
+    assert!(!directory.exists());
+}
+
+#[test]
 fn reconcile_reclaims_abandoned_owned_writing_and_keeps_published_payload() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();

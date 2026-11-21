@@ -6,15 +6,11 @@ publish = false
 
 [dependencies]
 marduk-core = { path = "../core" }
-marduk-archive = { path = "../archive" }
 marduk-platform = { path = "../platform" }
 rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled"] }
-sha2 = { version = "=0.11.1", default-features = false }
 
 [dev-dependencies]
+marduk-archive = { path = "../archive" }
+rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled"] }
+sha2 = { version = "=0.11.1", default-features = false }
 tempfile = "=3.27.0"
-
-[lints.cargo]
-# The Task 5 native stage adapter is the production consumer of these crates;
-# until it exists only the cfg(test) fixture exercises admission and digesting.
-unused_dependencies = "allow"
