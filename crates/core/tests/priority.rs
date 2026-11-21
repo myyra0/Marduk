@@ -119,6 +119,17 @@ fn disabled_member_does_not_compete() {
 }
 
 #[test]
+fn manifest_presence_precedes_alias_errors() {
+    let snapshot = profile(vec![member(A, A_REV, true), member(B, B_REV, true)]);
+    let manifests = inputs(&[(A_REV, &["Textures/Winner.dds", WINNER])]);
+    let error = resolve_files(&snapshot, &manifests).unwrap_err();
+    assert!(
+        matches!(error, ResolveError::MissingManifest(id) if id.get() == B_REV),
+        "expected MissingManifest for installed revision {B_REV}, got {error:?}"
+    );
+}
+
+#[test]
 fn same_mod_alias_is_invalid_but_overlap_is_allowed() {
     const CAPITALIZED: &str = "Textures/Winner.dds";
     let mut snapshot = profile(vec![member(A, A_REV, true)]);
@@ -186,6 +197,18 @@ fn file_directory_overlap_has_no_plan() {
 }
 
 #[test]
+fn canonical_order_is_component_wise() {
+    const CHILD: &str = "textures/pack/f.dds";
+    const NEIGHBOR: &str = "textures/pack-neighbor.dds";
+    let snapshot = profile(vec![member(A, A_REV, true)]);
+    let manifests = inputs(&[(A_REV, &[NEIGHBOR, CHILD])]);
+    let resolved = entries(&snapshot, resolve_files(&snapshot, &manifests).unwrap());
+    assert_eq!(resolved.len(), 2);
+    assert_entry(&resolved[0], CHILD, &[(A, A_REV, CHILD)]);
+    assert_entry(&resolved[1], NEIGHBOR, &[(A, A_REV, NEIGHBOR)]);
+}
+
+#[test]
 fn duplicate_member_has_no_plan() {
     let snapshot = profile(vec![member(A, A_REV, true), member(A, B_REV, false)]);
     let error = resolve_files(&snapshot, &inputs(&[])).unwrap_err();
@@ -237,6 +260,8 @@ fn unadmitted_paths_report_first_violation() {
         ("textures/COM1 .dds", 1, ReservedDeviceName),
         ("textures/LPT9", 1, ReservedDeviceName),
         ("CONIN$.txt", 0, ReservedDeviceName),
+        ("textures/CON.", 1, TrailingDotOrSpace),
+        ("textures/x?.", 1, ForbiddenCharacter),
     ] {
         let Err(error) = RelativePath::parse(spelling) else {
             panic!("admitted invalid path {spelling:?}");
