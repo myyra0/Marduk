@@ -124,6 +124,30 @@ fn prepare(port: &mut ProofSession, name: &str) -> PreparedStep {
     .unwrap()
 }
 
+fn prepare_detach(port: &mut ProofSession, name: &str) -> PreparedStep {
+    let target = port.resolve_target(&logical(name)).unwrap();
+    let pre = match port.observe(&target) {
+        Observation::Absent => PreState::Absent,
+        Observation::Regular(fingerprint) => PreState::Regular(fingerprint),
+        other => panic!("unexpected pre-state {other:?}"),
+    };
+    port.prepare(
+        OperationId::try_from_u64(1).unwrap(),
+        0,
+        StepDirection::Forward,
+        &StepSpec {
+            target,
+            original: PreImage {
+                observation: pre.clone(),
+                backup: None,
+            },
+            pre,
+            output: StepOutput::Absent,
+        },
+    )
+    .unwrap()
+}
+
 fn apply(port: &mut ProofSession, step: &PreparedStep) -> EffectOutcome {
     let target = &step.spec.target;
     let (stage, _) = step.staged.as_ref().expect("staged output");
@@ -144,6 +168,78 @@ fn base(step: &PreparedStep) -> Fingerprint {
         panic!("expected a regular pre-image")
     };
     fingerprint.clone()
+}
+
+#[test]
+fn detach_rejects_wrong_retain_slot_without_touching_target() {
+    let Some((dir, _)) = scratch() else { return };
+    let library = dir.path().join("library");
+    let f = Fixture {
+        game: dir.path(),
+        library: &library,
+    };
+    f.create();
+    let mut port = f.session(|_| Fault::None);
+    let step = prepare_detach(&mut port, WINNER);
+    let original = base(&step);
+
+    let wrong_retain = BackupRef::from_record(
+        step.op,
+        step.ordinal,
+        StepDirection::Forward,
+        BackupSlot::Original,
+    );
+    let outcome = port.detach_existing_retain(&step.spec.target, &original, wrong_retain);
+    let EffectOutcome::Conflict(evidence) = outcome else {
+        panic!("a wrong retain slot was accepted: {outcome:?}")
+    };
+    assert_eq!(evidence, port.inspect_step(&step));
+    assert_eq!(evidence.target, Observation::Regular(original));
+    assert_eq!(evidence.retained, Artifact::Absent);
+
+    bytes(&f.target(WINNER), BASE);
+    absent(&port.backup_path(step.retain));
+}
+
+#[test]
+fn detach_native_error_with_missing_target_and_occupied_slot_is_ambiguous() {
+    let Some((dir, _)) = scratch() else { return };
+    let library = dir.path().join("library");
+    let f = Fixture {
+        game: dir.path(),
+        library: &library,
+    };
+    f.create();
+    let target = f.target(WINNER);
+    let displaced = dir.path().join("private/ops/1/0/forward/displaced");
+    let raced = target.clone();
+    let occupied = displaced.clone();
+    let mut port = f.session(move |event| {
+        if matches!(event, Checkpoint::NativeRename { .. }) {
+            fs::remove_file(&raced).unwrap();
+            fs::write(&occupied, EDIT).unwrap();
+        }
+        Fault::None
+    });
+    let step = prepare_detach(&mut port, WINNER);
+    let original = base(&step);
+
+    let outcome = port.detach_existing_retain(&step.spec.target, &original, step.retain);
+    let EffectOutcome::Ambiguous(evidence) = outcome else {
+        panic!("a refused detach with an occupied slot claimed {outcome:?}")
+    };
+    assert_eq!(evidence.target, Observation::Absent);
+    assert_eq!(evidence.stage, Artifact::Absent);
+    let Artifact::Regular(retained) = &evidence.retained else {
+        panic!(
+            "the occupied slot was not reported: {:?}",
+            evidence.retained
+        )
+    };
+    assert_eq!(retained.len, EDIT.len() as u64);
+
+    absent(&target);
+    bytes(&displaced, EDIT);
 }
 
 #[test]

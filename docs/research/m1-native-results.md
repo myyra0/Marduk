@@ -36,3 +36,32 @@ Environment: Linux 7.3.5-1-cachyos, x86-64, rustc 1.100.0, uid 1000 with `CapEff
 - `cargo fmt --all -- --check`, `cargo build --workspace --locked`, `cargo test --workspace --locked`: passed.
 
 The frozen `run.py` builds its probe with only `.rlib` artifact directories. In this workspace the `zeroize_derive` proc-macro artifact lives in a separate build directory, so the probe first failed with `E0463: can't find crate for marduk_storage`. Symlinking the hashed proc-macro `.so` into `target/debug` (already a search path) let the frozen script complete unchanged. The harness assertions themselves were not modified; no assertion failed.
+
+## Residual closure (2026-11-22)
+
+Adds `crates/platform/tests/native_proof_evidence.rs` detach witnesses, `library_stage.rs` error classification and a private `revisions/` mode. Frozen harness and oracle unchanged.
+
+### Volume-selected library staging
+
+`Catalog::open` picks its stage adapter from the *volume* of the catalog root: `NativeStage::open` → `library_volume_qualified` (`crates/platform/src/linux.rs:904`) accepts only `BTRFS_SUPER_MAGIC`. tmpfs, ext4 and NTFS fall back to `StageAdapter::Unavailable`, so `prepare_import` returns `StageUnavailable`. The suites below therefore need opposite filesystems and cannot share one `TMPDIR`.
+
+| Suite / test | Required volume | Exact run condition | Observed |
+|---|---|---|---|
+| `crates/storage/tests/library_contract.rs` (5 tests), including `unqualified_production_catalog_refuses_preview_without_visible_changes` (`:57`) and `second_catalog_observes_the_active_writer_gate` (`:131`) | non-Btrfs | `tempdir()` under `TMPDIR=/tmp` (tmpfs): `TMPDIR=/tmp cargo test --locked -p marduk-storage --test library_contract` | 5 passed |
+| `library_catalog_never_names_missing_payload` (`tests/platform/m1/native-publication/effects.rs:764`) | Btrfs | `MARDUK_R03_SCRATCH=/home/parth/.cache/r03-run4` (Btrfs): `python tests/platform/m1/native-publication/run.py /home/parth/.cache/r03-run4` | ran all four real catalog cuts (stream, prepared, prepared, committed) |
+| same witness on tmpfs | none (not run) | `MARDUK_R03_SCRATCH=/tmp/opencode/r03-run5` | printed `R03 NOT RUN: catalog native receipt unavailable on this volume`; not a pass |
+| `cargo test --workspace --locked` | non-Btrfs `TMPDIR` | inherits `TMPDIR`; ran as `TMPDIR=/tmp cargo test --workspace --locked` | every suite passed |
+| `crates/storage/src/library/contract_tests.rs` (11 unit tests, frozen oracle) | any | `Catalog::open_for_test` forces the fixture stage, so volume does not select the adapter | 11 passed under `TMPDIR=/tmp` |
+
+Negative evidence for the same rule: `TMPDIR=/home/parth/.cache/r03-tmpdir` (Btrfs) makes the frozen `library_contract` oracle return `Ok(PreparedImport)`; `unqualified_production_catalog_refuses_preview_without_visible_changes` and `second_catalog_observes_the_active_writer_gate` then fail (3 passed, 2 failed). That is the oracle refusing a volume class it was not written for, not a staging defect; the file was not edited.
+
+### Detach and classification witnesses
+
+`MARDUK_R03_SCRATCH` on Btrfs and tmpfs, `--test-threads=1`: `cargo test --locked -p marduk-platform --test native_proof_evidence` → 7 passed on each volume.
+
+- `detach_rejects_wrong_retain_slot_without_touching_target`: `BackupSlot::Original` as the detach retain returns `Conflict`, the target keeps `base\n`, and the operation-owned `displaced` slot stays absent.
+- `detach_native_error_with_missing_target_and_occupied_slot_is_ambiguous`: the target disappears and the displaced slot is written at `NativeRename`; `renameat2` fails, reobservation reports target `Absent` with a non-empty retained slot, and the outcome is `Ambiguous`, never `Observed`.
+- `library_stage.rs:210` now maps a refused/exhausted `create_new` (permission, ENOSPC, I/O) to `StageUnavailable` and only `AlreadyExists` to `StageChanged`.
+- `library_stage.rs:274` maps `ArchiveError::Io` from `admit_zip` to `StageUnavailable`; every other admission error stays `StageChanged`. No new test drives either branch: both need an injected syscall failure, so only the classification code changed.
+- `Catalog::open` creates `revisions/` with mode `0700` (`private_directory`); `revisions_directory_is_private_to_the_owner` asserts `0700` on create and after reopen.
+

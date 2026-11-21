@@ -207,7 +207,15 @@ fn extract(directory: &Path, archive: &Path) -> Result<Vec<PayloadFile>, ImportE
         if let Some(parent) = path.parent() {
             private_create_dir_all(parent).map_err(|_| ImportError::Storage)?;
         }
-        let file = private_create_file(&path).map_err(|_| ImportError::StageChanged)?;
+        let file = private_create_file(&path).map_err(|error| {
+            // A duplicate path is a proved shape conflict. A refused or
+            // exhausted filesystem leaves the stage unverified, not changed.
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                ImportError::StageChanged
+            } else {
+                ImportError::StageUnavailable
+            }
+        })?;
         let mut writer = HashingFile::new(file);
         let written = admitted
             .copy_entry(index, &mut writer)
@@ -271,7 +279,12 @@ fn verify_tree(directory: &Path, evidence: &StageEvidence) -> Result<(), ImportE
         return Err(ImportError::StageChanged);
     }
     let archive_file = fsops::open_regular(&archive).map_err(|_| ImportError::StageUnavailable)?;
-    admit_zip(archive_file, M1_ZIP_LIMITS).map_err(|_| ImportError::StageChanged)?;
+    // A read failure is not an admission shape error: the snapshot stays
+    // unverified rather than proved changed.
+    admit_zip(archive_file, M1_ZIP_LIMITS).map_err(|error| match error {
+        ArchiveError::Io => ImportError::StageUnavailable,
+        _ => ImportError::StageChanged,
+    })?;
 
     let payload = directory.join(PAYLOAD_DIR);
     let mut top_level = BTreeSet::new();

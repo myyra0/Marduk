@@ -60,7 +60,7 @@ impl Catalog {
     /// are read back from the live connection and a mismatch is an error.
     pub fn open(root: &Path) -> Result<Self, ImportError> {
         fs::create_dir_all(root).map_err(|_| ImportError::Storage)?;
-        fs::create_dir_all(root.join(REVISIONS_DIR)).map_err(|_| ImportError::Storage)?;
+        private_directory(&root.join(REVISIONS_DIR)).map_err(|_| ImportError::Storage)?;
 
         let gate = WriterGate::open(root.join(crate::schema::LOCK_FILE)).map_err(gate_error)?;
         let _guard = gate.try_lock().map_err(gate_error)?;
@@ -1361,6 +1361,21 @@ fn collect_payload_files(
         }
     }
     Ok(())
+}
+
+/// The revisions tree holds private payload bytes: no group or other access.
+fn private_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        other => other,
+    }
 }
 
 #[cfg(test)]

@@ -141,6 +141,28 @@ mod library_contract {
         (a, member)
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn revisions_directory_is_private_to_the_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(tmp.path()).unwrap();
+        let revisions = tmp.path().join("revisions");
+        assert!(revisions.is_dir());
+        assert_eq!(
+            revisions.metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        drop(catalog);
+
+        Catalog::open(tmp.path()).unwrap();
+        assert_eq!(
+            revisions.metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
     #[test]
     fn failed_reinstall_keeps_previous_revision_and_bytes() {
         let tmp = tempfile::tempdir().unwrap();
