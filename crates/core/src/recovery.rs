@@ -372,15 +372,19 @@ pub fn recover_pending<J: Journal, P: crate::deployment::DeploymentInputs>(
     }
 
     let status = journal.status(op)?.ok_or(DeployError::UnknownOperation)?;
-    // Collect evidence across the operation even after a previous report or
-    // a cut during reporting. Never run another effect past a found artifact.
+    // Classify every sealed row before any effect. A failed target read still
+    // requires both private slots to be inspected, so hidden evidence cannot
+    // be skipped and a later readable row cannot run first.
     let mut found = false;
     let mut unavailable = false;
+    let mut unreadable_target = false;
     for row in journal.steps(op)? {
         for step in std::iter::once(&row.prepared).chain(row.undo.as_ref()) {
             let evidence = port.inspect_step(step);
             match preserve_displacements(journal, port, step, &evidence) {
-                Ok(preserved) => found |= preserved,
+                Ok(SlotScan::Displaced) => found = true,
+                Ok(SlotScan::TargetUnreadable) => unreadable_target = true,
+                Ok(SlotScan::Clean) => {}
                 Err(DeployError::TargetUnavailable) => unavailable = true,
                 Err(error) => return blocked(journal, op, error),
             }
@@ -393,9 +397,19 @@ pub fn recover_pending<J: Journal, P: crate::deployment::DeploymentInputs>(
         return blocked(journal, op, DeployError::TargetUnavailable);
     }
     match status.kind {
-        OperationKind::Deploy => recover_deploy(journal, port, op, status),
-        OperationKind::Restore => recover_restore(journal, port, op, status),
+        OperationKind::Deploy => recover_deploy(journal, port, op, status, unreadable_target),
+        OperationKind::Restore => recover_restore(journal, port, op, status, unreadable_target),
     }
+}
+
+/// What the two private slots say about a sealed row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotScan {
+    Clean,
+    /// A positive artifact was persisted as an operator-visible blocker.
+    Displaced,
+    /// The public target could not be read and no slot supplied evidence.
+    TargetUnreadable,
 }
 
 fn preserve_displacements<J: Journal, P: CopyEffects>(
@@ -403,13 +417,9 @@ fn preserve_displacements<J: Journal, P: CopyEffects>(
     port: &mut P,
     step: &PreparedStep,
     evidence: &Evidence,
-) -> Result<bool, DeployError> {
-    // A failed target read says nothing about either private slot, so no
-    // displacement can be attributed to this step yet. The target error path
-    // classifies it instead of wedging the operation on invented evidence.
-    if matches!(evidence.target, Observation::Unavailable(_)) {
-        return Ok(false);
-    }
+) -> Result<SlotScan, DeployError> {
+    // Both private slots are independent of the public target, so a failed
+    // target read must never suppress their inspection.
     let mut found = preserve_canonical_displacement(journal, step, evidence)?;
     match port.inspect_alternate_displacement(step) {
         Artifact::Absent => {}
@@ -422,7 +432,13 @@ fn preserve_displacements<J: Journal, P: CopyEffects>(
             found = true;
         }
     }
-    Ok(found)
+    Ok(if found {
+        SlotScan::Displaced
+    } else if matches!(evidence.target, Observation::Unavailable(_)) {
+        SlotScan::TargetUnreadable
+    } else {
+        SlotScan::Clean
+    })
 }
 
 pub(crate) fn preserve_canonical_displacement<J: Journal>(
@@ -430,15 +446,18 @@ pub(crate) fn preserve_canonical_displacement<J: Journal>(
     step: &PreparedStep,
     evidence: &Evidence,
 ) -> Result<bool, DeployError> {
-    if matches!(evidence.target, Observation::Unavailable(_)) {
-        return Ok(false);
-    }
-    // An unreadable canonical slot proves nothing about its contents, so it
-    // can never pass the displacement check and let an effect run.
+    // An unreadable canonical slot proves nothing about its contents. Without
+    // a readable target it is not a displacement report; with a readable
+    // target it can never pass the check and let an effect run.
     if evidence.retained == Artifact::Unavailable {
+        if matches!(evidence.target, Observation::Unavailable(_)) {
+            return Ok(false);
+        }
         journal.block_displacement(step.op, step, step.retain, evidence)?;
         return Ok(true);
     }
+    // A positively observed unexpected artifact is always a displacement,
+    // even when the public target itself could not be read.
     if matches!(
         evidence.retained,
         Artifact::Regular(_) | Artifact::Unsupported(_)
@@ -457,8 +476,8 @@ pub(crate) fn check_displacements<J: Journal, P: CopyEffects>(
     evidence: &Evidence,
 ) -> Result<(), DeployError> {
     match preserve_displacements(journal, port, step, evidence) {
-        Ok(true) => Err(DeployError::RecoveryConflict),
-        Ok(false) => Ok(()),
+        Ok(SlotScan::Displaced) => Err(DeployError::RecoveryConflict),
+        Ok(SlotScan::Clean | SlotScan::TargetUnreadable) => Ok(()),
         Err(DeployError::TargetUnavailable) => {
             journal.block(step.op, Some(DeployError::TargetUnavailable))?;
             Err(DeployError::TargetUnavailable)
@@ -482,6 +501,7 @@ fn recover_deploy<J: Journal, P: CopyEffects>(
     port: &mut P,
     op: OperationId,
     status: OperationStatus,
+    unreadable_target: bool,
 ) -> Result<Option<OperationStatus>, DeployError> {
     let rows = journal.steps(op)?;
     match status.phase {
@@ -497,6 +517,11 @@ fn recover_deploy<J: Journal, P: CopyEffects>(
         Phase::Applying => journal.set_phase(op, Phase::Applying, Phase::RollingBack)?,
         Phase::RollingBack => {}
         _ => return Ok(Some(status)),
+    }
+    // A row whose public target could not be read has no slot evidence to
+    // resolve. Stop before any effect rather than rolling back later rows.
+    if unreadable_target {
+        return blocked(journal, op, DeployError::TargetUnavailable);
     }
 
     for row in rows.iter().rev() {
@@ -629,6 +654,7 @@ fn recover_restore<J: Journal, P: CopyEffects>(
     port: &mut P,
     op: OperationId,
     status: OperationStatus,
+    unreadable_target: bool,
 ) -> Result<Option<OperationStatus>, DeployError> {
     let rows = journal.steps(op)?;
     match status.phase {
@@ -643,6 +669,11 @@ fn recover_restore<J: Journal, P: CopyEffects>(
         }
         Phase::Restoring => {}
         _ => return Ok(Some(status)),
+    }
+    // An unreadable row target with no positive slot evidence is typed, and
+    // must not let the readable rows run first.
+    if unreadable_target {
+        return blocked(journal, op, DeployError::TargetUnavailable);
     }
 
     for row in rows.iter().rev() {

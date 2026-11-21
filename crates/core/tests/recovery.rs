@@ -560,6 +560,10 @@ impl CopyEffects for Effects {
         }
     }
 
+    fn inspect_alternate_displacement(&mut self, step: &PreparedStep) -> Artifact {
+        artifact(lookup(&self.visible.backups, step.alternate_displacement()))
+    }
+
     fn durability_barrier(&mut self, step: &PreparedStep, _: &Evidence) -> BarrierOutcome {
         let evidence = self.inspect_step(step);
         let path = step.spec.target.target.relative.as_str();
@@ -798,6 +802,22 @@ impl Journal for Ledger {
 
     fn block(&mut self, op: OperationId, error: Option<DeployError>) -> Result<(), DeployError> {
         self.visible.statuses.get_mut(&op).unwrap().blocker = error;
+        self.persist();
+        Ok(())
+    }
+
+    fn block_displacement(
+        &mut self,
+        op: OperationId,
+        _step: &PreparedStep,
+        at: BackupRef,
+        _evidence: &Evidence,
+    ) -> Result<(), DeployError> {
+        let status = self.visible.statuses.get_mut(&op).unwrap();
+        if !status.retained.contains(&at) {
+            status.retained.push(at);
+        }
+        status.blocker = Some(DeployError::RecoveryConflict);
         self.persist();
         Ok(())
     }
@@ -1639,6 +1659,69 @@ fn unreadable_target_during_recovery_is_not_a_displacement() {
     f.assert_resolved(op, OperationKind::Deploy, Phase::RolledBack, None);
     f.mutations(&[]);
     f.files(None, BASE);
+}
+
+#[test]
+fn unreadable_restore_target_with_alternate_evidence_blocks_before_effects() {
+    let mut f = Fixture::new(WINNER);
+    let deployed = f.deploy();
+    let generation = deployed.generation;
+    let op = f.cut_restore();
+    let winner = f.journal.durable.steps[&op]
+        .iter()
+        .find(|row| row.prepared.spec.target.target.relative.as_str() == WINNER)
+        .unwrap()
+        .prepared
+        .clone();
+    let alternate = winner.alternate_displacement();
+    f.effects
+        .durable
+        .backups
+        .push((alternate, File::new(EDIT, 997)));
+    f.boot();
+    f.effects.target_reads.clear();
+    // The winner row is scanned first but restored last. Skipping its
+    // alternate would let the readable created row detach before the block.
+    f.effects.unreadable_target_after = Some((WINNER, 1));
+    let status = f.recover().unwrap();
+    assert_eq!(
+        (
+            status.kind,
+            status.phase,
+            status.generation,
+            status.blocker.clone(),
+        ),
+        (
+            OperationKind::Restore,
+            Phase::Restoring,
+            generation,
+            Some(DeployError::RecoveryConflict),
+        )
+    );
+    assert!(status.retained.contains(&alternate));
+    assert_eq!(f.state(op).retained, status.retained);
+    f.root_state(Some(op), generation);
+    f.mutations(&[
+        (Mutation::Create, CREATED),
+        (Mutation::Replace, WINNER),
+        (Mutation::Replace, WINNER),
+    ]);
+    f.files(Some(ONLY_A), BASE);
+
+    // Once the target is readable and the hidden artifact is resolved, the
+    // same pending Restore finishes without changing the generation.
+    f.effects.unreadable_target_after = None;
+    f.effects.target_reads.clear();
+    assert!(take(&mut f.effects.durable.backups, alternate).is_some());
+    f.boot();
+    f.assert_resolved(op, OperationKind::Restore, Phase::Completed, None);
+    f.files(None, BASE);
+    f.mutations(&[
+        (Mutation::Create, CREATED),
+        (Mutation::Replace, WINNER),
+        (Mutation::Replace, WINNER),
+        (Mutation::Detach, CREATED),
+    ]);
 }
 
 #[test]
