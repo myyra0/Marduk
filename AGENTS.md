@@ -46,6 +46,16 @@ Reuse sound existing Rust components from legacy instead of rewriting them.
 Rust is the default, including for hard problems; difficulty is never a reason to reach for Python. Python only where it is genuinely the better tool (dev tooling, glue, a Python-only dependency). Python in the shipped app needs an ADR: why Rust is a poor fit, and how it is bundled per OS.
 Tauri 2 only: capabilities/permissions model, no v1 APIs (`allowlist`, `tauri::api`).
 
+## Library and platform research
+
+Use Context7 (`query-docs`) before writing a third-party library or framework API, especially when the dependency
+version may be newer than training data: Rust crates (for example `zip`, `rusqlite`, `windows-sys`), Tauri 2, and the
+React/Vite/Vitest stack. It informs syntax and current API shape, never behavior: the brief, contracts and repo docs
+remain authoritative, and a query result does not authorize a narrower guarantee or a different design.
+For OS primitives and filesystem semantics (`renameat2`, Btrfs ioctls, Win32 durability), prefer the locked crate
+source, local kernel headers/man pages and current vendor documentation; Context7 is not authoritative there.
+If Context7 is unavailable, read the locked crate source in `~/.cargo/registry/src/` and record that path in the report.
+
 ## Reliability
 
 Anything that modifies a game install or user files is transactional: journaled, validated, reports progress, and can be
