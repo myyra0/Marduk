@@ -40,6 +40,7 @@
 ## Packet catalog and readiness
 
 - [M1: Working core](2026-11-20-m1-working-core.md) describes the first vertical slice and reference-test decisions.
+- [M1-CORE: Remaining working core](2026-11-21-m1-complete.md) combines the remaining M1 work in one launch with intermediate proof gates.
 - [M2–M4: Full-parity packets](2026-11-20-m2-m4-parity-packets.md) assigns later work now. Gate dependencies are explicit; the catalog is not independent acceptance of each affected contract.
 - [Architecture gate register](../../architecture.md#decision-and-proof-register) owns decisions and proof requirements. [Backlog](../../backlog-deferred.md) names retained gaps; a backlog entry is not permission to park a failed acceptance check.
 
@@ -102,14 +103,14 @@ Use this as the source handoff for the **inventoried** scope, not a claim that e
 - **Traceability:** the [capability register](../../inventory.md#capability-register) assigns outcomes and checks; the [packet catalog](2026-11-20-m2-m4-parity-packets.md) assigns owners. Fixture definitions, check commands and exact implementation files are still prospective where there is no baseline.
 - **Open gates, not assumed exclusions:** named native filesystem/power-loss and private-view proofs; installed artifact availability, scope, updates, associations and runtime helpers; provider eligibility, keyring, diagnostic sharing, codec/format/redistribution rights; and any separate operation to abandon recorded deployment metadata. See the [decision and proof register](../../architecture.md#decision-and-proof-register) and [deferred outcomes](../../backlog-deferred.md). No production or live proof follows from this handoff.
 
-### Before the first behavior dispatch
+### Execution gates
 
-Do not confuse the full audit checkpoint C0, packet readiness, and runtime proof. M1-A00 is verified; that does not approve M1-C01 or establish any product behavior. Do not dispatch production code in the planning session.
+Do not confuse the full audit checkpoint C0, packet readiness, and runtime proof. M1-A00 and M1-C01 have passed their gates; neither qualifies game-directory writes. Do not dispatch production code in the planning session.
 
 | Gate | Missing evidence or permission | What it blocks |
 |---|---|---|
 | Baseline | [M1-A00 is verified](2026-11-20-m1-working-core.md#m1-a00--baseline-workspace-and-native-ci) on Linux and Windows. | Closed for the starting workspace only, not product or filesystem behavior. |
-| First behavior brief | Approve the [M1-C01 packet](2026-11-21-m1-c01-resolver.md) and [contract](../../contracts/m1-file-resolution.md). In the same execution session, an oracle author turns the named witnesses into tests and an independent reviewer checks them before production dispatch. | First resolver implementation dispatch, not remaining source research. |
+| Working core | Approve [M1-CORE](2026-11-21-m1-complete.md) and complete its preflight. Preserve the native effect and recovery gates between implementation stages. | Remaining M1 implementation; missing native proof blocks the affected effect and qualification, not independent work. |
 | Execution model preflight | Resolve configured IDs for the three selected models and verify `high` is available for each. Confirm independent review and ledger/resume in a manually started session before trusting the supervisor. | Unattended execution; never silently substitute. |
 | Native scratch environments | Provide isolated ext4 and Btrfs Linux environments and native Windows NTFS. This checkout is on Btrfs; QEMU, `virsh` and `mkfs.ntfs` were not found on its `PATH`, which does not establish that a separate runner is unavailable. Destructive power-cut testing requires a separate disposable VM or disk image and approval. | Native probing and durability proof on an unavailable target; not pure resolver/archive checks. |
 | C0 decision and review | Review the source handoff and affected fixture definitions; rule on consequential decisions or explicitly gate them. Live/native/package checks still require their own approvals and capabilities. | Full C0 sign-off and affected downstream packet freeze, not independent preparation. |

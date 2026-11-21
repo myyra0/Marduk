@@ -33,13 +33,15 @@ The [C01 worker contract](../../contracts/m1-file-resolution.md) owns exact logi
 
 ## Session packets
 
+Run the remaining stages together under [M1-CORE](2026-11-21-m1-complete.md). The sections below retain original ownership and proof dependencies; they are not separate launches for this run.
+
 ### M1-A00 — Baseline, workspace and native CI
 
 **Status:** `verified` at `b54af92528166a55612ed73258783e4e35b9860a`. The [approved brief](2026-11-21-m1-a00-baseline.md) used rolling Rust `stable`, locked dependencies and one empty `marduk-core` crate. [Hosted CI](https://github.com/myyra0/Marduk/actions/runs/44906174341) passed format, locked build and locked tests on both native hosts. The baseline proves CI runs, not product behavior or native recovery. Each later packet owns its crate, and M1-U01 owns the desktop scaffold and checks.
 
 ### M1-C01 — Workspace, shared domain and resolver
 
-**Predecessor:** Verified M1-A00; approve this packet's interfaces only, not full C0 sign-off. **Status:** `draft` pending approval and preflight of the [execution packet](2026-11-21-m1-c01-resolver.md). The orchestrator owns test authoring and implementation in one run. This packet works on logical manifests only; actual filesystem placement belongs to M1-R01.
+**Status:** accepted at `022ef3a9866cb828c63dad5dff3d121e6d531fbc` after the scoped correction and Sol re-review, with [green hosted CI](https://github.com/myyra0/Marduk/actions/runs/44909371190). The [execution packet](2026-11-21-m1-c01-resolver.md) covers logical manifests only. Native filesystem placement belongs to M1-R01.
 
 ### M1-R01 — Root identity, portable relative paths and safe publication seam
 
