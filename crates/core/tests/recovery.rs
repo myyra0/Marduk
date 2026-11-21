@@ -1483,13 +1483,11 @@ fn unknown_external_file_is_not_removed() {
             Some(DeployError::RecoveryConflict),
         );
         f.root_state(Some(op), None);
-        f.files(Some(ONLY_A), BASE);
+        // The external edit is classified before any row rolls back, so the
+        // readable winner row is left untouched as well.
+        f.files(Some(ONLY_A), B);
         assert_eq!(f.effects.durable.public[CREATED], external);
-        f.mutations(&[
-            (Mutation::Create, CREATED),
-            (Mutation::Replace, WINNER),
-            (Mutation::Replace, WINNER),
-        ]);
+        f.mutations(&[(Mutation::Create, CREATED), (Mutation::Replace, WINNER)]);
     }
 }
 

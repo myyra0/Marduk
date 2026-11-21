@@ -234,3 +234,63 @@ fn restore_does_not_retry_without_the_sealed_step_backup() {
     f.files(Some(ONLY_A), BASE);
     assert_eq!(f.effects.mutations.len(), 3);
 }
+
+#[test]
+fn deploy_rollback_classifies_a_later_conflict_before_any_effect() {
+    let mut f = Fixture::new(WINNER);
+    let plan = f.plan();
+    let op = f.cut_apply(plan, Cut::BeforeWinnerAck);
+    // The winner row is resolvable and rolls back first in the reverse order;
+    // the created row is externally edited and conflicts second.
+    f.effects.external_write(CREATED, ONLY_A);
+    let external = f.effects.durable.public[CREATED].clone();
+    let effects = f.effects.mutations.len();
+    f.boot();
+    for _ in 0..2 {
+        let status = f.recover().unwrap();
+        assert_eq!(
+            (status.kind, status.phase, status.generation),
+            (OperationKind::Deploy, Phase::RollingBack, None)
+        );
+        assert_eq!(status.blocker, Some(DeployError::RecoveryConflict));
+        assert_eq!(f.state(op).blocker, status.blocker);
+        f.root_state(Some(op), None);
+        assert_eq!(f.effects.durable.public[CREATED], external);
+        assert_eq!(f.effects.durable.public[WINNER].bytes, B);
+        assert_eq!(f.effects.mutations.len(), effects);
+        assert_eq!(f.journal.finishes, 0);
+    }
+}
+
+#[test]
+fn restore_continuation_classifies_a_later_conflict_before_any_effect() {
+    let mut f = Fixture::new(WINNER);
+    let deploy = f.deploy();
+    let op = f.cut_restore();
+    // The created row is resolvable and restores first in the reverse order;
+    // the winner row was externally edited and conflicts second.
+    f.effects.external_write(WINNER, EDIT);
+    let external = f.effects.durable.public[WINNER].clone();
+    let effects = f.effects.mutations.len();
+    let finishes = f.journal.finishes;
+    f.boot();
+    for _ in 0..2 {
+        let status = f.recover().unwrap();
+        assert_eq!(
+            (status.kind, status.phase, status.generation),
+            (OperationKind::Restore, Phase::Restoring, deploy.generation)
+        );
+        assert_eq!(status.blocker, Some(DeployError::RecoveryConflict));
+        f.assert_status(
+            &status,
+            OperationKind::Restore,
+            Phase::Restoring,
+            Some(DeployError::RecoveryConflict),
+        );
+        f.root_state(Some(op), deploy.generation);
+        assert_eq!(f.effects.durable.public[WINNER], external);
+        assert_eq!(f.effects.durable.public[CREATED].bytes, ONLY_A);
+        assert_eq!(f.effects.mutations.len(), effects);
+        assert_eq!(f.journal.finishes, finishes);
+    }
+}

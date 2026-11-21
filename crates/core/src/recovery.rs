@@ -377,18 +377,31 @@ pub fn recover_pending<J: Journal, P: crate::deployment::DeploymentInputs>(
     // be skipped and a later readable row cannot run first.
     let mut found = false;
     let mut unavailable = false;
-    let mut unreadable_target = false;
+    let mut scans = Vec::new();
     for row in journal.steps(op)? {
-        for step in std::iter::once(&row.prepared).chain(row.undo.as_ref()) {
-            let evidence = port.inspect_step(step);
-            match preserve_displacements(journal, port, step, &evidence) {
-                Ok(SlotScan::Displaced) => found = true,
-                Ok(SlotScan::TargetUnreadable) => unreadable_target = true,
-                Ok(SlotScan::Clean) => {}
-                Err(DeployError::TargetUnavailable) => unavailable = true,
-                Err(error) => return blocked(journal, op, error),
-            }
+        let forward = port.inspect_step(&row.prepared);
+        match preserve_displacements(journal, port, &row.prepared, &forward) {
+            Ok(SlotScan::Displaced) => found = true,
+            Ok(SlotScan::TargetUnreadable) => {}
+            Ok(SlotScan::Clean) => {}
+            Err(DeployError::TargetUnavailable) => unavailable = true,
+            Err(error) => return blocked(journal, op, error),
         }
+        let undo = match &row.undo {
+            Some(undo) => {
+                let evidence = port.inspect_step(undo);
+                match preserve_displacements(journal, port, undo, &evidence) {
+                    Ok(SlotScan::Displaced) => found = true,
+                    Ok(SlotScan::TargetUnreadable) => {}
+                    Ok(SlotScan::Clean) => {}
+                    Err(DeployError::TargetUnavailable) => unavailable = true,
+                    Err(error) => return blocked(journal, op, error),
+                }
+                Some(evidence)
+            }
+            None => None,
+        };
+        scans.push(ScannedRow { row, forward, undo });
     }
     if found || journal.has_unresolved_displacement(op)? {
         return journal.status(op);
@@ -397,9 +410,19 @@ pub fn recover_pending<J: Journal, P: crate::deployment::DeploymentInputs>(
         return blocked(journal, op, DeployError::TargetUnavailable);
     }
     match status.kind {
-        OperationKind::Deploy => recover_deploy(journal, port, op, status, unreadable_target),
-        OperationKind::Restore => recover_restore(journal, port, op, status, unreadable_target),
+        OperationKind::Deploy => recover_deploy(journal, port, op, status, scans),
+        OperationKind::Restore => recover_restore(journal, port, op, status, scans),
     }
+}
+
+/// One sealed row plus the evidence the displacement scan already read.
+///
+/// Recovery classifies every row from this snapshot before it runs any effect,
+/// so a conflict cannot be discovered only after an earlier row mutated.
+struct ScannedRow {
+    row: StepRecord,
+    forward: Evidence,
+    undo: Option<Evidence>,
 }
 
 /// What the two private slots say about a sealed row.
@@ -501,7 +524,7 @@ fn recover_deploy<J: Journal, P: CopyEffects>(
     port: &mut P,
     op: OperationId,
     status: OperationStatus,
-    unreadable_target: bool,
+    scans: Vec<ScannedRow>,
 ) -> Result<Option<OperationStatus>, DeployError> {
     let rows = journal.steps(op)?;
     match status.phase {
@@ -518,13 +541,14 @@ fn recover_deploy<J: Journal, P: CopyEffects>(
         Phase::RollingBack => {}
         _ => return Ok(Some(status)),
     }
-    // A row whose public target could not be read has no slot evidence to
-    // resolve. Stop before any effect rather than rolling back later rows.
-    if unreadable_target {
-        return blocked(journal, op, DeployError::TargetUnavailable);
+    // Every row's complete rollback state is classified before the first
+    // effect, so a later conflict cannot follow an earlier mutation.
+    if let Err(error) = classify_deploy(port, &scans) {
+        return blocked(journal, op, error);
     }
 
-    for row in rows.iter().rev() {
+    for scan in scans.iter().rev() {
+        let row = &scan.row;
         let forward = &row.prepared;
         let result = if let Some(undo) = &row.undo {
             resume_undo(journal, port, row, undo)
@@ -654,7 +678,7 @@ fn recover_restore<J: Journal, P: CopyEffects>(
     port: &mut P,
     op: OperationId,
     status: OperationStatus,
-    unreadable_target: bool,
+    scans: Vec<ScannedRow>,
 ) -> Result<Option<OperationStatus>, DeployError> {
     let rows = journal.steps(op)?;
     match status.phase {
@@ -670,14 +694,15 @@ fn recover_restore<J: Journal, P: CopyEffects>(
         Phase::Restoring => {}
         _ => return Ok(Some(status)),
     }
-    // An unreadable row target with no positive slot evidence is typed, and
-    // must not let the readable rows run first.
-    if unreadable_target {
-        return blocked(journal, op, DeployError::TargetUnavailable);
+    // A row that cannot continue is typed before the first reverse effect, so
+    // a readable earlier row cannot mutate ahead of a later conflict.
+    if let Err(error) = classify_restore(port, &scans) {
+        return blocked(journal, op, error);
     }
 
-    for row in rows.iter().rev() {
-        let step = &row.prepared;
+    for scan in scans.iter().rev() {
+        let step = &scan.row.prepared;
+        let row = &scan.row;
         let result = (|| {
             let evidence = inspect_checked(journal, port, step)?;
             let from = row.phase;
@@ -735,6 +760,108 @@ fn recover_restore<J: Journal, P: CopyEffects>(
         journal.block(op, None)?;
     }
     crate::deployment::finish(journal, op, Finalize::RestoreCompleted).map(Some)
+}
+
+/// Read-only, phase-aware rollback check for every sealed row.
+///
+/// It mirrors the effect loop's state machine but only observes: target pre,
+/// post or unknown, canonical retain, stage evidence and the required original
+/// and step pre-image backups. Any row that could not continue is a typed
+/// blocker, so no effect runs after a conflict was already discoverable.
+fn classify_deploy<P: CopyEffects>(port: &mut P, scans: &[ScannedRow]) -> Result<(), DeployError> {
+    for scan in scans {
+        let row = &scan.row;
+        let forward = &row.prepared;
+        let evidence = &scan.forward;
+        if matches!(evidence.target, Observation::Unavailable(_)) {
+            return Err(observation_error(&evidence.target));
+        }
+        if let Some(undo) = &row.undo {
+            let evidence = scan.undo.as_ref().ok_or(DeployError::RecoveryConflict)?;
+            classify_forward_state(port, forward, &scan.forward)?;
+            classify_undo(port, row.phase, undo, evidence)?;
+            continue;
+        }
+        if evidence.target == as_observation(&forward.spec.pre) {
+            if !matches!(
+                row.phase,
+                StepPhase::Ready | StepPhase::Attempting | StepPhase::Undone
+            ) {
+                return Err(DeployError::RecoveryConflict);
+            }
+            check_pre(port, forward, evidence)?;
+        } else {
+            if !matches!(row.phase, StepPhase::Attempting | StepPhase::Applied) {
+                return Err(observation_error(&evidence.target));
+            }
+            check_post(port, forward, evidence)?;
+            // A rollback of a published forward step needs a preparable undo.
+            if !matches!(
+                crate::deployment::expected_post_state(forward),
+                PreState::Regular(_)
+            ) {
+                return Err(DeployError::RecoveryConflict);
+            }
+            if matches!(forward.spec.pre, PreState::Regular(_))
+                && (!matches!(forward.step_pre.observation, PreState::Regular(_))
+                    || forward.step_pre.backup.is_none())
+            {
+                return Err(DeployError::RecoveryConflict);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The undo half of the same read-only classification.
+fn classify_undo<P: CopyEffects>(
+    port: &mut P,
+    phase: StepPhase,
+    undo: &PreparedStep,
+    evidence: &Evidence,
+) -> Result<(), DeployError> {
+    if matches!(evidence.target, Observation::Unavailable(_)) {
+        return Err(observation_error(&evidence.target));
+    }
+    let settled = matches!(phase, StepPhase::UndoAttempting | StepPhase::Undone)
+        && evidence.target == crate::deployment::expected_post(undo);
+    if settled {
+        return check_post(port, undo, evidence);
+    }
+    if !matches!(
+        phase,
+        StepPhase::Attempting | StepPhase::Applied | StepPhase::UndoAttempting
+    ) {
+        return Err(observation_error(&evidence.target));
+    }
+    check_pre(port, undo, evidence)
+}
+
+/// Read-only, phase-aware continuation check for every Restore row.
+fn classify_restore<P: CopyEffects>(port: &mut P, scans: &[ScannedRow]) -> Result<(), DeployError> {
+    for scan in scans {
+        let row = &scan.row;
+        let step = &row.prepared;
+        let evidence = &scan.forward;
+        if matches!(evidence.target, Observation::Unavailable(_)) {
+            return Err(observation_error(&evidence.target));
+        }
+        if !matches!(
+            row.phase,
+            StepPhase::Ready | StepPhase::Attempting | StepPhase::Applied
+        ) {
+            return Err(DeployError::RecoveryConflict);
+        }
+        if evidence.target == crate::deployment::expected_post(step) {
+            if row.phase == StepPhase::Ready {
+                return Err(DeployError::RecoveryConflict);
+            }
+            check_post(port, step, evidence)?;
+        } else {
+            check_pre(port, step, evidence)?;
+        }
+    }
+    Ok(())
 }
 
 fn blocked<J: Journal>(
@@ -848,6 +975,14 @@ fn check_forward_slots<J: Journal, P: CopyEffects>(
     forward: &PreparedStep,
 ) -> Result<(), DeployError> {
     let evidence = inspect_checked(journal, port, forward)?;
+    classify_forward_state(port, forward, &evidence)
+}
+
+fn classify_forward_state<P: CopyEffects>(
+    port: &mut P,
+    forward: &PreparedStep,
+    evidence: &Evidence,
+) -> Result<(), DeployError> {
     if matches!(evidence.target, Observation::Unavailable(_))
         || evidence.stage != Artifact::Absent
         || evidence.retained != crate::deployment::expected_retained(forward)
