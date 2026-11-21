@@ -160,6 +160,22 @@ fn writer_sharing_refuses_observation() {
 }
 
 #[test]
+fn ordinary_file_is_regular_without_security_privileges() {
+    let tmp = tempfile::tempdir().unwrap();
+    layout(tmp.path());
+    let path = tmp.path().join("Data/original.dds");
+    fs::write(&path, b"inert").unwrap();
+    let binding = bind_installation(tmp.path(), &LAYOUT).unwrap();
+    let target =
+        resolve_existing_parent(&binding, &RelativePath::parse("original.dds").unwrap()).unwrap();
+    let observation = observe_target(&target).unwrap();
+    assert!(
+        matches!(&observation, TargetObservation::Regular { fingerprint } if fingerprint.len == 5),
+        "expected an ordinary original to be regular, got {observation:?}"
+    );
+}
+
+#[test]
 fn native_extended_attributes_refuse_an_original() {
     let tmp = tempfile::tempdir().unwrap();
     layout(tmp.path());
@@ -168,11 +184,6 @@ fn native_extended_attributes_refuse_an_original() {
     let binding = bind_installation(tmp.path(), &LAYOUT).unwrap();
     let target =
         resolve_existing_parent(&binding, &RelativePath::parse("original.dds").unwrap()).unwrap();
-    assert!(matches!(
-        observe_target(&target),
-        Ok(TargetObservation::Regular { fingerprint }) if fingerprint.len == 5
-    ));
-
     let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
     // FILE_FULL_EA_INFORMATION with name "TEST" and one byte value.
     #[repr(align(4))]

@@ -175,10 +175,9 @@ mod root {
         ERROR_SHARING_VIOLATION, GENERIC_READ, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Security::{
-        ACL, ATTRIBUTE_SECURITY_INFORMATION, DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION,
-        GetKernelObjectSecurity, GetSecurityDescriptorDacl, GetSecurityDescriptorGroup,
-        GetSecurityDescriptorOwner, GetSecurityDescriptorSacl, IsValidAcl, IsValidSid,
-        LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, SCOPE_SECURITY_INFORMATION,
+        ACL, DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetKernelObjectSecurity,
+        GetSecurityDescriptorDacl, GetSecurityDescriptorGroup, GetSecurityDescriptorOwner,
+        IsValidAcl, IsValidSid, OWNER_SECURITY_INFORMATION,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
@@ -210,7 +209,6 @@ mod root {
         file: File,
         final_path: String,
         volume: u64,
-        filesystem: String,
         identity: RootIdentity,
     }
 
@@ -525,8 +523,8 @@ mod root {
             _ => return Err(RootError::TargetUnavailable), // network/device namespaces are not local volumes
         };
         let root = open_path(&guid, DIRECTORY_ACCESS).map_err(|_| RootError::TargetUnavailable)?;
-        let filesystem = filesystem_name(&root)?;
-        let pinned = verify_root(root, filesystem)?;
+        verify_volume_filesystem(&root)?;
+        let pinned = verify_root(root)?;
         if !pinned.final_path.eq_ignore_ascii_case(&guid) {
             return Err(RootError::TargetUnavailable);
         }
@@ -592,7 +590,7 @@ mod root {
             return Err(RootError::UnsupportedTarget(UnsupportedReason::ObjectKind));
         }
         let file = open_entry(parent, &entry, DIRECTORY_ACCESS)?;
-        let child = verify_root(file, parent.filesystem.clone())?;
+        let child = verify_root(file)?;
         if child.final_path != join(&parent.final_path, &entry.name)
             || child.volume != parent.volume
             || child.identity == parent.identity
@@ -606,7 +604,7 @@ mod root {
         format!("{}\\{}", parent.trim_end_matches('\\'), name)
     }
 
-    fn verify_root(file: File, filesystem: String) -> Result<RootDir, RootError> {
+    fn verify_root(file: File) -> Result<RootDir, RootError> {
         let tag = attribute_tag(&file)?;
         if is_reparse(&tag) {
             return Err(RootError::TargetUnavailable);
@@ -622,7 +620,6 @@ mod root {
             file,
             final_path,
             volume: id.VolumeSerialNumber,
-            filesystem,
             identity,
         })
     }
@@ -720,7 +717,7 @@ mod root {
         tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 || tag.ReparseTag != 0
     }
 
-    fn filesystem_name(file: &File) -> Result<String, RootError> {
+    fn verify_volume_filesystem(file: &File) -> Result<(), RootError> {
         let mut name = [0u16; 64];
         let result = unsafe {
             GetVolumeInformationByHandleW(
@@ -744,7 +741,8 @@ mod root {
             .ok_or(RootError::UnsupportedTarget(
                 UnsupportedReason::Configuration,
             ))?;
-        String::from_utf16(&name[..end]).map_err(|_| RootError::Io)
+        char::decode_utf16(name[..end].iter().copied())
+            .try_for_each(|unit| unit.map(|_| ()).map_err(|_| RootError::Io))
     }
 
     fn final_path(file: &File) -> Result<String, RootError> {
@@ -1084,14 +1082,9 @@ mod root {
     }
 
     fn security_sha256(file: &File) -> Result<[u8; 32], RootError> {
-        // These SACL components can be queried with READ_CONTROL but are not
-        // represented by M1 original metadata.
-        let requested = OWNER_SECURITY_INFORMATION
-            | GROUP_SECURITY_INFORMATION
-            | DACL_SECURITY_INFORMATION
-            | LABEL_SECURITY_INFORMATION
-            | ATTRIBUTE_SECURITY_INFORMATION
-            | SCOPE_SECURITY_INFORMATION;
+        // Observation uses READ_CONTROL, not privileged SACL access.
+        let requested =
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
         let mut needed = 0u32;
         let ok = unsafe {
             GetKernelObjectSecurity(
@@ -1137,7 +1130,6 @@ mod root {
         let mut owner = ptr::null_mut();
         let mut group = ptr::null_mut();
         let mut dacl: *mut ACL = ptr::null_mut();
-        let mut extra: *mut ACL = ptr::null_mut();
         let mut present = 0;
         let mut defaulted = 0;
         unsafe {
@@ -1152,10 +1144,6 @@ mod root {
                 && present != 0
                 && !dacl.is_null()
                 && IsValidAcl(dacl) != 0
-                && GetSecurityDescriptorSacl(descriptor, &mut present, &mut extra, &mut defaulted)
-                    != 0
-                && (present == 0
-                    || (!extra.is_null() && IsValidAcl(extra) != 0 && (*extra).AceCount == 0))
         }
     }
 
