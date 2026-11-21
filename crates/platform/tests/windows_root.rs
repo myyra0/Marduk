@@ -28,7 +28,18 @@ fn ancestor_rename_does_not_authorize_observation() {
         .expect("resolve existing target");
 
     let moved = temp.path().join("moved");
-    fs::rename(&root, &moved).expect("rename an ancestor above the installation");
+    if let Err(error) = fs::rename(&root, &moved) {
+        assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
+        assert!(!moved.exists());
+        assert_eq!(
+            fs::read(data.join("original.dds")).unwrap(),
+            b"original bytes"
+        );
+        drop(target);
+        drop(binding);
+        fs::rename(&root, &moved).expect("rename must work once the pins are dropped");
+        return;
+    }
 
     match observe_target(&target) {
         Err(RootError::TargetUnavailable) | Err(RootError::OutsideBoundary) => {}

@@ -146,29 +146,19 @@ fn open_error(code: WIN32_ERROR) -> GateError {
 // ---------------------------------------------------------------------------
 // Native root binding and observation.
 //
-// Every object is opened against a volume-qualified GUID path with
-// `FILE_FLAG_OPEN_REPARSE_POINT`, then verified by handle information. Reparse
-// tags are refused rather than followed, and `GetFinalPathNameByHandleW` plus
-// the 64-bit volume serial from `FileIdInfo` prove containment. Handles pin
-// names without delete sharing.
-//
-// TOCTOU limit: observation is not write authority. The pinned parent identity
-// and its recorded locator are rechecked, the leaf is re-enumerated from that
-// pinned handle, and the opened leaf's `FILE_ID_INFO` must equal the enumerated
-// entry before hashing. A rename of an ancestor changes the pinned parent's
-// final path and is refused. A rename after those checks cannot redirect the
-// opened object to unverified bytes (opened identity is compared again), but a
-// writer with shared access can still change bytes after the final hash; a
-// later native effect must re-observe under the same pinned handles.
+// Each child is opened no-follow with a GUID path derived from its pinned
+// parent and verified against that parent's native enumeration. Directory
+// handles deny write and delete sharing from the volume root through the
+// resolved parent. Observation is not write authority.
 // ---------------------------------------------------------------------------
 mod root {
     use std::fs::File;
     use std::io::Read;
     use std::mem::offset_of;
-    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
-    use std::path::Path;
+    use std::path::{Component, Path, Prefix};
     use std::ptr;
+    use std::sync::Mutex;
 
     use marduk_core::root_identity::{
         FileMetadata, Fingerprint, GameLayout, NativeIdentity, RootError, RootIdentity,
@@ -176,35 +166,56 @@ mod root {
     };
     use marduk_core::targets::RelativePath;
     use sha2::{Digest, Sha256};
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_EA_INFORMATION, FileEaInformation, NtQueryInformationFile,
+    };
     use windows_sys::Win32::Foundation::{
         ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_INSUFFICIENT_BUFFER,
         ERROR_LOCK_VIOLATION, ERROR_MORE_DATA, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND,
         ERROR_SHARING_VIOLATION, GENERIC_READ, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetKernelObjectSecurity,
-        OWNER_SECURITY_INFORMATION,
+        ACL, ATTRIBUTE_SECURITY_INFORMATION, DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION,
+        GetKernelObjectSecurity, GetSecurityDescriptorDacl, GetSecurityDescriptorGroup,
+        GetSecurityDescriptorOwner, GetSecurityDescriptorSacl, IsValidAcl, IsValidSid,
+        LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, SCOPE_SECURITY_INFORMATION,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_ENCRYPTED,
-        FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SPARSE_FILE,
-        FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO,
-        FILE_INFO_BY_HANDLE_CLASS, FILE_NAME_NORMALIZED, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        CreateFileW, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
+        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, FILE_ATTRIBUTE_READONLY,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM, FILE_ATTRIBUTE_TAG_INFO,
+        FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY,
+        FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_READ_EA, FILE_SHARE_READ,
         FILE_STANDARD_INFO, FILE_STREAM_INFO, FileAttributeTagInfo, FileBasicInfo,
         FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo, FileIdInfo, FileStandardInfo,
-        FileStreamInfo, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
-        GetVolumeInformationByHandleW, OPEN_EXISTING, VOLUME_NAME_GUID,
+        FileStreamInfo, FindClose, FindFirstFileW, GetFileInformationByHandleEx,
+        GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
+        GetVolumeNameForVolumeMountPointW, OPEN_EXISTING, READ_CONTROL, ReOpenFile,
+        VOLUME_NAME_GUID, WIN32_FIND_DATAW,
     };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    const NO_FOLLOW: u32 = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT;
+    const DIRECTORY_ACCESS: u32 = FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES;
+    const METADATA_ACCESS: u32 = FILE_READ_ATTRIBUTES | FILE_READ_EA | READ_CONTROL;
+    const ORDINARY_ATTRIBUTES: u32 = FILE_ATTRIBUTE_ARCHIVE
+        | FILE_ATTRIBUTE_HIDDEN
+        | FILE_ATTRIBUTE_NORMAL
+        | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED
+        | FILE_ATTRIBUTE_READONLY
+        | FILE_ATTRIBUTE_SYSTEM;
 
     pub(crate) struct RootDir {
         file: File,
         final_path: String,
         volume: u64,
+        filesystem: String,
         identity: RootIdentity,
     }
 
     pub(crate) struct Binding {
+        ancestors: Vec<RootDir>,
         installation: RootDir,
         data: RootDir,
     }
@@ -224,23 +235,41 @@ mod root {
         creation_100ns: i64,
     }
 
+    impl DirectoryEntry {
+        fn is_reparse(&self) -> bool {
+            self.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 || self.reparse_tag != 0
+        }
+    }
+
     pub(crate) struct ResolvedTarget<'a> {
-        /// Held without delete sharing so the resolved parent cannot be
-        /// renamed under the pending observation.
-        parent: File,
-        /// Locator observed at resolution; a later ancestor rename changes it.
-        parent_path: String,
-        parent_identity: RootIdentity,
-        parent_volume: u64,
+        parents: Vec<RootDir>,
         leaf: String,
+        logical_leaf: String,
         /// Identity enumerated from the pinned parent when the leaf existed.
         leaf_identity: Option<NativeIdentity>,
-        _binding: &'a Binding,
+        binding: &'a Binding,
     }
 
     impl ResolvedTarget<'_> {
+        fn parent(&self) -> &RootDir {
+            self.parents.last().unwrap_or(&self.binding.data)
+        }
+
+        fn check_chain(&self) -> Result<(), RootError> {
+            for root in self
+                .binding
+                .ancestors
+                .iter()
+                .chain([&self.binding.installation, &self.binding.data])
+                .chain(&self.parents)
+            {
+                check_locator(root)?;
+            }
+            Ok(())
+        }
+
         pub(crate) fn parent_identity(&self) -> &RootIdentity {
-            &self.parent_identity
+            &self.parent().identity
         }
 
         pub(crate) fn leaf(&self) -> &str {
@@ -252,31 +281,14 @@ mod root {
         selection: &Path,
         layout: &GameLayout,
     ) -> Result<Binding, RootError> {
-        let installation_file = open_path(selection).map_err(|_| RootError::TargetUnavailable)?;
-        let installation = verify_root(installation_file)?;
-
-        if !ordinary_component(layout.data) {
-            return Err(RootError::UnsupportedTarget(
-                UnsupportedReason::Configuration,
-            ));
-        }
-        let data_path = selection.join(layout.data);
-        let data_file = open_path(&data_path)
-            .map_err(|_| RootError::UnsupportedTarget(UnsupportedReason::Configuration))?;
-        let data = verify_root(data_file)
-            .map_err(|_| RootError::UnsupportedTarget(UnsupportedReason::Configuration))?;
-        if !same_domain(&installation, &data) || installation.identity == data.identity {
-            return Err(RootError::UnsupportedTarget(
-                UnsupportedReason::Configuration,
-            ));
-        }
-        if !has_marker(&installation, layout)? {
+        let binding = bind_pair(selection, layout)?;
+        if !has_marker(&binding.installation, layout)? {
             return Err(RootError::UnsupportedTarget(
                 UnsupportedReason::Configuration,
             ));
         }
 
-        Ok(Binding { installation, data })
+        Ok(binding)
     }
 
     pub(crate) fn reopen_installation(
@@ -285,26 +297,23 @@ mod root {
         installation: &RootIdentity,
         data: &RootIdentity,
     ) -> Result<Binding, RootError> {
-        let reopened = reopen_pair(location, layout).map_err(|_| RootError::TargetUnavailable)?;
+        let reopened = bind_pair(location, layout).map_err(|_| RootError::TargetUnavailable)?;
         if reopened.installation.identity != *installation || reopened.data.identity != *data {
             return Err(RootError::TargetUnavailable);
         }
         Ok(reopened)
     }
 
-    fn reopen_pair(location: &Path, layout: &GameLayout) -> Result<Binding, RootError> {
-        let installation_file = open_path(location).map_err(|_| RootError::TargetUnavailable)?;
-        let installation = verify_root(installation_file)?;
-        if !ordinary_component(layout.data) {
-            return Err(RootError::TargetUnavailable);
-        }
-        let data_file =
-            open_path(&location.join(layout.data)).map_err(|_| RootError::TargetUnavailable)?;
-        let data = verify_root(data_file)?;
-        if !same_domain(&installation, &data) {
-            return Err(RootError::TargetUnavailable);
-        }
-        Ok(Binding { installation, data })
+    fn bind_pair(location: &Path, layout: &GameLayout) -> Result<Binding, RootError> {
+        let mut ancestors = open_selection(location)?;
+        let installation = ancestors.pop().expect("volume root is pinned");
+        let data = pin_directory(&installation, layout.data)
+            .map_err(|_| RootError::UnsupportedTarget(UnsupportedReason::Configuration))?;
+        Ok(Binding {
+            ancestors,
+            installation,
+            data,
+        })
     }
 
     pub(crate) fn resolve_existing_parent<'a>(
@@ -317,82 +326,45 @@ mod root {
             .expect("validated path has a component")
             .to_owned();
 
-        let mut parent = binding.data.file.try_clone().map_err(|_| RootError::Io)?;
-        let mut parent_path = binding.data.final_path.clone();
-        let mut parent_identity = binding.data.identity.clone();
-        let mut parent_volume = binding.data.volume;
+        let mut parents = Vec::new();
 
         for component in components {
-            let name = single_match(&parent, component)?;
-            let opened = open_child(&parent_path, &name)?;
-            let tag = attribute_tag(&opened)?;
-            if is_reparse(&tag) {
-                return Err(RootError::OutsideBoundary);
-            }
-            let standard = standard_info(&opened)?;
-            if !standard.Directory {
-                return Err(RootError::UnsupportedTarget(UnsupportedReason::ObjectKind));
-            }
-            ensure_within(&binding.data, &opened)?;
-
-            parent_path = final_path(&opened)?;
-            parent_identity = RootIdentity::from_adapter_evidence(identity(&opened)?);
-            parent_volume = file_id(&opened)?.VolumeSerialNumber;
-            parent = opened;
+            let child = pin_directory(parents.last().unwrap_or(&binding.data), component)?;
+            parents.push(child);
         }
 
-        let (leaf, leaf_identity) = match leaf_match(&parent, &leaf_planned)? {
+        let parent = parents.last().unwrap_or(&binding.data);
+        let (leaf, leaf_identity) = match leaf_match(parent, &leaf_planned)? {
             Some(entry) => {
-                let opened = open_child(&parent_path, &entry.name)?;
-                if is_reparse(&attribute_tag(&opened)?) {
+                if entry.is_reparse() {
                     return Err(RootError::OutsideBoundary);
                 }
-                let expected = entry_identity(parent_volume, &entry);
-                if identity(&opened)? != expected {
-                    return Err(RootError::TargetUnavailable);
-                }
+                open_entry(parent, &entry, FILE_READ_ATTRIBUTES)?;
+                let expected = entry_identity(parent.volume, &entry);
                 (entry.name, Some(expected))
             }
-            None => (leaf_planned, None),
+            None => (leaf_planned.clone(), None),
         };
 
         Ok(ResolvedTarget {
-            parent,
-            parent_path,
-            parent_identity,
-            parent_volume,
+            parents,
             leaf,
+            logical_leaf: leaf_planned,
             leaf_identity,
-            _binding: binding,
+            binding,
         })
     }
 
     pub(crate) fn observe_target(
         target: &ResolvedTarget<'_>,
     ) -> Result<TargetObservation, RootError> {
-        // The pinned parent must still be the object recorded by resolution.
-        if identity(&target.parent).map_err(|_| RootError::TargetUnavailable)?
-            != *target.parent_identity.evidence()
-        {
-            return Err(RootError::TargetUnavailable);
-        }
-        // An ancestor rename or replacement changes the pinned parent's
-        // locator; the recorded path is then stale authority.
-        let current_path = final_path(&target.parent).map_err(|_| RootError::TargetUnavailable)?;
-        if !current_path.eq_ignore_ascii_case(&target.parent_path) {
-            return Err(RootError::TargetUnavailable);
-        }
-
-        // Re-enumerate from the pinned parent, not from a path string.
-        let mut found = matches(&target.parent, &target.leaf)?;
-        if found.is_empty() {
+        let parent = target.parent();
+        target.check_chain()?;
+        let Some(entry) = leaf_match(parent, &target.logical_leaf)? else {
+            target.check_chain()?;
             return Ok(TargetObservation::Absent);
-        }
-        if found.len() > 1 {
-            return Err(RootError::AmbiguousName);
-        }
-        let entry = found.remove(0);
-        let enumerated = entry_identity(target.parent_volume, &entry);
+        };
+        let enumerated = entry_identity(parent.volume, &entry);
         if target
             .leaf_identity
             .as_ref()
@@ -401,62 +373,56 @@ mod root {
             return Err(RootError::TargetUnavailable);
         }
 
-        let path = join(&current_path, &entry.name);
-        let file = match open_path(Path::new(&path)) {
+        if entry.is_reparse() || entry.attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            return Ok(TargetObservation::Unsupported {
+                reason: UnsupportedReason::ObjectKind,
+            });
+        }
+        let metadata = match open_entry(parent, &entry, METADATA_ACCESS) {
             Ok(file) => file,
-            Err(code) if is_missing(code) => return Ok(TargetObservation::Absent),
-            Err(code) if is_sharing(code) => {
+            Err(RootError::UnsupportedTarget(reason)) => {
+                return Ok(TargetObservation::Unsupported { reason });
+            }
+            Err(error) => return Err(error),
+        };
+        let standard = standard_info(&metadata)?;
+        if is_reparse(&attribute_tag(&metadata)?) || standard.Directory {
+            return Ok(TargetObservation::Unsupported {
+                reason: UnsupportedReason::ObjectKind,
+            });
+        }
+        let before_basic = basic_info(&metadata)?;
+        let Some(security_sha256) = eligible_metadata(&metadata, &before_basic, &standard) else {
+            return Ok(TargetObservation::Unsupported {
+                reason: UnsupportedReason::Metadata,
+            });
+        };
+
+        // Open the already verified object for data, never its pathname again.
+        let handle = unsafe {
+            ReOpenFile(
+                metadata.as_raw_handle(),
+                GENERIC_READ,
+                FILE_SHARE_READ,
+                NO_FOLLOW,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            let code = unsafe { GetLastError() };
+            if is_sharing(code) {
                 return Ok(TargetObservation::Unsupported {
                     reason: UnsupportedReason::Sharing,
                 });
             }
-            Err(_) => return Err(RootError::Io),
-        };
-        if identity(&file).map_err(|_| RootError::Io)? != enumerated {
             return Err(RootError::TargetUnavailable);
         }
-
-        let tag = attribute_tag(&file)?;
-        if is_reparse(&tag) {
-            return Ok(TargetObservation::Unsupported {
-                reason: UnsupportedReason::ObjectKind,
-            });
-        }
-        let standard = standard_info(&file)?;
-        if standard.Directory {
-            return Ok(TargetObservation::Unsupported {
-                reason: UnsupportedReason::ObjectKind,
-            });
-        }
-        if standard.NumberOfLinks > 1 {
+        let file = unsafe { File::from_raw_handle(handle) };
+        check_original(&file, &enumerated, &before_basic, &standard)?;
+        if eligible_metadata(&file, &before_basic, &standard) != Some(security_sha256) {
             return Ok(TargetObservation::Unsupported {
                 reason: UnsupportedReason::Metadata,
             });
         }
-        ensure_within(&target._binding.data, &file)?;
-
-        let basic = basic_info(&file)?;
-        if basic.FileAttributes
-            & (FILE_ATTRIBUTE_COMPRESSED
-                | FILE_ATTRIBUTE_ENCRYPTED
-                | FILE_ATTRIBUTE_OFFLINE
-                | FILE_ATTRIBUTE_SPARSE_FILE
-                | FILE_ATTRIBUTE_REPARSE_POINT)
-            != 0
-        {
-            return Ok(TargetObservation::Unsupported {
-                reason: UnsupportedReason::Metadata,
-            });
-        }
-        if has_unknown_streams(&file)? {
-            return Ok(TargetObservation::Unsupported {
-                reason: UnsupportedReason::Metadata,
-            });
-        }
-
-        let before_identity = identity(&file)?;
-        let before_basic = basic;
-        let security_sha256 = security_sha256(&file)?;
 
         let mut hasher = Sha256::new();
         let mut reader = &file;
@@ -474,23 +440,27 @@ mod root {
             }
         }
 
-        let after_identity = identity(&file)?;
-        let after_basic = basic_info(&file)?;
-        let after_standard = standard_info(&file)?;
-        if before_identity != after_identity
-            || before_basic.LastWriteTime != after_basic.LastWriteTime
-            || before_basic.ChangeTime != after_basic.ChangeTime
-            || len != standard.EndOfFile as u64
-            || after_standard.EndOfFile != standard.EndOfFile
-        {
+        check_original(&file, &enumerated, &before_basic, &standard)?;
+        if len != standard.EndOfFile as u64 {
             return Err(RootError::Io);
         }
+        if eligible_metadata(&file, &before_basic, &standard) != Some(security_sha256) {
+            return Ok(TargetObservation::Unsupported {
+                reason: UnsupportedReason::Metadata,
+            });
+        }
+        let current =
+            leaf_match(parent, &target.logical_leaf)?.ok_or(RootError::TargetUnavailable)?;
+        if entry_identity(parent.volume, &current) != enumerated {
+            return Err(RootError::TargetUnavailable);
+        }
+        target.check_chain()?;
 
         let mut sha256 = [0u8; 32];
         sha256.copy_from_slice(&hasher.finalize());
         Ok(TargetObservation::Regular {
             fingerprint: Fingerprint {
-                identity: before_identity,
+                identity: enumerated,
                 len,
                 sha256,
                 metadata: FileMetadata::Windows {
@@ -503,20 +473,85 @@ mod root {
         })
     }
 
-    fn open_path(path: &Path) -> Result<File, u32> {
-        let wide: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
+    fn open_selection(path: &Path) -> Result<Vec<RootDir>, RootError> {
+        if path.components().any(|part| part == Component::ParentDir) {
+            return Err(RootError::TargetUnavailable);
+        }
+        let absolute = std::path::absolute(path).map_err(|_| RootError::TargetUnavailable)?;
+        let mut parts = absolute.components();
+        let Some(Component::Prefix(prefix)) = parts.next() else {
+            return Err(RootError::TargetUnavailable);
+        };
+        if parts.next() != Some(Component::RootDir) {
+            return Err(RootError::TargetUnavailable);
+        }
+        let guid = match prefix.kind() {
+            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => {
+                let drive = [drive as u16, b':' as u16, b'\\' as u16, 0];
+                let mut guid = [0u16; 50];
+                if unsafe {
+                    GetVolumeNameForVolumeMountPointW(
+                        drive.as_ptr(),
+                        guid.as_mut_ptr(),
+                        guid.len() as u32,
+                    )
+                } == 0
+                {
+                    return Err(RootError::TargetUnavailable);
+                }
+                let end = guid
+                    .iter()
+                    .position(|unit| *unit == 0)
+                    .ok_or(RootError::TargetUnavailable)?;
+                String::from_utf16(&guid[..end]).map_err(|_| RootError::TargetUnavailable)?
+            }
+            Prefix::Verbatim(name)
+                if name.to_str().is_some_and(|name| {
+                    name.len() == 44
+                        && name
+                            .get(..7)
+                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Volume{"))
+                        && name.ends_with('}')
+                }) =>
+            {
+                format!(
+                    "{}\\",
+                    prefix
+                        .as_os_str()
+                        .to_str()
+                        .ok_or(RootError::TargetUnavailable)?
+                )
+            }
+            _ => return Err(RootError::TargetUnavailable), // network/device namespaces are not local volumes
+        };
+        let root = open_path(&guid, DIRECTORY_ACCESS).map_err(|_| RootError::TargetUnavailable)?;
+        let filesystem = filesystem_name(&root)?;
+        let pinned = verify_root(root, filesystem)?;
+        if !pinned.final_path.eq_ignore_ascii_case(&guid) {
+            return Err(RootError::TargetUnavailable);
+        }
+        let mut chain = vec![pinned];
+        for part in parts {
+            let Component::Normal(name) = part else {
+                return Err(RootError::TargetUnavailable);
+            };
+            let name = name.to_str().ok_or(RootError::TargetUnavailable)?;
+            let child = pin_directory(chain.last().expect("volume root is pinned"), name)?;
+            chain.push(child);
+        }
+        Ok(chain)
+    }
+
+    fn open_path(path: &str, access: u32) -> Result<File, u32> {
+        let wide: Vec<u16> = path.encode_utf16().chain([0]).collect();
         let handle = unsafe {
             CreateFileW(
                 wide.as_ptr(),
-                GENERIC_READ,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                access,
+                FILE_SHARE_READ,
                 ptr::null(),
                 OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                NO_FOLLOW,
                 ptr::null_mut(),
             )
         };
@@ -526,23 +561,52 @@ mod root {
         Ok(unsafe { File::from_raw_handle(handle) })
     }
 
-    fn open_child(parent_path: &str, name: &str) -> Result<File, RootError> {
-        open_path(Path::new(&join(parent_path, name))).map_err(|code| {
-            if is_missing(code) {
-                RootError::MissingParent
+    fn open_entry(
+        parent: &RootDir,
+        entry: &DirectoryEntry,
+        access: u32,
+    ) -> Result<File, RootError> {
+        check_locator(parent)?;
+        let file = open_path(&join(&parent.final_path, &entry.name), access).map_err(|code| {
+            if matches!(code, ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) {
+                RootError::TargetUnavailable
             } else if is_sharing(code) {
                 RootError::UnsupportedTarget(UnsupportedReason::Sharing)
             } else {
                 RootError::Io
             }
-        })
+        })?;
+        if identity(&file)? != entry_identity(parent.volume, entry) {
+            return Err(RootError::TargetUnavailable);
+        }
+        check_locator(parent)?;
+        Ok(file)
+    }
+
+    fn pin_directory(parent: &RootDir, name: &str) -> Result<RootDir, RootError> {
+        let entry = leaf_match(parent, name)?.ok_or(RootError::MissingParent)?;
+        if entry.is_reparse() {
+            return Err(RootError::OutsideBoundary);
+        }
+        if entry.attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(RootError::UnsupportedTarget(UnsupportedReason::ObjectKind));
+        }
+        let file = open_entry(parent, &entry, DIRECTORY_ACCESS)?;
+        let child = verify_root(file, parent.filesystem.clone())?;
+        if child.final_path != join(&parent.final_path, &entry.name)
+            || child.volume != parent.volume
+            || child.identity == parent.identity
+        {
+            return Err(RootError::OutsideBoundary);
+        }
+        Ok(child)
     }
 
     fn join(parent: &str, name: &str) -> String {
         format!("{}\\{}", parent.trim_end_matches('\\'), name)
     }
 
-    fn verify_root(file: File) -> Result<RootDir, RootError> {
+    fn verify_root(file: File, filesystem: String) -> Result<RootDir, RootError> {
         let tag = attribute_tag(&file)?;
         if is_reparse(&tag) {
             return Err(RootError::TargetUnavailable);
@@ -551,11 +615,6 @@ mod root {
         if !standard.Directory {
             return Err(RootError::TargetUnavailable);
         }
-        if !filesystem_is_ntfs(&file)? {
-            return Err(RootError::UnsupportedTarget(
-                UnsupportedReason::Configuration,
-            ));
-        }
         let final_path = final_path(&file)?;
         let id = file_id(&file)?;
         let identity = RootIdentity::from_adapter_evidence(identity(&file)?);
@@ -563,37 +622,29 @@ mod root {
             file,
             final_path,
             volume: id.VolumeSerialNumber,
+            filesystem,
             identity,
         })
     }
 
-    fn same_domain(installation: &RootDir, data: &RootDir) -> bool {
-        installation.volume == data.volume && is_within(&data.final_path, &installation.final_path)
-    }
-
-    fn ensure_within(root: &RootDir, file: &File) -> Result<(), RootError> {
-        let id = file_id(file)?;
-        if id.VolumeSerialNumber != root.volume {
-            return Err(RootError::OutsideBoundary);
-        }
-        let path = final_path(file)?;
-        if !is_within(&path, &root.final_path) {
-            return Err(RootError::OutsideBoundary);
+    fn check_locator(root: &RootDir) -> Result<(), RootError> {
+        if final_path(&root.file).map_err(|_| RootError::TargetUnavailable)? != root.final_path
+            || is_reparse(&attribute_tag(&root.file)?)
+        {
+            return Err(RootError::TargetUnavailable);
         }
         Ok(())
-    }
-
-    fn is_within(child: &str, parent: &str) -> bool {
-        let child_lower = child.to_lowercase();
-        let parent_lower = parent.trim_end_matches('\\').to_lowercase();
-        child_lower
-            .strip_prefix(&parent_lower)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('\\'))
     }
 
     fn identity(file: &File) -> Result<NativeIdentity, RootError> {
         let id = file_id(file)?;
         let basic = basic_info(file)?;
+        if id.VolumeSerialNumber == 0 || id.FileId.Identifier == [0; 16] || basic.CreationTime == 0
+        {
+            return Err(RootError::UnsupportedTarget(
+                UnsupportedReason::Configuration,
+            ));
+        }
         Ok(NativeIdentity::Windows {
             volume_serial: id.VolumeSerialNumber,
             file_id: id.FileId.Identifier,
@@ -669,7 +720,7 @@ mod root {
         tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 || tag.ReparseTag != 0
     }
 
-    fn filesystem_is_ntfs(file: &File) -> Result<bool, RootError> {
+    fn filesystem_name(file: &File) -> Result<String, RootError> {
         let mut name = [0u16; 64];
         let result = unsafe {
             GetVolumeInformationByHandleW(
@@ -689,8 +740,11 @@ mod root {
         let end = name
             .iter()
             .position(|unit| *unit == 0)
-            .unwrap_or(name.len());
-        Ok(String::from_utf16_lossy(&name[..end]).eq_ignore_ascii_case("NTFS"))
+            .filter(|end| *end != 0)
+            .ok_or(RootError::UnsupportedTarget(
+                UnsupportedReason::Configuration,
+            ))?;
+        String::from_utf16(&name[..end]).map_err(|_| RootError::Io)
     }
 
     fn final_path(file: &File) -> Result<String, RootError> {
@@ -709,13 +763,16 @@ mod root {
             }
             if (len as usize) < buffer.len() {
                 buffer.truncate(len as usize);
-                return Ok(String::from_utf16_lossy(&buffer));
+                return String::from_utf16(&buffer).map_err(|_| RootError::TargetUnavailable);
             }
             buffer = vec![0u16; len as usize + 1];
         }
     }
 
     fn read_directory(directory: &File) -> Result<Vec<DirectoryEntry>, RootError> {
+        // Restart and continue calls share the directory handle's cursor.
+        static ENUMERATION: Mutex<()> = Mutex::new(());
+        let _guard = ENUMERATION.lock().map_err(|_| RootError::Io)?;
         let mut buffer = vec![0u8; 256 * 1024];
         loop {
             let mut entries = Vec::new();
@@ -813,29 +870,53 @@ mod root {
         }
     }
 
-    fn single_match(directory: &File, component: &str) -> Result<String, RootError> {
-        let mut found = matches(directory, component)?;
-        match found.len() {
-            0 => Err(RootError::MissingParent),
-            1 => Ok(found.remove(0).name),
-            _ => Err(RootError::AmbiguousName),
+    fn leaf_match(parent: &RootDir, component: &str) -> Result<Option<DirectoryEntry>, RootError> {
+        if !ordinary_component(component) {
+            return Err(RootError::TargetUnavailable);
         }
-    }
-
-    fn leaf_match(directory: &File, component: &str) -> Result<Option<DirectoryEntry>, RootError> {
-        let mut found = matches(directory, component)?;
-        match found.len() {
-            0 => Ok(None),
-            1 => Ok(Some(found.remove(0))),
-            _ => Err(RootError::AmbiguousName),
-        }
-    }
-
-    fn matches(directory: &File, component: &str) -> Result<Vec<DirectoryEntry>, RootError> {
-        Ok(read_directory(directory)?
+        check_locator(parent)?;
+        let mut found = read_directory(&parent.file)?
             .into_iter()
-            .filter(|entry| entry.name.eq_ignore_ascii_case(component))
-            .collect())
+            .filter(|entry| entry.name.eq_ignore_ascii_case(component));
+        let entry = found.next();
+        if found.next().is_some() {
+            return Err(RootError::AmbiguousName);
+        }
+        // FindFirstFileW resolves a native lookup (including alternate 8.3
+        // names) without requiring access to the target data or its ACL.
+        let path: Vec<u16> = join(&parent.final_path, component)
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        let mut found = WIN32_FIND_DATAW::default();
+        let handle = unsafe { FindFirstFileW(path.as_ptr(), &mut found) };
+        if handle == INVALID_HANDLE_VALUE {
+            match unsafe { GetLastError() } {
+                ERROR_FILE_NOT_FOUND
+                    if entry.as_ref().is_none_or(|entry| entry.name != component) => {}
+                ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => {
+                    return Err(RootError::TargetUnavailable);
+                }
+                _ => return Err(RootError::Io),
+            }
+        } else {
+            unsafe { FindClose(handle) };
+            let end = found
+                .cFileName
+                .iter()
+                .position(|unit| *unit == 0)
+                .ok_or(RootError::Io)?;
+            if entry.as_ref().is_none_or(|entry| {
+                !entry
+                    .name
+                    .encode_utf16()
+                    .eq(found.cFileName[..end].iter().copied())
+            }) {
+                return Err(RootError::AmbiguousName);
+            }
+        }
+        check_locator(parent)?;
+        Ok(entry)
     }
 
     fn entry_identity(volume: u64, entry: &DirectoryEntry) -> NativeIdentity {
@@ -874,6 +955,62 @@ mod root {
             && !name.contains('\\')
             && !name.contains('\0')
             && !name.contains(':')
+            && !name.contains(['*', '?'])
+    }
+
+    fn check_original(
+        file: &File,
+        expected: &NativeIdentity,
+        basic: &FILE_BASIC_INFO,
+        standard: &FILE_STANDARD_INFO,
+    ) -> Result<(), RootError> {
+        let current = basic_info(file)?;
+        let current_standard = standard_info(file)?;
+        if identity(file)? != *expected
+            || is_reparse(&attribute_tag(file)?)
+            || current.FileAttributes != basic.FileAttributes
+            || current.LastWriteTime != basic.LastWriteTime
+            || current.ChangeTime != basic.ChangeTime
+            || current_standard.DeletePending
+            || current_standard.Directory
+            || current_standard.NumberOfLinks != standard.NumberOfLinks
+            || current_standard.EndOfFile != standard.EndOfFile
+        {
+            return Err(RootError::TargetUnavailable);
+        }
+        Ok(())
+    }
+
+    fn eligible_metadata(
+        file: &File,
+        basic: &FILE_BASIC_INFO,
+        standard: &FILE_STANDARD_INFO,
+    ) -> Option<[u8; 32]> {
+        if standard.DeletePending
+            || standard.NumberOfLinks != 1
+            || standard.EndOfFile < 0
+            || basic.FileAttributes & !ORDINARY_ATTRIBUTES != 0
+            || !no_extended_attributes(file)
+            || !matches!(has_unknown_streams(file), Ok(false))
+        {
+            return None;
+        }
+        security_sha256(file).ok()
+    }
+
+    fn no_extended_attributes(file: &File) -> bool {
+        let mut io = IO_STATUS_BLOCK::default();
+        let mut info = FILE_EA_INFORMATION { EaSize: u32::MAX };
+        let status = unsafe {
+            NtQueryInformationFile(
+                file.as_raw_handle(),
+                &mut io,
+                (&mut info as *mut FILE_EA_INFORMATION).cast(),
+                size_of::<FILE_EA_INFORMATION>() as u32,
+                FileEaInformation,
+            )
+        };
+        status == 0 && io.Information == size_of::<FILE_EA_INFORMATION>() && info.EaSize == 0
     }
 
     fn has_unknown_streams(file: &File) -> Result<bool, RootError> {
@@ -947,8 +1084,14 @@ mod root {
     }
 
     fn security_sha256(file: &File) -> Result<[u8; 32], RootError> {
-        let requested =
-            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+        // These SACL components can be queried with READ_CONTROL but are not
+        // represented by M1 original metadata.
+        let requested = OWNER_SECURITY_INFORMATION
+            | GROUP_SECURITY_INFORMATION
+            | DACL_SECURITY_INFORMATION
+            | LABEL_SECURITY_INFORMATION
+            | ATTRIBUTE_SECURITY_INFORMATION
+            | SCOPE_SECURITY_INFORMATION;
         let mut needed = 0u32;
         let ok = unsafe {
             GetKernelObjectSecurity(
@@ -966,7 +1109,8 @@ mod root {
             return Err(RootError::Io);
         }
 
-        let mut descriptor = vec![0u8; needed as usize];
+        let mut descriptor = vec![0u32; (needed as usize).div_ceil(size_of::<u32>())];
+        let capacity = needed;
         let ok = unsafe {
             GetKernelObjectSecurity(
                 file.as_raw_handle() as HANDLE,
@@ -976,18 +1120,43 @@ mod root {
                 &mut needed,
             )
         };
-        if ok == 0 {
+        if ok == 0 || needed > capacity || !complete_security(descriptor.as_mut_ptr().cast()) {
             return Err(RootError::Io);
         }
         let mut sha256 = [0u8; 32];
         let mut hasher = Sha256::new();
-        hasher.update(&descriptor[..needed as usize]);
+        let bytes = unsafe {
+            std::slice::from_raw_parts(descriptor.as_ptr().cast::<u8>(), needed as usize)
+        };
+        hasher.update(bytes);
         sha256.copy_from_slice(&hasher.finalize());
         Ok(sha256)
     }
 
-    fn is_missing(code: u32) -> bool {
-        matches!(code, ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND)
+    fn complete_security(descriptor: *mut std::ffi::c_void) -> bool {
+        let mut owner = ptr::null_mut();
+        let mut group = ptr::null_mut();
+        let mut dacl: *mut ACL = ptr::null_mut();
+        let mut extra: *mut ACL = ptr::null_mut();
+        let mut present = 0;
+        let mut defaulted = 0;
+        unsafe {
+            GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted) != 0
+                && !owner.is_null()
+                && IsValidSid(owner) != 0
+                && GetSecurityDescriptorGroup(descriptor, &mut group, &mut defaulted) != 0
+                && !group.is_null()
+                && IsValidSid(group) != 0
+                && GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
+                    != 0
+                && present != 0
+                && !dacl.is_null()
+                && IsValidAcl(dacl) != 0
+                && GetSecurityDescriptorSacl(descriptor, &mut present, &mut extra, &mut defaulted)
+                    != 0
+                && (present == 0
+                    || (!extra.is_null() && IsValidAcl(extra) != 0 && (*extra).AceCount == 0))
+        }
     }
 
     fn is_sharing(code: u32) -> bool {

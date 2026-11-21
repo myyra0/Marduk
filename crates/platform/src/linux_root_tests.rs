@@ -10,8 +10,12 @@ use tempfile::TempDir;
 
 use super::*;
 
-/// Ordinary extent-mapped ext4 files carry this flag.
-const FS_EXTENT_FL: libc::c_long = 0x0008_0000;
+const FS_IMMUTABLE_FL: libc::c_long = 0x0000_0010;
+const FS_APPEND_FL: libc::c_long = 0x0000_0020;
+const FS_ENCRYPT_FL: libc::c_long = 0x0000_0800;
+const FS_VERITY_FL: libc::c_long = 0x0010_0000;
+const FS_NOCOW_FL: libc::c_long = 0x0080_0000;
+const FS_DAX_FL: libc::c_long = 0x0200_0000;
 
 const LAYOUT: GameLayout = GameLayout {
     data: "Data",
@@ -35,7 +39,7 @@ fn layout_at(install: &Path) {
 #[test]
 fn extent_mapped_flags_are_supported() {
     assert!(flags_are_supported(0));
-    assert!(flags_are_supported(FS_EXTENT_FL));
+    assert!(flags_are_supported(0x0008_0000));
 }
 
 #[test]
