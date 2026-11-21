@@ -210,17 +210,129 @@ impl Catalog {
     /// ID order for explicit Apply or discard.
     pub fn reconcile(&mut self) -> Result<Vec<ImportId>, ImportError> {
         let _guard = self.lock()?;
-        Err(ImportError::Storage)
+        let rows = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT id FROM imports WHERE state = 'prepared' ORDER BY id")
+                .map_err(storage_error)?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, i64>(0))
+                .map_err(storage_error)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(storage_error)?
+        };
+
+        let mut ids = Vec::with_capacity(rows.len());
+        for value in rows {
+            let value = u64::try_from(value).map_err(|_| ImportError::Storage)?;
+            ids.push(ImportId::try_from_u64(value)?);
+        }
+        Ok(ids)
     }
 
     pub fn reorder(
         &mut self,
-        _profile: ProfileId,
-        _expected: ProfileRevision,
-        _order: &[MemberId],
+        profile: ProfileId,
+        expected: ProfileRevision,
+        order: &[MemberId],
     ) -> Result<ProfileSnapshot, ProfileEditError> {
         let _guard = self.lock_edit()?;
-        Err(ProfileEditError::Storage)
+        let profile_value = sql_profile_id(profile).map_err(|_| ProfileEditError::Storage)?;
+        let expected_value =
+            nonnegative_sql(expected.get()).map_err(|_| ProfileEditError::Storage)?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(edit_storage)?;
+
+        let revision: Option<i64> = transaction
+            .query_row(
+                "SELECT revision FROM profiles WHERE id = ?1",
+                [profile_value],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(edit_storage)?;
+        if revision != Some(expected_value) {
+            return Err(match revision {
+                Some(_) => ProfileEditError::StalePlan,
+                None => ProfileEditError::Storage,
+            });
+        }
+
+        let members =
+            read_member_rows(&transaction, profile_value).map_err(|_| ProfileEditError::Storage)?;
+        validate_permutation(&members, order)?;
+
+        let next = expected
+            .get()
+            .checked_add(1)
+            .ok_or(ProfileEditError::Storage)?;
+        let next_value = nonnegative_sql(next).map_err(|_| ProfileEditError::Storage)?;
+
+        if !members.is_empty() {
+            // Move every ordinal into a disjoint temporary range so the unique
+            // `(profile_id, ordinal)` constraint never sees a transient clash.
+            let offset = members
+                .iter()
+                .map(|member| member.ordinal)
+                .max()
+                .and_then(|ordinal| ordinal.checked_add(1))
+                .ok_or(ProfileEditError::Storage)?;
+            transaction
+                .execute(
+                    "UPDATE members SET ordinal = ordinal + ?1 WHERE profile_id = ?2",
+                    params![offset, profile_value],
+                )
+                .map_err(edit_storage)?;
+        }
+
+        for (ordinal, member) in order.iter().enumerate() {
+            let ordinal_value = i64::try_from(ordinal).map_err(|_| ProfileEditError::Storage)?;
+            let member_value =
+                i64::try_from(member.get()).map_err(|_| ProfileEditError::InvalidOrder)?;
+            transaction
+                .execute(
+                    "UPDATE members SET ordinal = ?1 WHERE id = ?2 AND profile_id = ?3",
+                    params![ordinal_value, member_value, profile_value],
+                )
+                .map_err(edit_storage)?;
+        }
+
+        let changed = transaction
+            .execute(
+                "UPDATE profiles SET revision = ?1 WHERE id = ?2 AND revision = ?3",
+                params![next_value, profile_value, expected_value],
+            )
+            .map_err(edit_storage)?;
+        if changed != 1 {
+            return Err(ProfileEditError::StalePlan);
+        }
+        transaction.commit().map_err(edit_storage)?;
+
+        let by_id: BTreeMap<u64, &MemberRow> = members
+            .iter()
+            .map(|member| (member.id.get(), member))
+            .collect();
+        let reordered = order
+            .iter()
+            .map(|member| {
+                let row = by_id
+                    .get(&member.get())
+                    .expect("permutation was validated above");
+                ProfileMember {
+                    id: *member,
+                    installed: row.installed,
+                    enabled: row.enabled,
+                }
+            })
+            .collect();
+
+        Ok(ProfileSnapshot {
+            id: profile,
+            revision: ProfileRevision::new(next),
+            members: reordered,
+        })
     }
 
     fn lock(&self) -> Result<WriterGuard, ImportError> {
@@ -1223,6 +1335,73 @@ fn remove_directory_if_empty(path: &Path) -> Result<(), ImportError> {
     }
 }
 
+fn validate_permutation(members: &[MemberRow], order: &[MemberId]) -> Result<(), ProfileEditError> {
+    if order.len() != members.len() {
+        return Err(ProfileEditError::InvalidOrder);
+    }
+    let known = members
+        .iter()
+        .map(|member| member.id.get())
+        .collect::<BTreeSet<_>>();
+    let mut seen = BTreeSet::new();
+    for member in order {
+        let value = member.get();
+        if value == 0 || !known.contains(&value) || !seen.insert(value) {
+            return Err(ProfileEditError::InvalidOrder);
+        }
+    }
+    if seen.len() != members.len() {
+        return Err(ProfileEditError::InvalidOrder);
+    }
+    Ok(())
+}
+
+struct MemberRow {
+    id: MemberId,
+    installed: InstalledRevisionId,
+    enabled: bool,
+    ordinal: i64,
+}
+
+fn read_member_rows(
+    transaction: &Transaction<'_>,
+    profile: i64,
+) -> Result<Vec<MemberRow>, ImportError> {
+    let rows = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT id, installed_id, enabled, ordinal FROM members \
+                 WHERE profile_id = ?1 ORDER BY ordinal ASC",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([profile], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(storage_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(storage_error)?
+    };
+
+    let mut members = Vec::with_capacity(rows.len());
+    for (id, installed, enabled, ordinal) in rows {
+        if ordinal < 0 {
+            return Err(ImportError::Storage);
+        }
+        members.push(MemberRow {
+            id: MemberId::new(positive_id(id)?),
+            installed: InstalledRevisionId::new(positive_id(installed)?),
+            enabled: enabled_flag(enabled)?,
+            ordinal,
+        });
+    }
+    Ok(members)
+}
+
 fn revision_dir(root: &Path, id: ImportId) -> PathBuf {
     root.join(REVISIONS_DIR).join(id.get().to_string())
 }
@@ -1350,6 +1529,10 @@ fn gate_error(error: GateError) -> ImportError {
         GateError::Busy => ImportError::Busy,
         GateError::Unavailable | GateError::Io => ImportError::Storage,
     }
+}
+
+fn edit_storage(_error: rusqlite::Error) -> ProfileEditError {
+    ProfileEditError::Storage
 }
 
 fn storage_error(_error: rusqlite::Error) -> ImportError {
