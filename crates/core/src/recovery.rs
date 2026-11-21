@@ -725,6 +725,18 @@ fn observation_error(observation: &Observation) -> DeployError {
     }
 }
 
+/// The typed blocker for a target that could not be read, if any.
+///
+/// A failed target read proves nothing about the namespace, so an effect must
+/// not run on it. Callers that are about to execute persist this before
+/// returning it.
+pub(crate) fn target_error(evidence: &Evidence) -> Option<DeployError> {
+    match &evidence.target {
+        Observation::Unavailable(error) => Some(crate::deployment::map_root_error(error.clone())),
+        _ => None,
+    }
+}
+
 fn check_backup<P: CopyEffects>(port: &mut P, image: &PreImage) -> Result<(), DeployError> {
     match (&image.observation, image.backup) {
         (PreState::Absent, None) => Ok(()),

@@ -998,6 +998,20 @@ impl Fixture {
         operation_status(&mut self.journal, id).unwrap()
     }
 
+    /// The retained locations a seal records: originals and step pre-images.
+    fn sealed_retained(&self, op: OperationId) -> Vec<BackupRef> {
+        self.journal.durable.steps[&op]
+            .iter()
+            .flat_map(|row| {
+                [
+                    row.prepared.spec.original.backup,
+                    row.prepared.step_pre.backup,
+                ]
+            })
+            .flatten()
+            .collect()
+    }
+
     fn cut_apply(&mut self, plan: PlanId, cut: Cut) -> OperationId {
         self.journal.cut = Some(cut);
         interrupted(cut, || {
@@ -1554,8 +1568,52 @@ fn unreadable_target_after_preflight_is_not_a_displacement() {
     f.mutations(&[]);
     f.files(None, BASE);
     let op = f.journal.visible.pending.unwrap();
+    // Sealing advertises the recorded originals; the failed read must not add
+    // a displaced location of its own.
+    assert_eq!(f.state(op).retained, f.sealed_retained(op));
     assert_eq!(f.state(op).blocker, Some(DeployError::TargetUnavailable));
     f.root_state(Some(op), None);
+}
+
+#[test]
+fn unreadable_target_at_apply_read_blocks_the_effect() {
+    let mut f = Fixture::new(WINNER);
+    let plan = f.plan();
+    // Preview, commit preflight and the sealed validation each read the
+    // created target; the per-step apply read then finds the namespace
+    // unreadable before the first public effect can run.
+    f.effects.unreadable_target_after = Some((CREATED, 4));
+    assert_eq!(f.commit(plan), Err(DeployError::TargetUnavailable));
+    f.mutations(&[]);
+    f.files(None, BASE);
+    let op = f.journal.visible.pending.unwrap();
+    assert_eq!(f.state(op).retained, f.sealed_retained(op));
+    assert_eq!(f.state(op).blocker, Some(DeployError::TargetUnavailable));
+    f.root_state(Some(op), None);
+}
+
+#[test]
+fn unreadable_target_at_restore_apply_read_blocks_the_effect() {
+    let mut f = Fixture::new(WINNER);
+    let deployed = f.deploy();
+    let generation = deployed.generation;
+    f.effects.target_reads.clear();
+    // Restore preflight reads the winner once, sealed validation reads it
+    // again, and the per-step apply read then finds it unreadable before the
+    // first reverse effect can run.
+    f.effects.unreadable_target_after = Some((WINNER, 3));
+    assert_eq!(f.restore(), Err(DeployError::TargetUnavailable));
+    f.mutations(&[(Mutation::Create, CREATED), (Mutation::Replace, WINNER)]);
+    f.files(Some(ONLY_A), B);
+    let op = f.journal.visible.pending.unwrap();
+    let status = f.state(op);
+    assert_eq!(
+        (status.kind, status.phase),
+        (OperationKind::Restore, Phase::Restoring)
+    );
+    assert_eq!(status.retained, f.sealed_retained(op));
+    assert_eq!(status.blocker, Some(DeployError::TargetUnavailable));
+    f.root_state(Some(op), generation);
 }
 
 #[test]

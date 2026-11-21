@@ -391,7 +391,7 @@ pub fn commit_deployment<J: Journal, P: DeploymentInputs>(
             StepPhase::Attempting,
             None,
         )?;
-        crate::recovery::inspect_checked(journal, port, step)?;
+        inspect_effect_ready(journal, port, op, step)?;
         let outcome = execute(port, step)?;
         settle_forward(journal, port, op, step, outcome)?;
     }
@@ -511,7 +511,7 @@ pub fn restore<J: Journal, P: DeploymentInputs>(
             StepPhase::Attempting,
             None,
         )?;
-        crate::recovery::inspect_checked(journal, port, step)?;
+        inspect_effect_ready(journal, port, op, step)?;
         let outcome = execute(port, step)?;
         settle_forward(journal, port, op, step, outcome)?;
     }
@@ -525,6 +525,23 @@ pub fn restore<J: Journal, P: DeploymentInputs>(
     }
 
     finish(journal, op, Finalize::RestoreCompleted)
+}
+
+/// Inspect a step at the per-step apply boundary. An unreadable target is a
+/// typed blocker: the checked exchange cannot prove its precondition from a
+/// failed read, so no effect may run and no displacement may be attributed.
+fn inspect_effect_ready<J: Journal, P: CopyEffects>(
+    journal: &mut J,
+    port: &mut P,
+    op: OperationId,
+    step: &PreparedStep,
+) -> Result<(), DeployError> {
+    let evidence = crate::recovery::inspect_checked(journal, port, step)?;
+    if let Some(error) = crate::recovery::target_error(&evidence) {
+        journal.block(op, Some(error))?;
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn validate_prepared<J: Journal, P: CopyEffects>(
