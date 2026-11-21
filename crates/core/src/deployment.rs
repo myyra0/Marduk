@@ -7,8 +7,8 @@
 use crate::ids::{InstalledRevisionId, ProfileId, ProfileRevision};
 use crate::profiles::ProfileSnapshot;
 use crate::recovery::{
-    BackupRef, BarrierOutcome, Claim, CopyEffects, EffectOutcome, Finalize, Journal, Observation,
-    PreImage, PreparedStep, StepDirection, StepOutput, StepPhase, StepSpec,
+    Artifact, BackupRef, BarrierOutcome, Claim, CopyEffects, EffectOutcome, Evidence, Finalize,
+    Journal, Observation, PreImage, PreparedStep, StepDirection, StepOutput, StepPhase, StepSpec,
 };
 use crate::resolve::{ResolveError, ResolvedInputs, resolve_files};
 use crate::root_identity::{Fingerprint, RootError, RootIdentity};
@@ -379,20 +379,17 @@ pub fn commit_deployment<J: Journal, P: DeploymentInputs>(
             StepPhase::Attempting,
             None,
         )?;
-        let outcome = execute(port, step);
-        match settle_forward(journal, port, op, step, outcome) {
-            Ok(()) => {}
-            Err(error) => return Err(error),
-        }
+        let outcome = execute(port, step)?;
+        settle_forward(journal, port, op, step, outcome)?;
     }
 
-    // Recheck every visible target against the recorded expected output without
-    // pretending later external edits are excluded.
+    // Recheck every visible target, consumed stage and retained pre-image
+    // without pretending later external edits are excluded.
     for step in &steps {
         let evidence = port.inspect_step(step);
-        if evidence.target != expected_post(step) {
-            journal.block(op, Some(DeployError::RecoveryConflict))?;
-            return Err(DeployError::RecoveryConflict);
+        if let Err(error) = validate_settled(step, &evidence) {
+            journal.block(op, Some(error))?;
+            return Err(error);
         }
     }
 
@@ -498,15 +495,15 @@ pub fn restore<J: Journal, P: DeploymentInputs>(
             StepPhase::Attempting,
             None,
         )?;
-        let outcome = execute(port, step);
+        let outcome = execute(port, step)?;
         settle_forward(journal, port, op, step, outcome)?;
     }
 
     for step in &steps {
         let evidence = port.inspect_step(step);
-        if evidence.target != expected_post(step) {
-            journal.block(op, Some(DeployError::RecoveryConflict))?;
-            return Err(DeployError::RecoveryConflict);
+        if let Err(error) = validate_settled(step, &evidence) {
+            journal.block(op, Some(error))?;
+            return Err(error);
         }
     }
 
@@ -521,8 +518,14 @@ pub fn operation_status<J: Journal>(
 }
 
 /// Execute one prepared forward (or restore) step through the checked port.
-pub(crate) fn execute<P: CopyEffects>(port: &mut P, step: &PreparedStep) -> EffectOutcome {
-    match (&step.spec.pre, &step.spec.output, step.staged.as_ref()) {
+///
+/// An invalid step shape is an internal invariant failure, not a native
+/// capability result, so it fails with a stable `Io` code.
+pub(crate) fn execute<P: CopyEffects>(
+    port: &mut P,
+    step: &PreparedStep,
+) -> Result<EffectOutcome, DeployError> {
+    let outcome = match (&step.spec.pre, &step.spec.output, step.staged.as_ref()) {
         (PreState::Absent, StepOutput::Source(_), Some((stage, _))) => {
             port.publish_new_absent(&step.spec.target, *stage)
         }
@@ -535,26 +538,50 @@ pub(crate) fn execute<P: CopyEffects>(port: &mut P, step: &PreparedStep) -> Effe
         (PreState::Regular(expected), StepOutput::Absent, _) => {
             port.detach_existing_retain(&step.spec.target, expected, step.retain)
         }
-        _ => EffectOutcome::Unavailable(RootError::UnsupportedTarget(
-            crate::root_identity::UnsupportedReason::Configuration,
-        )),
-    }
+        _ => return Err(DeployError::Io),
+    };
+    Ok(outcome)
 }
 
 /// Execute the recorded undo step: restore the step pre-image or detach a
 /// managed creation.
-pub(crate) fn execute_undo<P: CopyEffects>(port: &mut P, undo: &PreparedStep) -> EffectOutcome {
-    match (&undo.spec.pre, &undo.spec.output, undo.staged.as_ref()) {
+pub(crate) fn execute_undo<P: CopyEffects>(
+    port: &mut P,
+    undo: &PreparedStep,
+) -> Result<EffectOutcome, DeployError> {
+    let outcome = match (&undo.spec.pre, &undo.spec.output, undo.staged.as_ref()) {
         (PreState::Regular(expected), StepOutput::Original(_), Some((stage, _))) => {
             port.replace_existing_retain_displaced(&undo.spec.target, expected, *stage, undo.retain)
         }
         (PreState::Regular(expected), StepOutput::Absent, _) => {
             port.detach_existing_retain(&undo.spec.target, expected, undo.retain)
         }
-        _ => EffectOutcome::Unavailable(RootError::UnsupportedTarget(
-            crate::root_identity::UnsupportedReason::Configuration,
-        )),
+        _ => return Err(DeployError::Io),
+    };
+    Ok(outcome)
+}
+
+/// The retained-artifact evidence promised by a settled step.
+pub(crate) fn expected_retained(step: &PreparedStep) -> Artifact {
+    match &step.spec.pre {
+        PreState::Absent => Artifact::Absent,
+        PreState::Regular(fingerprint) => Artifact::Regular(fingerprint.clone()),
     }
+}
+
+/// Fully settled evidence: expected target, consumed stage and the exact
+/// retained pre-image (or explicit absence).
+pub(crate) fn validate_settled(
+    step: &PreparedStep,
+    evidence: &Evidence,
+) -> Result<(), DeployError> {
+    if evidence.target != expected_post(step)
+        || evidence.stage != Artifact::Absent
+        || evidence.retained != expected_retained(step)
+    {
+        return Err(DeployError::RecoveryConflict);
+    }
+    Ok(())
 }
 
 /// The observation this prepared step promises after a successful effect.
@@ -581,8 +608,38 @@ pub(crate) fn settle_forward<J: Journal, P: CopyEffects>(
     step: &PreparedStep,
     outcome: EffectOutcome,
 ) -> Result<(), DeployError> {
+    settle_forward_from(journal, port, op, step, StepPhase::Attempting, outcome)
+}
+
+/// Settle a forward effect recorded as `from`, validating every reported
+/// artifact before the step becomes `Applied`.
+pub(crate) fn settle_forward_from<J: Journal, P: CopyEffects>(
+    journal: &mut J,
+    port: &mut P,
+    op: OperationId,
+    step: &PreparedStep,
+    from: StepPhase,
+    outcome: EffectOutcome,
+) -> Result<(), DeployError> {
     let evidence = match outcome {
-        EffectOutcome::Observed(evidence) | EffectOutcome::Displaced { evidence, .. } => evidence,
+        EffectOutcome::Observed(evidence) => {
+            if let Err(error) = validate_settled(step, &evidence) {
+                journal.block(op, Some(error))?;
+                return Err(error);
+            }
+            evidence
+        }
+        EffectOutcome::Displaced { evidence, at } => {
+            if let Err(error) = validate_settled(step, &evidence) {
+                journal.block(op, Some(error))?;
+                return Err(error);
+            }
+            if at != step.retain {
+                journal.block(op, Some(DeployError::RecoveryConflict))?;
+                return Err(DeployError::RecoveryConflict);
+            }
+            evidence
+        }
         EffectOutcome::Conflict(_) => {
             journal.block(op, Some(DeployError::RecoveryConflict))?;
             return Err(DeployError::RecoveryConflict);
@@ -599,13 +656,13 @@ pub(crate) fn settle_forward<J: Journal, P: CopyEffects>(
     };
 
     match port.durability_barrier(step, &evidence) {
-        BarrierOutcome::Durable(evidence) => journal.record_step(
-            op,
-            step.ordinal,
-            StepPhase::Attempting,
-            StepPhase::Applied,
-            Some(evidence),
-        ),
+        BarrierOutcome::Durable(evidence) => {
+            if let Err(error) = validate_settled(step, &evidence) {
+                journal.block(op, Some(error))?;
+                return Err(error);
+            }
+            journal.record_step(op, step.ordinal, from, StepPhase::Applied, Some(evidence))
+        }
         BarrierOutcome::Unavailable(error) => {
             let error = map_root_error(error);
             journal.block(op, Some(error))?;

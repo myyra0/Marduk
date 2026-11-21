@@ -5,10 +5,9 @@
 //! Evidence is a versioned portable encoding checked on every read; no caller
 //! path or native diagnostic is stored.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use marduk_core::deployment::{
     BoundTarget, DeployError, DeploymentPlan, FileIntent, GenerationId, OperationId, OperationKind,
@@ -27,13 +26,6 @@ use marduk_core::targets::{RelativePath, RootRole, TargetFile};
 use marduk_platform::{GateError, WriterGate, WriterGuard};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-const CATALOG_FILE: &str = "catalog.sqlite3";
-const LOCK_FILE: &str = "library.lock";
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const MIGRATION_VERSION: i64 = 2;
-const SCHEMA_V1: &str = include_str!("../migrations/0001_library.sql");
-const SCHEMA_V2: &str = include_str!("../migrations/0002_operations.sql");
-
 pub struct OperationJournal {
     path: PathBuf,
     connection: Connection,
@@ -44,15 +36,12 @@ impl OperationJournal {
     /// Open (and migrate) the shared catalog under the application data root.
     pub fn open(app_data: &Path) -> Result<Self, DeployError> {
         fs::create_dir_all(app_data).map_err(|_| DeployError::Io)?;
-        let gate = WriterGate::open(app_data.join(LOCK_FILE)).map_err(gate_error)?;
-        let path = app_data.join(CATALOG_FILE);
+        let gate = WriterGate::open(app_data.join(crate::schema::LOCK_FILE)).map_err(gate_error)?;
+        let path = crate::schema::catalog_path(app_data);
         let mut connection = Connection::open(&path).map_err(|_| DeployError::Io)?;
 
         let _guard = gate.try_lock().map_err(gate_error)?;
-        configure(&connection)?;
-        migrate(&mut connection)?;
-        seed_profile(&mut connection)?;
-        verify_pragmas(&connection)?;
+        crate::schema::prepare(&mut connection).map_err(|_| DeployError::Io)?;
 
         Ok(Self {
             path,
@@ -183,8 +172,7 @@ impl OperationJournal {
 impl Journal for OperationJournal {
     fn reopen(&mut self) -> Result<(), DeployError> {
         let connection = Connection::open(&self.path).map_err(|_| DeployError::Io)?;
-        configure(&connection)?;
-        verify_pragmas(&connection)?;
+        crate::schema::reconfigure(&connection).map_err(|_| DeployError::Io)?;
         self.connection = connection;
         Ok(())
     }
@@ -428,6 +416,24 @@ impl Journal for OperationJournal {
         }
         let op_value = sql_id(op.get())?;
 
+        let deploy = match row.kind {
+            OperationKind::Deploy => None,
+            OperationKind::Restore => {
+                let from_generation = row.from_generation.ok_or(DeployError::Io)?;
+                let deploy: i64 = transaction
+                    .query_row(
+                        "SELECT deploy_op FROM generations WHERE id = ?1",
+                        [from_generation],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| DeployError::Io)?;
+                Some(OperationId::try_from_u64(row_id(deploy)?)?)
+            }
+        };
+        let bindings = deploy
+            .map(|deploy| deploy_bindings(&transaction, deploy))
+            .transpose()?;
+
         match row.kind {
             OperationKind::Deploy => {
                 let plan_value: i64 = transaction
@@ -450,29 +456,15 @@ impl Journal for OperationJournal {
                 }
             }
             OperationKind::Restore => {
-                let from_generation: i64 = transaction
-                    .query_row(
-                        "SELECT from_generation FROM operations WHERE id = ?1",
-                        [op_value],
-                        |row| row.get(0),
-                    )
-                    .map_err(|_| DeployError::Io)?;
-                let deploy: i64 = transaction
-                    .query_row(
-                        "SELECT deploy_op FROM generations WHERE id = ?1",
-                        [from_generation],
-                        |row| row.get(0),
-                    )
-                    .map_err(|_| DeployError::Io)?;
-                let expected: i64 = transaction
-                    .query_row(
-                        "SELECT count(*) FROM operation_steps WHERE operation_id = ?1",
-                        [deploy],
-                        |row| row.get(0),
-                    )
-                    .map_err(|_| DeployError::Io)?;
-                if usize::try_from(expected).map_err(|_| DeployError::Io)? != steps.len() {
+                let bindings = bindings.as_ref().ok_or(DeployError::Io)?;
+                if bindings.len() != steps.len() {
                     return Err(DeployError::Io);
+                }
+                for step in &steps {
+                    let binding = bindings.get(&step.ordinal).ok_or(DeployError::Io)?;
+                    if step.spec.target != binding.target {
+                        return Err(DeployError::Io);
+                    }
                 }
             }
         }
@@ -482,37 +474,68 @@ impl Journal for OperationJournal {
             if step.op != op
                 || step.direction != StepDirection::Forward
                 || !ordinals.insert(step.ordinal)
+                || !valid_pre_image(&step.spec.original)
+                || !valid_pre_image(&step.step_pre)
+                || step.spec.pre != step.step_pre.observation
             {
                 return Err(DeployError::Io);
             }
-            if !valid_pre_image(&step.spec.original)
-                || !valid_pre_image(&step.step_pre)
-                || step.spec.original.backup.is_some_and(|at| {
-                    at != BackupRef::from_record(
+
+            let expected_original = match &step.spec.original.observation {
+                PreState::Absent => None,
+                PreState::Regular(_) => Some(match row.kind {
+                    OperationKind::Deploy => BackupRef::from_record(
                         op,
                         step.ordinal,
                         StepDirection::Forward,
                         BackupSlot::Original,
-                    )
-                })
-                || step.step_pre.backup.is_some_and(|at| {
-                    at != BackupRef::from_record(
-                        op,
-                        step.ordinal,
-                        StepDirection::Forward,
-                        BackupSlot::Step,
-                    )
-                })
-                || step.staged.as_ref().is_some_and(|(at, _)| {
-                    *at != StageRef::from_record(op, step.ordinal, StepDirection::Forward)
-                })
-                || step.retain
-                    != BackupRef::from_record(
-                        op,
-                        step.ordinal,
-                        StepDirection::Forward,
-                        BackupSlot::Displaced,
-                    )
+                    ),
+                    OperationKind::Restore => bindings
+                        .as_ref()
+                        .and_then(|bindings| bindings.get(&step.ordinal))
+                        .and_then(|binding| binding.original_backup)
+                        .ok_or(DeployError::Io)?,
+                }),
+            };
+            if step.spec.original.backup != expected_original {
+                return Err(DeployError::Io);
+            }
+            if row.kind == OperationKind::Restore {
+                let binding = bindings
+                    .as_ref()
+                    .and_then(|bindings| bindings.get(&step.ordinal))
+                    .ok_or(DeployError::Io)?;
+                if binding.original != step.spec.original.observation {
+                    return Err(DeployError::Io);
+                }
+            }
+            match (
+                &row.kind,
+                &step.spec.original.observation,
+                &step.spec.output,
+            ) {
+                (OperationKind::Deploy, _, StepOutput::Source(_)) => {}
+                (OperationKind::Restore, PreState::Absent, StepOutput::Absent) => {}
+                (OperationKind::Restore, PreState::Regular(_), StepOutput::Original(at))
+                    if Some(*at) == expected_original => {}
+                _ => return Err(DeployError::Io),
+            }
+            if step.step_pre.backup.is_some_and(|at| {
+                at != BackupRef::from_record(
+                    op,
+                    step.ordinal,
+                    StepDirection::Forward,
+                    BackupSlot::Step,
+                )
+            }) || step.staged.as_ref().is_some_and(|(at, _)| {
+                *at != StageRef::from_record(op, step.ordinal, StepDirection::Forward)
+            }) || step.retain
+                != BackupRef::from_record(
+                    op,
+                    step.ordinal,
+                    StepDirection::Forward,
+                    BackupSlot::Displaced,
+                )
             {
                 return Err(DeployError::Io);
             }
@@ -609,6 +632,10 @@ impl Journal for OperationJournal {
 
     fn block(&mut self, op: OperationId, error: Option<DeployError>) -> Result<(), DeployError> {
         let _guard = self.lock()?;
+        let row = load_operation(&self.connection, op)?.ok_or(DeployError::UnknownOperation)?;
+        if row.phase.is_terminal() || !pending_is(&self.connection, &row.data, op)? {
+            return Err(DeployError::UnknownOperation);
+        }
         let changed = self
             .connection
             .execute(
@@ -799,26 +826,22 @@ impl Journal for OperationJournal {
         if !pending_is(&transaction, &data, op)? {
             return Err(DeployError::UnknownOperation);
         }
-        let row: Option<(Vec<u8>, Option<Vec<u8>>)> = transaction
-            .query_row(
-                "SELECT displaced_ref, undo FROM operation_steps \
-                 WHERE operation_id = ?1 AND ordinal = ?2",
-                params![op_value, i64::from(ordinal)],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(|_| DeployError::Io)?;
-        let Some((displaced, existing)) = row else {
-            return Err(DeployError::UnknownOperation);
-        };
-        if existing.is_some()
-            || undo.op != op
-            || undo.ordinal != ordinal
-            || undo.direction != StepDirection::Undo
-            || decode_backup(&displaced)? != undo.retain
+        let row = read_steps(&transaction, op)?
+            .into_iter()
+            .find(|row| row.prepared.ordinal == ordinal)
+            .ok_or(DeployError::UnknownOperation)?;
+        if row.undo.is_some()
+            || row.prepared.retain
+                != BackupRef::from_record(
+                    op,
+                    ordinal,
+                    StepDirection::Forward,
+                    BackupSlot::Displaced,
+                )
         {
             return Err(DeployError::Io);
         }
+        validate_undo(&row.prepared, &undo)?;
         let encoded = encode_prepared(&undo);
         let changed = transaction
             .execute(
@@ -832,101 +855,6 @@ impl Journal for OperationJournal {
         }
         transaction.commit().map_err(|_| DeployError::Io)
     }
-}
-
-fn configure(connection: &Connection) -> Result<(), DeployError> {
-    connection
-        .busy_timeout(BUSY_TIMEOUT)
-        .map_err(|_| DeployError::Io)?;
-    connection
-        .pragma_update(None, "foreign_keys", 1)
-        .map_err(|_| DeployError::Io)?;
-    connection
-        .pragma_update(None, "synchronous", 2)
-        .map_err(|_| DeployError::Io)?;
-    let _: String = connection
-        .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
-        .map_err(|_| DeployError::Io)?;
-    Ok(())
-}
-
-fn migrate(connection: &mut Connection) -> Result<(), DeployError> {
-    let version = user_version(connection)?;
-    if version < 0 || version > MIGRATION_VERSION {
-        return Err(DeployError::Io);
-    }
-
-    if version < 1 {
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|_| DeployError::Io)?;
-        if user_version(&transaction)? != 0 {
-            return Err(DeployError::Io);
-        }
-        transaction
-            .execute_batch(SCHEMA_V1)
-            .map_err(|_| DeployError::Io)?;
-        transaction
-            .pragma_update(None, "user_version", 1)
-            .map_err(|_| DeployError::Io)?;
-        transaction.commit().map_err(|_| DeployError::Io)?;
-    }
-
-    if user_version(connection)? < MIGRATION_VERSION {
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|_| DeployError::Io)?;
-        if user_version(&transaction)? != 1 {
-            return Err(DeployError::Io);
-        }
-        transaction
-            .execute_batch(SCHEMA_V2)
-            .map_err(|_| DeployError::Io)?;
-        transaction
-            .pragma_update(None, "user_version", MIGRATION_VERSION)
-            .map_err(|_| DeployError::Io)?;
-        transaction.commit().map_err(|_| DeployError::Io)?;
-    }
-
-    if user_version(connection)? != MIGRATION_VERSION {
-        return Err(DeployError::Io);
-    }
-    Ok(())
-}
-
-fn seed_profile(connection: &mut Connection) -> Result<(), DeployError> {
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|_| DeployError::Io)?;
-    transaction
-        .execute(
-            "INSERT INTO profiles (id, revision) VALUES (1, 0) ON CONFLICT (id) DO NOTHING",
-            [],
-        )
-        .map_err(|_| DeployError::Io)?;
-    transaction.commit().map_err(|_| DeployError::Io)
-}
-
-fn verify_pragmas(connection: &Connection) -> Result<(), DeployError> {
-    let foreign_keys: i64 = connection
-        .pragma_query_value(None, "foreign_keys", |row| row.get(0))
-        .map_err(|_| DeployError::Io)?;
-    let journal_mode: String = connection
-        .pragma_query_value(None, "journal_mode", |row| row.get(0))
-        .map_err(|_| DeployError::Io)?;
-    let synchronous: i64 = connection
-        .pragma_query_value(None, "synchronous", |row| row.get(0))
-        .map_err(|_| DeployError::Io)?;
-    if foreign_keys != 1 || !journal_mode.eq_ignore_ascii_case("wal") || synchronous != 2 {
-        return Err(DeployError::Io);
-    }
-    Ok(())
-}
-
-fn user_version(connection: &Connection) -> Result<i64, DeployError> {
-    connection
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(|_| DeployError::Io)
 }
 
 fn gate_error(error: GateError) -> DeployError {
@@ -1117,6 +1045,10 @@ fn read_retained(connection: &Connection, op: OperationId) -> Result<Vec<BackupR
 }
 
 fn read_steps(connection: &Connection, op: OperationId) -> Result<Vec<StepRecord>, DeployError> {
+    let (kind, deploy) = step_context(connection, op)?;
+    let bindings = deploy
+        .map(|deploy| deploy_bindings(connection, deploy))
+        .transpose()?;
     let rows = {
         let mut statement = connection
             .prepare(
@@ -1173,16 +1105,44 @@ fn read_steps(connection: &Connection, op: OperationId) -> Result<Vec<StepRecord
             return Err(DeployError::Io);
         }
         let ordinal = u32::try_from(ordinal).map_err(|_| DeployError::Io)?;
+        let target = decode_bound(&target)?;
+        let original_observation = decode_pre_state(&original_observation)?;
         let original_backup = original_backup.as_deref().map(decode_backup).transpose()?;
-        if original_backup.is_some_and(|at| {
-            at != BackupRef::from_record(op, ordinal, StepDirection::Forward, BackupSlot::Original)
-        }) {
+        let expected_original = match &original_observation {
+            PreState::Absent => None,
+            PreState::Regular(_) => Some(match kind {
+                OperationKind::Deploy => BackupRef::from_record(
+                    op,
+                    ordinal,
+                    StepDirection::Forward,
+                    BackupSlot::Original,
+                ),
+                OperationKind::Restore => bindings
+                    .as_ref()
+                    .and_then(|bindings| bindings.get(&ordinal))
+                    .and_then(|binding| binding.original_backup)
+                    .ok_or(DeployError::Io)?,
+            }),
+        };
+        if original_backup != expected_original {
             return Err(DeployError::Io);
         }
+        if kind == OperationKind::Restore {
+            let binding = bindings
+                .as_ref()
+                .and_then(|bindings| bindings.get(&ordinal))
+                .ok_or(DeployError::Io)?;
+            if binding.target != target || binding.original != original_observation {
+                return Err(DeployError::Io);
+            }
+        }
+
+        let step_pre_observation = decode_pre_state(&step_pre_observation)?;
         let step_pre_backup = step_pre_backup.as_deref().map(decode_backup).transpose()?;
         if step_pre_backup.is_some_and(|at| {
             at != BackupRef::from_record(op, ordinal, StepDirection::Forward, BackupSlot::Step)
-        }) {
+        }) || step_pre_backup.is_none() != matches!(step_pre_observation, PreState::Absent)
+        {
             return Err(DeployError::Io);
         }
         let staged = match (stage_ref.as_deref(), stage_fingerprint.as_deref()) {
@@ -1202,48 +1162,187 @@ fn read_steps(connection: &Connection, op: OperationId) -> Result<Vec<StepRecord
         {
             return Err(DeployError::Io);
         }
-        let undo = undo
-            .as_deref()
-            .map(decode_prepared)
-            .transpose()?
-            .map(|undo: PreparedStep| {
-                if undo.op != op || undo.ordinal != ordinal || undo.direction != StepDirection::Undo
-                {
-                    Err(DeployError::Io)
-                } else {
-                    Ok(undo)
-                }
-            })
-            .transpose()?;
+        let output = decode_output(&output)?;
+        match (&kind, &original_observation, &output) {
+            (OperationKind::Deploy, _, StepOutput::Source(_)) => {}
+            (OperationKind::Restore, PreState::Absent, StepOutput::Absent) => {}
+            (OperationKind::Restore, PreState::Regular(_), StepOutput::Original(at))
+                if Some(*at) == expected_original => {}
+            _ => return Err(DeployError::Io),
+        }
 
         let prepared = PreparedStep {
             op,
             ordinal,
             direction: StepDirection::Forward,
             spec: StepSpec {
-                target: decode_bound(&target)?,
+                target,
                 original: PreImage {
-                    observation: decode_pre_state(&original_observation)?,
+                    observation: original_observation,
                     backup: original_backup,
                 },
-                pre: decode_pre_state(&step_pre_observation)?,
-                output: decode_output(&output)?,
+                pre: step_pre_observation.clone(),
+                output,
             },
             step_pre: PreImage {
-                observation: decode_pre_state(&step_pre_observation)?,
+                observation: step_pre_observation,
                 backup: step_pre_backup,
             },
             staged,
             retain,
         };
+        let undo = undo
+            .as_deref()
+            .map(decode_prepared)
+            .transpose()?
+            .map(|undo| {
+                validate_undo(&prepared, &undo)?;
+                Ok::<PreparedStep, DeployError>(undo)
+            })
+            .transpose()?;
+        let phase = parse_step_phase(&phase)?;
+        let evidence = observed.as_deref().map(decode_evidence).transpose()?;
+        if matches!(phase, StepPhase::Applied | StepPhase::Undone) && evidence.is_none() {
+            return Err(DeployError::Io);
+        }
         steps.push(StepRecord {
             prepared,
-            phase: parse_step_phase(&phase)?,
-            evidence: observed.as_deref().map(decode_evidence).transpose()?,
+            phase,
+            evidence,
             undo,
         });
     }
     Ok(steps)
+}
+
+fn step_context(
+    connection: &Connection,
+    op: OperationId,
+) -> Result<(OperationKind, Option<OperationId>), DeployError> {
+    let row = load_operation(connection, op)?.ok_or(DeployError::UnknownOperation)?;
+    let deploy = match row.kind {
+        OperationKind::Deploy => None,
+        OperationKind::Restore => {
+            let from_generation = row.from_generation.ok_or(DeployError::Io)?;
+            let deploy: i64 = connection
+                .query_row(
+                    "SELECT deploy_op FROM generations WHERE id = ?1",
+                    [from_generation],
+                    |row| row.get(0),
+                )
+                .map_err(|_| DeployError::Io)?;
+            Some(OperationId::try_from_u64(row_id(deploy)?)?)
+        }
+    };
+    Ok((row.kind, deploy))
+}
+
+#[derive(Clone)]
+struct DeployBinding {
+    target: BoundTarget,
+    original: PreState,
+    original_backup: Option<BackupRef>,
+}
+
+fn deploy_bindings(
+    connection: &Connection,
+    deploy: OperationId,
+) -> Result<BTreeMap<u32, DeployBinding>, DeployError> {
+    let rows = {
+        let mut statement = connection
+            .prepare(
+                "SELECT ordinal, target, original_observation, original_backup \
+                 FROM operation_steps WHERE operation_id = ?1 ORDER BY ordinal ASC",
+            )
+            .map_err(|_| DeployError::Io)?;
+        let rows = statement
+            .query_map([sql_id(deploy.get())?], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
+                ))
+            })
+            .map_err(|_| DeployError::Io)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|_| DeployError::Io)?
+    };
+    let mut bindings = BTreeMap::new();
+    for (ordinal, target, original, backup) in rows {
+        let ordinal = u32::try_from(ordinal).map_err(|_| DeployError::Io)?;
+        let original = decode_pre_state(&original)?;
+        let backup = backup.as_deref().map(decode_backup).transpose()?;
+        let expected = match &original {
+            PreState::Absent => None,
+            PreState::Regular(_) => Some(BackupRef::from_record(
+                deploy,
+                ordinal,
+                StepDirection::Forward,
+                BackupSlot::Original,
+            )),
+        };
+        if backup != expected {
+            return Err(DeployError::Io);
+        }
+        bindings.insert(
+            ordinal,
+            DeployBinding {
+                target: decode_bound(&target)?,
+                original,
+                original_backup: backup,
+            },
+        );
+    }
+    Ok(bindings)
+}
+
+fn validate_undo(forward: &PreparedStep, undo: &PreparedStep) -> Result<(), DeployError> {
+    let expected_post = match &forward.staged {
+        Some((_, fingerprint)) => PreState::Regular(fingerprint.clone()),
+        None => PreState::Absent,
+    };
+    let PreState::Regular(_) = undo.spec.pre else {
+        return Err(DeployError::Io);
+    };
+    if undo.op != forward.op
+        || undo.ordinal != forward.ordinal
+        || undo.direction != StepDirection::Undo
+        || undo.spec.target != forward.spec.target
+        || undo.spec.pre != expected_post
+        || !valid_pre_image(&undo.spec.original)
+        || undo.spec.original.observation != forward.spec.original.observation
+        || undo.spec.original.backup != forward.spec.original.backup
+        || !valid_pre_image(&undo.step_pre)
+        || undo.step_pre.observation != undo.spec.pre
+        || undo.retain
+            != BackupRef::from_record(
+                undo.op,
+                undo.ordinal,
+                StepDirection::Undo,
+                BackupSlot::Displaced,
+            )
+        || undo.step_pre.backup.is_some_and(|at| {
+            at != BackupRef::from_record(
+                undo.op,
+                undo.ordinal,
+                StepDirection::Undo,
+                BackupSlot::Step,
+            )
+        })
+        || undo.step_pre.backup.is_none() != matches!(undo.step_pre.observation, PreState::Absent)
+    {
+        return Err(DeployError::Io);
+    }
+    match (&undo.spec.output, &undo.staged) {
+        (StepOutput::Absent, None) if matches!(forward.spec.pre, PreState::Absent) => {}
+        (StepOutput::Original(at), Some((stage, _)))
+            if matches!(forward.spec.pre, PreState::Regular(_))
+                && Some(*at) == forward.step_pre.backup
+                && *stage == StageRef::from_record(undo.op, undo.ordinal, StepDirection::Undo) => {}
+        _ => return Err(DeployError::Io),
+    }
+    Ok(())
 }
 
 fn read_intents(connection: &Connection, plan: i64) -> Result<Vec<FileIntent>, DeployError> {
@@ -1390,13 +1489,13 @@ fn clear_pending(connection: &Connection, data: &[u8], op: OperationId) -> Resul
 fn all_steps_applied(connection: &Connection, op: i64) -> Result<bool, DeployError> {
     let (total, applied): (i64, i64) = connection
         .query_row(
-            "SELECT count(*), sum(CASE WHEN phase = 'applied' THEN 1 ELSE 0 END) \
+            "SELECT count(*), COALESCE(sum(CASE WHEN phase = 'applied' THEN 1 ELSE 0 END), 0) \
              FROM operation_steps WHERE operation_id = ?1",
             [op],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|_| DeployError::Io)?;
-    Ok(total > 0 && total == applied)
+    Ok(total == applied)
 }
 
 fn valid_pre_image(image: &PreImage) -> bool {
@@ -1750,7 +1849,7 @@ fn encode_output(output: &StepOutput) -> Vec<u8> {
         }
         StepOutput::Original(at) => {
             out.push(1);
-            out.extend_from_slice(&encode_backup(*at));
+            put_blob(&mut out, &encode_backup(*at));
         }
         StepOutput::Absent => out.push(2),
     }

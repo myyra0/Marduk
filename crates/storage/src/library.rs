@@ -8,7 +8,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 #[cfg(test)]
 use std::fs::{File, OpenOptions};
@@ -40,16 +39,11 @@ mod contract_tests;
 #[cfg(test)]
 mod stage_tests;
 
-const CATALOG_FILE: &str = "catalog.sqlite3";
-const LOCK_FILE: &str = "library.lock";
 const REVISIONS_DIR: &str = "revisions";
 #[cfg(test)]
 const PAYLOAD_DIR: &str = "payload";
 #[cfg(test)]
 const ARCHIVE_FILE: &str = "archive.zip";
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const MIGRATION_VERSION: i64 = 1;
-const SCHEMA_V1: &str = include_str!("../migrations/0001_library.sql");
 
 pub struct Catalog {
     root: PathBuf,
@@ -67,14 +61,12 @@ impl Catalog {
         fs::create_dir_all(root).map_err(|_| ImportError::Storage)?;
         fs::create_dir_all(root.join(REVISIONS_DIR)).map_err(|_| ImportError::Storage)?;
 
-        let gate = WriterGate::open(root.join(LOCK_FILE)).map_err(gate_error)?;
+        let gate = WriterGate::open(root.join(crate::schema::LOCK_FILE)).map_err(gate_error)?;
         let _guard = gate.try_lock().map_err(gate_error)?;
 
-        let mut connection = Connection::open(root.join(CATALOG_FILE)).map_err(storage_error)?;
-        configure(&connection)?;
-        migrate(&mut connection)?;
-        seed_profile(&mut connection)?;
-        verify_pragmas(&connection)?;
+        let mut connection =
+            Connection::open(crate::schema::catalog_path(root)).map_err(storage_error)?;
+        crate::schema::prepare(&mut connection).map_err(|_| ImportError::Storage)?;
 
         Ok(Self {
             root: root.to_path_buf(),
@@ -921,97 +913,6 @@ fn persist_stage(
         return Err(ImportError::Storage);
     }
     transaction.commit().map_err(storage_error)
-}
-
-fn configure(connection: &Connection) -> Result<(), ImportError> {
-    connection
-        .busy_timeout(BUSY_TIMEOUT)
-        .map_err(storage_error)?;
-    connection
-        .pragma_update(None, "foreign_keys", 1)
-        .map_err(storage_error)?;
-    connection
-        .pragma_update(None, "synchronous", 2)
-        .map_err(storage_error)?;
-
-    // `journal_mode` cannot change inside a transaction; the returned value is
-    // the mode SQLite actually selected.
-    let _: String = connection
-        .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
-        .map_err(storage_error)?;
-    Ok(())
-}
-
-fn migrate(connection: &mut Connection) -> Result<(), ImportError> {
-    let version = user_version(connection)?;
-    if version < 0 || version > MIGRATION_VERSION {
-        return Err(ImportError::Storage);
-    }
-
-    if version < MIGRATION_VERSION {
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(storage_error)?;
-        if user_version(&transaction)? != version {
-            return Err(ImportError::Storage);
-        }
-        transaction
-            .execute_batch(SCHEMA_V1)
-            .map_err(storage_error)?;
-        transaction
-            .pragma_update(None, "user_version", MIGRATION_VERSION)
-            .map_err(storage_error)?;
-        transaction.commit().map_err(storage_error)?;
-    }
-
-    if user_version(connection)? != MIGRATION_VERSION {
-        return Err(ImportError::Storage);
-    }
-    Ok(())
-}
-
-fn seed_profile(connection: &mut Connection) -> Result<(), ImportError> {
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(storage_error)?;
-    transaction
-        .execute(
-            "INSERT INTO profiles (id, revision) VALUES (1, 0) ON CONFLICT (id) DO NOTHING",
-            [],
-        )
-        .map_err(storage_error)?;
-    transaction.commit().map_err(storage_error)
-}
-
-fn verify_pragmas(connection: &Connection) -> Result<(), ImportError> {
-    let foreign_keys: i64 = connection
-        .pragma_query_value(None, "foreign_keys", |row| row.get(0))
-        .map_err(storage_error)?;
-    if foreign_keys != 1 {
-        return Err(ImportError::Storage);
-    }
-
-    let journal_mode: String = connection
-        .pragma_query_value(None, "journal_mode", |row| row.get(0))
-        .map_err(storage_error)?;
-    if !journal_mode.eq_ignore_ascii_case("wal") {
-        return Err(ImportError::Storage);
-    }
-
-    let synchronous: i64 = connection
-        .pragma_query_value(None, "synchronous", |row| row.get(0))
-        .map_err(storage_error)?;
-    if synchronous != 2 {
-        return Err(ImportError::Storage);
-    }
-
-    Ok(())
-}
-
-fn user_version(connection: &Connection) -> Result<i64, ImportError> {
-    connection
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(storage_error)
 }
 
 fn read_snapshot(
