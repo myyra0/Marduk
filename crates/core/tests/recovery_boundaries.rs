@@ -236,6 +236,68 @@ fn restore_does_not_retry_without_the_sealed_step_backup() {
 }
 
 #[test]
+fn restore_continuation_rejects_a_later_missing_step_backup_before_any_effect() {
+    let mut f = Fixture::new(WINNER);
+    let deploy = f.deploy();
+    let op = f.cut_restore();
+    let rows = &f.journal.durable.steps[&op];
+    let earlier = rows
+        .iter()
+        .find(|row| row.prepared.spec.target.target.relative.as_str() == CREATED)
+        .unwrap();
+    let later = rows
+        .iter()
+        .find(|row| row.prepared.spec.target.target.relative.as_str() == WINNER)
+        .unwrap();
+    // The created row runs first in the reverse order; the winner row is the
+    // later conflict and its sealed pre-image is the one that goes missing.
+    assert_eq!(earlier.prepared.ordinal, 0);
+    assert_eq!(later.prepared.ordinal, 1);
+    let earlier_backup = earlier.prepared.step_pre.backup.unwrap();
+    let later_backup = later.prepared.step_pre.backup.unwrap();
+    assert!(lookup(&f.effects.durable.backups, earlier_backup).is_some());
+    let sealed = take(&mut f.effects.durable.backups, later_backup).unwrap();
+    let effects = f.effects.mutations.len();
+    let finishes = f.journal.finishes;
+    f.boot();
+    for _ in 0..2 {
+        let status = f.recover().unwrap();
+        assert_eq!(
+            (status.kind, status.phase, status.generation),
+            (OperationKind::Restore, Phase::Restoring, deploy.generation)
+        );
+        assert_eq!(status.blocker, Some(DeployError::RecoveryConflict));
+        f.assert_status(
+            &status,
+            OperationKind::Restore,
+            Phase::Restoring,
+            Some(DeployError::RecoveryConflict),
+        );
+        f.root_state(Some(op), deploy.generation);
+        // The earlier readable row must not have been detached first.
+        f.files(Some(ONLY_A), BASE);
+        assert_eq!(f.effects.mutations.len(), effects);
+        assert_eq!(f.journal.finishes, finishes);
+    }
+    // Restoring the sealed pre-image makes the same continuation runnable.
+    f.effects
+        .visible
+        .backups
+        .push((later_backup, sealed.clone()));
+    f.effects.durable.backups.push((later_backup, sealed));
+    let status = f.recover().unwrap();
+    f.assert_status(&status, OperationKind::Restore, Phase::Completed, None);
+    f.root_state(None, None);
+    f.files(None, BASE);
+    f.mutations(&[
+        (Mutation::Create, CREATED),
+        (Mutation::Replace, WINNER),
+        (Mutation::Replace, WINNER),
+        (Mutation::Detach, CREATED),
+    ]);
+}
+
+#[test]
 fn deploy_rollback_classifies_a_later_conflict_before_any_effect() {
     let mut f = Fixture::new(WINNER);
     let plan = f.plan();
