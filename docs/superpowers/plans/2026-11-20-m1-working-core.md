@@ -35,24 +35,11 @@ The [C01 worker contract](../../contracts/m1-file-resolution.md) owns exact logi
 
 ### M1-A00 — Baseline, workspace and native CI
 
-**Predecessor:** User approves the existing checkout, scaffold and GitHub-hosted CI scope in the [exact execution brief](2026-11-21-m1-a00-baseline.md); orchestrator verifies the starting revision and completes brief review and preflight. Does not wait on native durability, frontend stack selection or the full C0 audit. **Status:** `draft` pending approval and preflight. This catalog does not authorize implementation.
-
-**Owns:** Root `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `crates/core/{Cargo.toml,src/lib.rs}` as an empty buildable first member, and checked command/runner definitions. Name exact CI file paths and native Linux/Windows x86-64 runner images before dispatch, after repository hosting is decided. Do not create placeholder adapters, frontend projects or a custom runner. Each later packet adds its crate and workspace membership; M1-U01 owns frontend/app scaffold, lockfile and desktop build steps. Serialize edits to shared manifests and lockfiles through the orchestrator.
-
-- [ ] **Planner:** Pin an exact Rust release and required `rustfmt` component, confirm both runner images actually have the native prerequisites, and record lockfile/dependency review steps. The workspace initially adds no third-party crates; review versions/features where first introduced, not through a speculative list.
-- [ ] **Worker:** Create the minimal workspace from the approved baseline. Set up the same native Rust checks on Linux and Windows. No cross-compiled stand-in for Windows, repo publishing, hosted credential setup or Tauri/deployment claims.
-- [ ] **Gate:** Each runner records OS/architecture, `rustc --version`, `cargo --version`, and results from `cargo fmt --all -- --check`, `cargo build --workspace --locked` and `cargo test --workspace --locked`. The empty baseline proves CI runs, not behavior; follow-on packets add executable assertions. A missing runner blocks matrix sign-off, not local fixture drafting. Ordinary hosted runners are not the named process/power-cut environments.
+**Status:** `verified` at `b54af92528166a55612ed73258783e4e35b9860a`. The [approved brief](2026-11-21-m1-a00-baseline.md) used rolling Rust `stable`, locked dependencies and one empty `marduk-core` crate. [Hosted CI](https://github.com/myyra0/Marduk/actions/runs/44906174341) passed format, locked build and locked tests on both native hosts. The baseline proves CI runs, not product behavior or native recovery. Each later packet owns its crate, and M1-U01 owns the desktop scaffold and checks.
 
 ### M1-C01 — Workspace, shared domain and resolver
 
-**Predecessor:** M1-A00 baseline; C0 approval for this packet's interfaces only, not full C0 sign-off.
-
-**Owns:** `crates/core/{src/lib.rs,src/ids.rs,src/profiles.rs,src/targets.rs,src/resolve.rs,tests/priority.rs}` and fixture recipe in `tests/fixtures/m1/README.md`. Shared DTO/schema work is deferred to M1-U01. Freeze the file ownership list against the baseline.
-
-- [ ] **Planner:** Freeze types and write the five tests in the [resolution contract](../../contracts/m1-file-resolution.md#planner-test-inputs-and-witnesses): precedence/provenance, disabled members, aliases, incompatible path shape, and duplicate membership IDs. Include path-admission unit checks in `targets.rs`.
-- [ ] **Orchestrator:** Run `cargo test -p marduk-core --test priority`; record missing functionality as the expected first failure after shared skeleton exists. A build environment failure does not prove a behavioral red test.
-- [ ] **Worker:** Implement resolver on the repository manifests and deterministic target ordering; no storage, UI or mutation code. Route bytes/provenance by installed revision, not a display name.
-- [ ] **Gate:** Same test passes and reorder does not alter stored payload. Run `cargo fmt --all -- --check` and `cargo test -p marduk-core`. Verify cargo/build prerequisites on both targets before depending on them.
+**Predecessor:** Verified M1-A00; approve this packet's interfaces only, not full C0 sign-off. **Status:** `draft` pending approval and preflight of the [execution packet](2026-11-21-m1-c01-resolver.md). The orchestrator owns test authoring and implementation in one run. This packet works on logical manifests only; actual filesystem placement belongs to M1-R01.
 
 ### M1-R01 — Root identity, portable relative paths and safe publication seam
 
