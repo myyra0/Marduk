@@ -56,6 +56,8 @@ For OS primitives and filesystem semantics (`renameat2`, Btrfs ioctls, Win32 dur
 source, local kernel headers/man pages and current vendor documentation; Context7 is not authoritative there.
 If Context7 is unavailable, read the locked crate source in `~/.cargo/registry/src/` and record that path in the report.
 
+When an implementation is stuck, or a native/API problem looks like it has a known solution, tell the subagent to research it before inventing one: GitHub code/issues via the GitHub MCP, the web via Firecrawl/search, and current vendor documentation. Prefer maintained crates and documented OS patterns; record the source and licence in the report. Research informs the design, not the acceptance criteria: the brief, contracts and frozen tests still decide what is correct, and copied code must fit this project's architecture.
+
 ## Reliability
 
 Anything that modifies a game install or user files is transactional: journaled, validated, reports progress, and can be
