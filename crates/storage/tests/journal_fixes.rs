@@ -307,7 +307,7 @@ fn restore_seals_and_reads_the_generation_deploy_original() {
 fn restore_seal_rejects_a_ref_owned_by_the_restore_operation() {
     let dir = fixture_v1();
     let mut journal = open_fixture(&dir);
-    let (_deploy, generation, original) = completed_deploy(&mut journal);
+    let (_deploy, generation, _original) = completed_deploy(&mut journal);
     let restore = journal
         .claim(Claim::Restore {
             installation: root(1),
@@ -328,6 +328,9 @@ fn undo_accepts_only_undo_slots_and_reads_back() {
     let dir = fixture_v1();
     let mut journal = open_fixture(&dir);
     let (op, forward) = applying_deploy(&mut journal);
+    journal
+        .set_phase(op, Phase::Applying, Phase::RollingBack)
+        .unwrap();
     let step_ref = forward.step_pre.backup.unwrap();
 
     let undo = PreparedStep {
@@ -361,11 +364,11 @@ fn undo_accepts_only_undo_slots_and_reads_back() {
     wrong.retain = BackupRef::from_record(op, 0, StepDirection::Forward, BackupSlot::Displaced);
     assert!(journal.record_undo(op, 0, wrong).is_err());
 
+    journal.record_undo(op, 0, undo.clone()).unwrap();
+    assert!(journal.record_undo(op, 0, undo.clone()).is_err());
     journal
         .record_step(op, 0, StepPhase::Applied, StepPhase::UndoAttempting, None)
         .unwrap();
-    journal.record_undo(op, 0, undo.clone()).unwrap();
-    assert!(journal.record_undo(op, 0, undo.clone()).is_err());
 
     let rows = journal.steps(op).unwrap();
     let [row] = rows.as_slice() else {
@@ -385,9 +388,6 @@ fn undo_accepts_only_undo_slots_and_reads_back() {
                 retained: Artifact::Regular(post_fp()),
             }),
         )
-        .unwrap();
-    journal
-        .set_phase(op, Phase::Applying, Phase::RollingBack)
         .unwrap();
     let status = journal.finish(op, Finalize::RolledBack).unwrap();
     assert_eq!(status.phase, Phase::RolledBack);

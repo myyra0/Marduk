@@ -1,0 +1,264 @@
+include!("operation_journal.rs");
+
+fn claimed_fixture() -> (TempDir, OperationJournal, OperationId) {
+    let dir = fixture_v1();
+    let mut journal = open_fixture(&dir);
+    let reviewed = plan(&mut journal);
+    let op = journal.claim(Claim::Deploy(reviewed)).unwrap();
+    (dir, journal, op)
+}
+
+#[test]
+fn seal_rejects_unapproved_parent_and_source() {
+    let (_dir, mut journal, op) = claimed_fixture();
+    let mut step = prepared(op);
+    step.spec.target.parent = root(6);
+    assert!(journal.seal(op, vec![step]).is_err());
+    let mut step = prepared(op);
+    let StepOutput::Source(source) = &mut step.spec.output else {
+        unreachable!()
+    };
+    source.path = RelativePath::parse("other.dds").unwrap();
+    assert!(journal.seal(op, vec![step]).is_err());
+}
+
+#[test]
+fn cannot_enter_public_phase_without_seal_or_skip_rollback_resolution() {
+    let (_dir, mut journal, op) = claimed_fixture();
+    assert!(
+        journal
+            .set_phase(op, Phase::Preparing, Phase::Applying)
+            .is_err()
+    );
+    journal.seal(op, vec![prepared(op)]).unwrap();
+    journal
+        .set_phase(op, Phase::Prepared, Phase::Applying)
+        .unwrap();
+    assert!(journal.finish(op, Finalize::RolledBack).is_err());
+    journal
+        .set_phase(op, Phase::Applying, Phase::RollingBack)
+        .unwrap();
+    assert!(journal.finish(op, Finalize::RolledBack).is_err());
+    root_state(&mut journal, Some(op), None);
+}
+
+#[test]
+fn missing_sealed_rows_cannot_commit_a_generation() {
+    let (dir, mut journal, op) = claimed_fixture();
+    journal.seal(op, vec![prepared(op)]).unwrap();
+    journal
+        .set_phase(op, Phase::Prepared, Phase::Applying)
+        .unwrap();
+    Connection::open(dir.path().join(DB))
+        .unwrap()
+        .execute("DELETE FROM operation_steps", [])
+        .unwrap();
+    assert!(journal.finish(op, Finalize::DeployCommitted).is_err());
+    root_state(&mut journal, Some(op), None);
+}
+
+#[test]
+fn setup_cannot_deselect_pending_pair() {
+    let (_dir, mut journal, op) = claimed_fixture();
+    assert_eq!(
+        journal.select_verified_installation(Path::new("other"), &root(5), &root(6)),
+        Err(DeployError::Busy)
+    );
+    root_state(&mut journal, Some(op), None);
+}
+
+#[test]
+fn catalog_writer_guard_can_enclose_journal_writes() {
+    use marduk_platform::{GateError, WriterGate};
+    use marduk_storage::library::Catalog;
+
+    let dir = fixture_v1();
+    let mut catalog = Catalog::open(dir.path()).unwrap();
+    let mut journal = open_fixture(&dir);
+    let library = WriterGate::open(catalog.root().join("library.lock")).unwrap();
+    let _guard = catalog.lock().unwrap();
+    let reviewed = plan(&mut journal);
+    let op = journal.claim(Claim::Deploy(reviewed)).unwrap();
+    journal.seal(op, vec![prepared(op)]).unwrap();
+    assert!(library.try_lock().is_err());
+    let journal_gate = WriterGate::open(catalog.root().join("journal.lock")).unwrap();
+    let _journal_guard = journal_gate.try_lock().unwrap();
+    assert!(matches!(journal_gate.try_lock(), Err(GateError::Busy)));
+    assert_eq!(
+        journal.set_phase(op, Phase::Prepared, Phase::Applying),
+        Err(DeployError::Busy)
+    );
+    assert_eq!(
+        catalog.snapshot(ProfileId::new(1)).unwrap().revision,
+        ProfileRevision::new(7)
+    );
+}
+
+#[test]
+fn deleted_approved_intents_do_not_prove_an_empty_plan() {
+    let (dir, mut journal, op) = claimed_fixture();
+    Connection::open(dir.path().join(DB))
+        .unwrap()
+        .execute("DELETE FROM plan_intents", [])
+        .unwrap();
+    assert!(journal.seal(op, Vec::new()).is_err());
+}
+
+#[test]
+fn status_does_not_report_a_foreign_backup_ref() {
+    let (dir, mut journal, op) = claimed_fixture();
+    journal.seal(op, vec![prepared(op)]).unwrap();
+    Connection::open(dir.path().join(DB))
+        .unwrap()
+        .execute("UPDATE operation_steps SET displaced_ref = x'00'", [])
+        .unwrap();
+    assert!(journal.status(op).is_err());
+}
+
+#[test]
+fn recovery_pair_and_locator_must_match_the_claim() {
+    let (dir, mut journal, op) = claimed_fixture();
+    let location = journal.verify_pending_pair(op, &root(1), &root(2)).unwrap();
+    assert!(location.is_some());
+    assert_eq!(
+        journal.verify_pending_pair(op, &root(5), &root(2)),
+        Err(DeployError::TargetUnavailable)
+    );
+    journal
+        .select_verified_installation(Path::new("other-locator"), &root(1), &root(2))
+        .unwrap();
+    assert_eq!(
+        journal.verify_pending_pair(op, &root(1), &root(2)).unwrap(),
+        location
+    );
+    Connection::open(dir.path().join(DB))
+        .unwrap()
+        .execute("UPDATE installations SET location = x'0078'", [])
+        .unwrap();
+    assert_eq!(
+        journal.verify_pending_pair(op, &root(1), &root(2)),
+        Err(DeployError::TargetUnavailable)
+    );
+}
+
+#[test]
+fn unexpectedly_displaced_ref_survives_reopen_and_prevents_finalize() {
+    let (dir, mut journal, op) = claimed_fixture();
+    let step = prepared(op);
+    journal.seal(op, vec![step.clone()]).unwrap();
+    journal
+        .set_phase(op, Phase::Prepared, Phase::Applying)
+        .unwrap();
+    journal
+        .record_step(op, 0, StepPhase::Ready, StepPhase::Attempting, None)
+        .unwrap();
+    let at = BackupRef::from_record(op, 0, StepDirection::Forward, BackupSlot::Step);
+    journal
+        .block_displacement(op, &step, at, &applied())
+        .unwrap();
+    drop(journal);
+
+    let mut journal = OperationJournal::open(dir.path()).unwrap();
+    let status = journal.status(op).unwrap().unwrap();
+    assert_eq!(status.blocker, Some(DeployError::RecoveryConflict));
+    assert_eq!(status.retained, [at]);
+    assert!(journal.has_unresolved_displacement(op).unwrap());
+    assert!(
+        journal
+            .record_step(
+                op,
+                0,
+                StepPhase::Attempting,
+                StepPhase::Applied,
+                Some(applied())
+            )
+            .is_err()
+    );
+    assert!(journal.finish(op, Finalize::DeployCommitted).is_err());
+    root_state(&mut journal, Some(op), None);
+}
+
+#[test]
+fn terminal_transaction_checks_evidence_values_not_just_applied_flag() {
+    let (dir, mut journal, op) = claimed_fixture();
+    journal.seal(op, vec![prepared(op)]).unwrap();
+    journal
+        .set_phase(op, Phase::Prepared, Phase::Applying)
+        .unwrap();
+    journal
+        .record_step(op, 0, StepPhase::Ready, StepPhase::Attempting, None)
+        .unwrap();
+    journal
+        .record_step(
+            op,
+            0,
+            StepPhase::Attempting,
+            StepPhase::Applied,
+            Some(applied()),
+        )
+        .unwrap();
+    let db = Connection::open(dir.path().join(DB)).unwrap();
+    let mut evidence: Vec<u8> = db
+        .query_row("SELECT observed FROM operation_steps", [], |row| row.get(0))
+        .unwrap();
+    evidence[6] ^= 1;
+    db.execute("UPDATE operation_steps SET observed = ?1", [evidence])
+        .unwrap();
+    assert!(journal.finish(op, Finalize::DeployCommitted).is_err());
+    root_state(&mut journal, Some(op), None);
+}
+
+#[test]
+fn restore_seal_requires_the_committed_managed_identity() {
+    let (_dir, mut journal, op) = claimed_fixture();
+    journal.seal(op, vec![prepared(op)]).unwrap();
+    journal
+        .set_phase(op, Phase::Prepared, Phase::Applying)
+        .unwrap();
+    journal
+        .record_step(op, 0, StepPhase::Ready, StepPhase::Attempting, None)
+        .unwrap();
+    journal
+        .record_step(
+            op,
+            0,
+            StepPhase::Attempting,
+            StepPhase::Applied,
+            Some(applied()),
+        )
+        .unwrap();
+    let generation = journal
+        .finish(op, Finalize::DeployCommitted)
+        .unwrap()
+        .generation
+        .unwrap();
+    assert_eq!(
+        journal.select_verified_installation(Path::new("other"), &root(5), &root(6)),
+        Err(DeployError::ActiveDeployment)
+    );
+
+    let restore = journal
+        .claim(Claim::Restore {
+            installation: root(1),
+            data: root(2),
+            generation,
+        })
+        .unwrap();
+    let mut step = prepared(restore);
+    step.staged = None;
+    step.spec.output = StepOutput::Absent;
+    step.step_pre.backup = Some(BackupRef::from_record(
+        restore,
+        0,
+        StepDirection::Forward,
+        BackupSlot::Step,
+    ));
+    let mut other = fingerprint();
+    other.identity = native(5);
+    step.spec.pre = PreState::Regular(other);
+    step.step_pre.observation = step.spec.pre.clone();
+    assert!(journal.seal(restore, vec![step.clone()]).is_err());
+    step.spec.pre = PreState::Regular(fingerprint());
+    step.step_pre.observation = step.spec.pre.clone();
+    journal.seal(restore, vec![step]).unwrap();
+}

@@ -17,7 +17,7 @@ use marduk_core::ids::{InstalledRevisionId, ProfileId, ProfileRevision};
 use marduk_core::recovery::{
     Artifact, BackupRef, BackupSlot, Claim, Evidence, Finalize, GenerationRecord, Journal,
     Observation, PreImage, PreparedStep, RootState, StageRef, StepDirection, StepOutput, StepPhase,
-    StepRecord, StepSpec,
+    StepRecord, StepSpec, matches_post, matches_pre, matches_step_state,
 };
 use marduk_core::root_identity::{
     FileMetadata, Fingerprint, NativeIdentity, RootError, RootIdentity, UnsupportedReason,
@@ -25,6 +25,7 @@ use marduk_core::root_identity::{
 use marduk_core::targets::{RelativePath, RootRole, TargetFile};
 use marduk_platform::{GateError, WriterGate, WriterGuard};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
 
 pub struct OperationJournal {
     path: PathBuf,
@@ -36,7 +37,8 @@ impl OperationJournal {
     /// Open (and migrate) the shared catalog under the application data root.
     pub fn open(app_data: &Path) -> Result<Self, DeployError> {
         fs::create_dir_all(app_data).map_err(|_| DeployError::Io)?;
-        let gate = WriterGate::open(app_data.join(crate::schema::LOCK_FILE)).map_err(gate_error)?;
+        let gate = WriterGate::open(app_data.join(crate::schema::JOURNAL_LOCK_FILE))
+            .map_err(gate_error)?;
         let path = crate::schema::catalog_path(app_data);
         let mut connection = Connection::open(&path).map_err(|_| DeployError::Io)?;
 
@@ -64,6 +66,24 @@ impl OperationJournal {
         let location = encode_locator(locator);
 
         let transaction = self.immediate()?;
+        let deselect: Option<(Option<i64>, Option<i64>)> = transaction
+            .query_row(
+                "SELECT l.pending_op, l.active_generation FROM installations i
+                 JOIN root_leases l ON l.data = i.data AND l.installation = i.installation
+                 WHERE i.selected = 1 AND (i.installation <> ?1 OR i.data <> ?2)",
+                params![installation_blob, data_blob],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|_| DeployError::Io)?;
+        if let Some((pending, active)) = deselect {
+            if pending.is_some() {
+                return Err(DeployError::Busy);
+            }
+            if active.is_some() {
+                return Err(DeployError::ActiveDeployment);
+            }
+        }
         let lease: Option<(Vec<u8>, Option<i64>, Option<i64>)> = transaction
             .query_row(
                 "SELECT installation, pending_op, active_generation FROM root_leases \
@@ -85,7 +105,7 @@ impl OperationJournal {
                         DeployError::TargetUnavailable
                     });
                 }
-                pending.is_some()
+                pending.is_some() || active.is_some()
             }
             None => false,
         };
@@ -163,10 +183,6 @@ impl OperationJournal {
             intents,
         }))
     }
-
-    fn read_steps(&self, op: OperationId) -> Result<Vec<StepRecord>, DeployError> {
-        read_steps(&self.connection, op)
-    }
 }
 
 impl Journal for OperationJournal {
@@ -212,6 +228,12 @@ impl Journal for OperationJournal {
             let ordinal = i64::try_from(ordinal).map_err(|_| DeployError::Io)?;
             write_intent(&transaction, plan_value, ordinal, intent)?;
         }
+        transaction
+            .execute(
+                "INSERT INTO plan_proofs (plan_id, intents_sha) VALUES (?1, ?2)",
+                params![plan_value, plan_digest(&intents).as_slice()],
+            )
+            .map_err(|_| DeployError::Io)?;
         transaction.commit().map_err(|_| DeployError::Io)?;
 
         Ok(DeploymentPlan {
@@ -229,18 +251,9 @@ impl Journal for OperationJournal {
     }
 
     fn claimed(&mut self, id: PlanId) -> Result<Option<OperationStatus>, DeployError> {
-        let plan_value = sql_id(id.get())?;
-        let op: Option<i64> = self
-            .connection
-            .query_row(
-                "SELECT id FROM operations WHERE plan_id = ?1",
-                [plan_value],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|_| DeployError::Io)?;
-        match op {
-            Some(op) => read_status(&self.connection, OperationId::try_from_u64(row_id(op)?)?),
+        let read = self.connection.transaction().map_err(|_| DeployError::Io)?;
+        match operation_for_plan(&read, sql_id(id.get())?)? {
+            Some(op) => read_status(&read, op),
             None => Ok(None),
         }
     }
@@ -276,6 +289,27 @@ impl Journal for OperationJournal {
         })
     }
 
+    fn verify_pending_pair(
+        &mut self,
+        op: OperationId,
+        installation: &RootIdentity,
+        data: &RootIdentity,
+    ) -> Result<Option<Vec<u8>>, DeployError> {
+        let location: Option<Vec<u8>> = self.connection.query_row(
+            "SELECT p.location FROM operations o
+             JOIN root_leases l ON l.pending_op = o.id AND l.data = o.data AND l.installation = o.installation
+             JOIN installations i ON i.id = o.installation_id AND i.data = o.data AND i.installation = o.installation
+             JOIN operation_proofs p ON p.operation_id = o.id AND p.location = i.location
+             WHERE o.id = ?1 AND o.installation = ?2 AND o.data = ?3 AND i.selected = 1",
+            params![sql_id(op.get())?, encode_root(installation), encode_root(data)],
+            |row| row.get(0),
+        ).optional().map_err(|_| DeployError::Io)?;
+        location
+            .filter(|location| valid_locator(location))
+            .map(Some)
+            .ok_or(DeployError::TargetUnavailable)
+    }
+
     fn claim(&mut self, claim: Claim) -> Result<OperationId, DeployError> {
         let _guard = self.lock()?;
         let transaction = self.immediate()?;
@@ -302,6 +336,9 @@ impl Journal for OperationJournal {
                     }
                     if let Some(op) = operation_for_plan(&transaction, plan_value)? {
                         return Ok(op);
+                    }
+                    if read_intents(&transaction, plan_value)? != plan.intents {
+                        return Err(DeployError::StalePlan);
                     }
                     (
                         encode_root(&plan.installation),
@@ -375,6 +412,16 @@ impl Journal for OperationJournal {
             _ => return Err(DeployError::Io),
         }
 
+        let location: Vec<u8> = transaction
+            .query_row(
+                "SELECT location FROM installations WHERE id = ?1 AND selected = 1",
+                [installation_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| DeployError::Io)?
+            .filter(|location: &Vec<u8>| valid_locator(location))
+            .ok_or(DeployError::TargetUnavailable)?;
         transaction
             .execute(
                 "INSERT INTO operations \
@@ -392,6 +439,12 @@ impl Journal for OperationJournal {
             .map_err(|_| DeployError::Io)?;
         let op_value = transaction.last_insert_rowid();
         let op = OperationId::try_from_u64(row_id(op_value)?)?;
+        transaction
+            .execute(
+                "INSERT INTO operation_proofs (operation_id, location) VALUES (?1, ?2)",
+                params![op_value, location],
+            )
+            .map_err(|_| DeployError::Io)?;
 
         let changed = transaction
             .execute(
@@ -416,130 +469,13 @@ impl Journal for OperationJournal {
         }
         let op_value = sql_id(op.get())?;
 
-        let deploy = match row.kind {
-            OperationKind::Deploy => None,
-            OperationKind::Restore => {
-                let from_generation = row.from_generation.ok_or(DeployError::Io)?;
-                let deploy: i64 = transaction
-                    .query_row(
-                        "SELECT deploy_op FROM generations WHERE id = ?1",
-                        [from_generation],
-                        |row| row.get(0),
-                    )
-                    .map_err(|_| DeployError::Io)?;
-                Some(OperationId::try_from_u64(row_id(deploy)?)?)
-            }
-        };
-        let bindings = deploy
-            .map(|deploy| deploy_bindings(&transaction, deploy))
-            .transpose()?;
-
-        match row.kind {
-            OperationKind::Deploy => {
-                let plan_value: i64 = transaction
-                    .query_row(
-                        "SELECT plan_id FROM operations WHERE id = ?1",
-                        [op_value],
-                        |row| row.get(0),
-                    )
-                    .map_err(|_| DeployError::Io)?;
-                let expected = read_plan_paths(&transaction, plan_value)?;
-                if expected.len() != steps.len() {
-                    return Err(DeployError::Io);
-                }
-                for (index, (path, step)) in expected.iter().zip(steps.iter()).enumerate() {
-                    if u32::try_from(index).map_err(|_| DeployError::Io)? != step.ordinal
-                        || step.spec.target.target.relative.as_str() != path
-                    {
-                        return Err(DeployError::Io);
-                    }
-                }
-            }
-            OperationKind::Restore => {
-                let bindings = bindings.as_ref().ok_or(DeployError::Io)?;
-                if bindings.len() != steps.len() {
-                    return Err(DeployError::Io);
-                }
-                for step in &steps {
-                    let binding = bindings.get(&step.ordinal).ok_or(DeployError::Io)?;
-                    if step.spec.target != binding.target {
-                        return Err(DeployError::Io);
-                    }
-                }
-            }
-        }
-
-        let mut ordinals = BTreeSet::new();
         for step in &steps {
             if step.op != op
                 || step.direction != StepDirection::Forward
-                || !ordinals.insert(step.ordinal)
-                || !valid_pre_image(&step.spec.original)
-                || !valid_pre_image(&step.step_pre)
                 || step.spec.pre != step.step_pre.observation
             {
                 return Err(DeployError::Io);
             }
-
-            let expected_original = match &step.spec.original.observation {
-                PreState::Absent => None,
-                PreState::Regular(_) => Some(match row.kind {
-                    OperationKind::Deploy => BackupRef::from_record(
-                        op,
-                        step.ordinal,
-                        StepDirection::Forward,
-                        BackupSlot::Original,
-                    ),
-                    OperationKind::Restore => bindings
-                        .as_ref()
-                        .and_then(|bindings| bindings.get(&step.ordinal))
-                        .and_then(|binding| binding.original_backup)
-                        .ok_or(DeployError::Io)?,
-                }),
-            };
-            if step.spec.original.backup != expected_original {
-                return Err(DeployError::Io);
-            }
-            if row.kind == OperationKind::Restore {
-                let binding = bindings
-                    .as_ref()
-                    .and_then(|bindings| bindings.get(&step.ordinal))
-                    .ok_or(DeployError::Io)?;
-                if binding.original != step.spec.original.observation {
-                    return Err(DeployError::Io);
-                }
-            }
-            match (
-                &row.kind,
-                &step.spec.original.observation,
-                &step.spec.output,
-            ) {
-                (OperationKind::Deploy, _, StepOutput::Source(_)) => {}
-                (OperationKind::Restore, PreState::Absent, StepOutput::Absent) => {}
-                (OperationKind::Restore, PreState::Regular(_), StepOutput::Original(at))
-                    if Some(*at) == expected_original => {}
-                _ => return Err(DeployError::Io),
-            }
-            if step.step_pre.backup.is_some_and(|at| {
-                at != BackupRef::from_record(
-                    op,
-                    step.ordinal,
-                    StepDirection::Forward,
-                    BackupSlot::Step,
-                )
-            }) || step.staged.as_ref().is_some_and(|(at, _)| {
-                *at != StageRef::from_record(op, step.ordinal, StepDirection::Forward)
-            }) || step.retain
-                != BackupRef::from_record(
-                    op,
-                    step.ordinal,
-                    StepDirection::Forward,
-                    BackupSlot::Displaced,
-                )
-            {
-                return Err(DeployError::Io);
-            }
-
             transaction
                 .execute(
                     "INSERT INTO operation_steps \
@@ -564,6 +500,15 @@ impl Journal for OperationJournal {
                 .map_err(|_| DeployError::Io)?;
         }
 
+        let mut ordered: Vec<_> = steps.iter().collect();
+        ordered.sort_by_key(|step| step.ordinal);
+        let digest = steps_digest(ordered);
+        if transaction.execute(
+            "UPDATE operation_proofs SET intents_sha = ?1 WHERE operation_id = ?2 AND intents_sha IS NULL",
+            params![digest.as_slice(), op_value],
+        ).map_err(|_| DeployError::Io)? != 1 {
+            return Err(DeployError::Io);
+        }
         let changed = transaction
             .execute(
                 "UPDATE operations SET phase = 'prepared' \
@@ -574,16 +519,27 @@ impl Journal for OperationJournal {
         if changed != 1 {
             return Err(DeployError::Io);
         }
+        read_steps(&transaction, op)?;
         transaction.commit().map_err(|_| DeployError::Io)
     }
 
     fn set_phase(&mut self, op: OperationId, from: Phase, to: Phase) -> Result<(), DeployError> {
         let _guard = self.lock()?;
-        if to.is_terminal() {
+        let transaction = self.immediate()?;
+        let row = load_operation(&transaction, op)?.ok_or(DeployError::UnknownOperation)?;
+        if !matches!(
+            (row.kind, from, to),
+            (OperationKind::Deploy, Phase::Prepared, Phase::Applying)
+                | (OperationKind::Deploy, Phase::Applying, Phase::RollingBack)
+                | (OperationKind::Restore, Phase::Prepared, Phase::Restoring)
+        ) || row.phase != from
+            || !pending_is(&transaction, &row.data, op)?
+            || read_displacement(&transaction, op)?.is_some()
+        {
             return Err(DeployError::Io);
         }
-        let changed = self
-            .connection
+        read_steps(&transaction, op)?;
+        let changed = transaction
             .execute(
                 "UPDATE operations SET phase = ?1 WHERE id = ?2 AND phase = ?3 \
                  AND EXISTS (SELECT 1 FROM root_leases WHERE pending_op = ?2)",
@@ -593,7 +549,7 @@ impl Journal for OperationJournal {
         if changed != 1 {
             return Err(DeployError::Io);
         }
-        Ok(())
+        transaction.commit().map_err(|_| DeployError::Io)
     }
 
     fn record_step(
@@ -604,15 +560,53 @@ impl Journal for OperationJournal {
         to: StepPhase,
         evidence: Option<Evidence>,
     ) -> Result<(), DeployError> {
-        if matches!(to, StepPhase::Applied | StepPhase::Undone) && evidence.is_none() {
+        let _guard = self.lock()?;
+        let transaction = self.immediate()?;
+        let operation = load_operation(&transaction, op)?.ok_or(DeployError::UnknownOperation)?;
+        let op_value = sql_id(op.get())?;
+        let (phase, pre, stage, undo): (String, Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>) =
+            transaction.query_row(
+                "SELECT phase, step_pre_observation, stage_fingerprint, undo FROM operation_steps
+                 WHERE operation_id = ?1 AND ordinal = ?2",
+                params![op_value, ordinal],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).map_err(|_| DeployError::Io)?;
+        if parse_step_phase(&phase)? != from
+            || !pending_is(&transaction, &operation.data, op)?
+            || read_displacement(&transaction, op)?.is_some()
+        {
             return Err(DeployError::Io);
         }
-        let _guard = self.lock()?;
+        let pre = decode_pre_state(&pre)?;
+        let stage = stage.as_deref().map(decode_fingerprint).transpose()?;
+        use StepPhase::{Applied, Attempting, Ready, UndoAttempting, Undone};
+        let legal = match (operation.phase, from, to, evidence.as_ref()) {
+            (Phase::Applying | Phase::Restoring, Ready, Attempting, None) => true,
+            (Phase::Restoring, Applied, Attempting, Some(evidence)) => {
+                matches_step_state(&pre, stage.as_ref(), false, evidence)
+            }
+            (Phase::Applying | Phase::Restoring, Attempting, Applied, Some(evidence)) => {
+                matches_step_state(&pre, stage.as_ref(), true, evidence)
+            }
+            (Phase::RollingBack, Attempting | Applied, UndoAttempting, None) => undo.is_some(),
+            (Phase::RollingBack, UndoAttempting, Undone, Some(evidence)) => undo
+                .as_deref()
+                .map(decode_prepared)
+                .transpose()?
+                .as_ref()
+                .is_some_and(|undo| matches_post(undo, evidence)),
+            (Phase::RollingBack, Ready | Attempting, Undone, Some(evidence)) => {
+                undo.is_none() && matches_step_state(&pre, stage.as_ref(), false, evidence)
+            }
+            _ => false,
+        };
+        if !legal {
+            return Err(DeployError::Io);
+        }
         let evidence = evidence.map(|evidence| encode_evidence(&evidence));
-        let changed = self
-            .connection
+        let changed = transaction
             .execute(
-                "UPDATE operation_steps SET phase = ?1, observed = COALESCE(?2, observed) \
+                "UPDATE operation_steps SET phase = ?1, observed = ?2 \
                  WHERE operation_id = ?3 AND ordinal = ?4 AND phase = ?5 \
                  AND EXISTS (SELECT 1 FROM root_leases WHERE pending_op = ?3)",
                 params![
@@ -627,7 +621,7 @@ impl Journal for OperationJournal {
         if changed != 1 {
             return Err(DeployError::Io);
         }
-        Ok(())
+        transaction.commit().map_err(|_| DeployError::Io)
     }
 
     fn block(&mut self, op: OperationId, error: Option<DeployError>) -> Result<(), DeployError> {
@@ -649,12 +643,64 @@ impl Journal for OperationJournal {
         Ok(())
     }
 
+    fn block_displacement(
+        &mut self,
+        op: OperationId,
+        step: &PreparedStep,
+        at: BackupRef,
+        evidence: &Evidence,
+    ) -> Result<(), DeployError> {
+        let _guard = self.lock()?;
+        let transaction = self.immediate()?;
+        let operation = load_operation(&transaction, op)?.ok_or(DeployError::UnknownOperation)?;
+        if !pending_is(&transaction, &operation.data, op)? {
+            return Err(DeployError::UnknownOperation);
+        }
+        let row = read_steps(&transaction, op)?
+            .into_iter()
+            .find(|row| row.prepared.ordinal == step.ordinal)
+            .ok_or(DeployError::Io)?;
+        let attempting = match (step.direction, operation.phase, row.phase) {
+            (StepDirection::Forward, Phase::Applying | Phase::Restoring, StepPhase::Attempting) => {
+                step == &row.prepared
+            }
+            (StepDirection::Undo, Phase::RollingBack, StepPhase::UndoAttempting) => {
+                row.undo.as_ref() == Some(step)
+            }
+            _ => false,
+        };
+        if !attempting {
+            return Err(DeployError::Io);
+        }
+        let op_value = sql_id(op.get())?;
+        transaction.execute(
+            "INSERT INTO unexpected_displacements (operation_id, ordinal, direction, reported_ref, evidence)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![op_value, i64::from(step.ordinal), direction_tag(step.direction), encode_backup(at), encode_evidence(evidence)],
+        ).map_err(|_| DeployError::Io)?;
+        transaction
+            .execute(
+                "UPDATE operations SET blocker = 'recovery_conflict' WHERE id = ?1",
+                [op_value],
+            )
+            .map_err(|_| DeployError::Io)?;
+        transaction.commit().map_err(|_| DeployError::Io)
+    }
+
+    fn has_unresolved_displacement(&mut self, op: OperationId) -> Result<bool, DeployError> {
+        Ok(read_displacement(&self.connection, op)?.is_some())
+    }
+
     fn finish(&mut self, op: OperationId, how: Finalize) -> Result<OperationStatus, DeployError> {
         let _guard = self.lock()?;
         let transaction = self.immediate()?;
         let row = load_operation(&transaction, op)?.ok_or(DeployError::UnknownOperation)?;
         if !pending_is(&transaction, &row.data, op)? {
             return Err(DeployError::UnknownOperation);
+        }
+        let steps = read_steps(&transaction, op)?;
+        if read_displacement(&transaction, op)?.is_some() {
+            return Err(DeployError::RecoveryConflict);
         }
         let op_value = sql_id(op.get())?;
         let data_blob = row.data.clone();
@@ -664,7 +710,7 @@ impl Journal for OperationJournal {
                 if row.kind != OperationKind::Deploy
                     || row.phase != Phase::Applying
                     || row.blocker.is_some()
-                    || !all_steps_applied(&transaction, op_value)?
+                    || !steps.iter().all(|step| step.phase == StepPhase::Applied)
                 {
                     return Err(DeployError::Io);
                 }
@@ -701,7 +747,7 @@ impl Journal for OperationJournal {
                 if row.kind != OperationKind::Restore
                     || row.phase != Phase::Restoring
                     || row.blocker.is_some()
-                    || !all_steps_applied(&transaction, op_value)?
+                    || !steps.iter().all(|step| step.phase == StepPhase::Applied)
                 {
                     return Err(DeployError::Io);
                 }
@@ -718,8 +764,8 @@ impl Journal for OperationJournal {
                 let changed = transaction
                     .execute(
                         "UPDATE root_leases SET pending_op = NULL, active_generation = NULL \
-                         WHERE data = ?1 AND pending_op = ?2",
-                        params![data_blob.as_slice(), op_value],
+                         WHERE data = ?1 AND pending_op = ?2 AND active_generation = ?3",
+                        params![data_blob.as_slice(), op_value, row.from_generation],
                     )
                     .map_err(|_| DeployError::Io)?;
                 if changed != 1 {
@@ -728,14 +774,16 @@ impl Journal for OperationJournal {
             }
             Finalize::RolledBack => {
                 if row.kind != OperationKind::Deploy
-                    || !matches!(row.phase, Phase::Applying | Phase::RollingBack)
+                    || row.phase != Phase::RollingBack
+                    || row.blocker.is_some()
+                    || !steps.iter().all(|step| step.phase == StepPhase::Undone)
                 {
                     return Err(DeployError::Io);
                 }
                 let changed = transaction
                     .execute(
                         "UPDATE operations SET phase = 'rolled_back', blocker = NULL \
-                         WHERE id = ?1 AND phase IN ('applying', 'rolling_back')",
+                         WHERE id = ?1 AND phase = 'rolling_back'",
                         [op_value],
                     )
                     .map_err(|_| DeployError::Io)?;
@@ -768,17 +816,19 @@ impl Journal for OperationJournal {
     }
 
     fn status(&mut self, op: OperationId) -> Result<Option<OperationStatus>, DeployError> {
-        read_status(&self.connection, op)
+        let read = self.connection.transaction().map_err(|_| DeployError::Io)?;
+        read_status(&read, op)
     }
 
     fn steps(&mut self, op: OperationId) -> Result<Vec<StepRecord>, DeployError> {
-        self.read_steps(op)
+        let read = self.connection.transaction().map_err(|_| DeployError::Io)?;
+        read_steps(&read, op)
     }
 
     fn generation(&mut self, id: GenerationId) -> Result<GenerationRecord, DeployError> {
         let generation_value = sql_id(id.get())?;
-        let row: Option<(i64, Vec<u8>, Vec<u8>)> = self
-            .connection
+        let read = self.connection.transaction().map_err(|_| DeployError::Io)?;
+        let row: Option<(i64, Vec<u8>, Vec<u8>)> = read
             .query_row(
                 "SELECT deploy_op, data, installation FROM generations WHERE id = ?1",
                 [generation_value],
@@ -791,9 +841,11 @@ impl Journal for OperationJournal {
         };
         let deploy = OperationId::try_from_u64(row_id(deploy)?)?;
 
-        let operation =
-            load_operation(&self.connection, deploy)?.ok_or(DeployError::UnknownOperation)?;
-        if operation.data != data || operation.installation != installation {
+        let operation = load_operation(&read, deploy)?.ok_or(DeployError::UnknownOperation)?;
+        if operation.data != data
+            || operation.installation != installation
+            || operation.result_generation != Some(generation_value)
+        {
             return Err(DeployError::Io);
         }
         if operation.kind != OperationKind::Deploy || operation.phase != Phase::Completed {
@@ -803,7 +855,7 @@ impl Journal for OperationJournal {
         Ok(GenerationRecord {
             id,
             deploy,
-            steps: self.read_steps(deploy)?,
+            steps: read_steps(&read, deploy)?,
         })
     }
 
@@ -816,29 +868,19 @@ impl Journal for OperationJournal {
         let _guard = self.lock()?;
         let transaction = self.immediate()?;
         let op_value = sql_id(op.get())?;
-        let data: Vec<u8> = transaction
-            .query_row(
-                "SELECT data FROM operations WHERE id = ?1",
-                [op_value],
-                |row| row.get(0),
-            )
-            .map_err(|_| DeployError::Io)?;
-        if !pending_is(&transaction, &data, op)? {
+        let operation = load_operation(&transaction, op)?.ok_or(DeployError::UnknownOperation)?;
+        if operation.kind != OperationKind::Deploy
+            || operation.phase != Phase::RollingBack
+            || !pending_is(&transaction, &operation.data, op)?
+            || read_displacement(&transaction, op)?.is_some()
+        {
             return Err(DeployError::UnknownOperation);
         }
         let row = read_steps(&transaction, op)?
             .into_iter()
             .find(|row| row.prepared.ordinal == ordinal)
             .ok_or(DeployError::UnknownOperation)?;
-        if row.undo.is_some()
-            || row.prepared.retain
-                != BackupRef::from_record(
-                    op,
-                    ordinal,
-                    StepDirection::Forward,
-                    BackupSlot::Displaced,
-                )
-        {
+        if row.undo.is_some() || !matches!(row.phase, StepPhase::Attempting | StepPhase::Applied) {
             return Err(DeployError::Io);
         }
         validate_undo(&row.prepared, &undo)?;
@@ -938,6 +980,7 @@ struct OperationRow {
     blocker: Option<String>,
     installation: Vec<u8>,
     data: Vec<u8>,
+    plan_id: Option<i64>,
 }
 
 fn load_operation(
@@ -952,10 +995,11 @@ fn load_operation(
         Option<String>,
         Vec<u8>,
         Vec<u8>,
+        Option<i64>,
     )> = connection
         .query_row(
             "SELECT kind, phase, from_generation, result_generation, blocker, \
-                 installation, data FROM operations WHERE id = ?1",
+                  installation, data, plan_id FROM operations WHERE id = ?1",
             [sql_id(op.get())?],
             |row| {
                 Ok((
@@ -966,23 +1010,54 @@ fn load_operation(
                     row.get(4)?,
                     row.get(5)?,
                     row.get(6)?,
+                    row.get(7)?,
                 ))
             },
         )
         .optional()
         .map_err(|_| DeployError::Io)?;
-    let Some((kind, phase, from_generation, result_generation, blocker, installation, data)) = row
-    else {
-        return Ok(None);
-    };
-    Ok(Some(OperationRow {
-        kind: parse_kind(&kind)?,
-        phase: parse_phase(&phase)?,
+    let Some((
+        kind,
+        phase,
         from_generation,
         result_generation,
         blocker,
         installation,
         data,
+        plan_id,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let kind = parse_kind(&kind)?;
+    let phase = parse_phase(&phase)?;
+    if !match kind {
+        OperationKind::Deploy => {
+            phase != Phase::Restoring
+                && plan_id.is_some()
+                && from_generation.is_none()
+                && result_generation.is_some() == (phase == Phase::Completed)
+        }
+        OperationKind::Restore => {
+            !matches!(
+                phase,
+                Phase::Applying | Phase::RollingBack | Phase::RolledBack
+            ) && plan_id.is_none()
+                && from_generation.is_some()
+                && result_generation.is_none()
+        }
+    } {
+        return Err(DeployError::Io);
+    }
+    Ok(Some(OperationRow {
+        kind,
+        phase,
+        from_generation,
+        result_generation,
+        blocker,
+        installation,
+        data,
+        plan_id,
     }))
 }
 
@@ -993,7 +1068,45 @@ fn read_status(
     let Some(row) = load_operation(connection, op)? else {
         return Ok(None);
     };
-    let retained = read_retained(connection, op)?;
+    let steps = read_steps(connection, op)?;
+    let mut retained = BTreeSet::new();
+    for row in &steps {
+        retained.extend(row.prepared.spec.original.backup);
+        retained.extend(row.prepared.step_pre.backup);
+        if let Some(undo) = &row.undo {
+            retained.extend(undo.step_pre.backup);
+            retained.insert(row.prepared.retain);
+        }
+        if row
+            .evidence
+            .as_ref()
+            .is_some_and(|evidence| matches!(evidence.retained, Artifact::Regular(_)))
+        {
+            let settled = if row.phase == StepPhase::Undone {
+                row.undo.as_ref().unwrap_or(&row.prepared)
+            } else {
+                &row.prepared
+            };
+            retained.insert(settled.retain);
+        }
+    }
+    let displacement = read_displacement(connection, op)?;
+    if let Some((ordinal, direction, at)) = displacement {
+        let row = steps
+            .iter()
+            .find(|row| row.prepared.ordinal == ordinal)
+            .ok_or(DeployError::Io)?;
+        if !(matches!(
+            (direction, row.phase),
+            (StepDirection::Forward, StepPhase::Attempting)
+                | (StepDirection::Undo, StepPhase::UndoAttempting)
+        )) {
+            return Err(DeployError::Io);
+        }
+        if at.operation() == op && at.ordinal() == ordinal && at.direction() == direction {
+            retained.insert(at);
+        }
+    }
     let generation = match (row.kind, row.phase) {
         (OperationKind::Deploy, Phase::Completed) => row.result_generation,
         (OperationKind::Restore, Phase::Completed) => None,
@@ -1008,44 +1121,29 @@ fn read_status(
             .transpose()?
             .map(GenerationId::try_from_u64)
             .transpose()?,
-        blocker: row.blocker.as_deref().map(parse_error).transpose()?,
-        retained,
+        blocker: if displacement.is_some() {
+            Some(DeployError::RecoveryConflict)
+        } else {
+            row.blocker.as_deref().map(parse_error).transpose()?
+        },
+        retained: retained.into_iter().collect(),
     }))
 }
 
-fn read_retained(connection: &Connection, op: OperationId) -> Result<Vec<BackupRef>, DeployError> {
-    let rows = {
-        let mut statement = connection
-            .prepare(
-                "SELECT original_backup, step_pre_backup FROM operation_steps \
-                 WHERE operation_id = ?1 ORDER BY ordinal ASC",
-            )
-            .map_err(|_| DeployError::Io)?;
-        let rows = statement
-            .query_map([sql_id(op.get())?], |row| {
-                Ok((
-                    row.get::<_, Option<Vec<u8>>>(0)?,
-                    row.get::<_, Option<Vec<u8>>>(1)?,
-                ))
-            })
-            .map_err(|_| DeployError::Io)?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|_| DeployError::Io)?
-    };
-    let mut retained = Vec::new();
-    for (original, step) in rows {
-        if let Some(blob) = original {
-            retained.push(decode_backup(&blob)?);
-        }
-        if let Some(blob) = step {
-            retained.push(decode_backup(&blob)?);
-        }
-    }
-    Ok(retained)
-}
-
 fn read_steps(connection: &Connection, op: OperationId) -> Result<Vec<StepRecord>, DeployError> {
+    let operation = load_operation(connection, op)?.ok_or(DeployError::UnknownOperation)?;
     let (kind, deploy) = step_context(connection, op)?;
+    let digest: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT intents_sha FROM operation_proofs WHERE operation_id = ?1",
+            [sql_id(op.get())?],
+            |row| row.get(0),
+        )
+        .map_err(|_| DeployError::Io)?;
+    let approved = operation
+        .plan_id
+        .map(|plan| read_intents(connection, plan))
+        .transpose()?;
     let bindings = deploy
         .map(|deploy| deploy_bindings(connection, deploy))
         .transpose()?;
@@ -1084,7 +1182,7 @@ fn read_steps(connection: &Connection, op: OperationId) -> Result<Vec<StepRecord
 
     let mut steps = Vec::with_capacity(rows.len());
     for (
-        operation,
+        owner,
         ordinal,
         target,
         output,
@@ -1100,8 +1198,7 @@ fn read_steps(connection: &Connection, op: OperationId) -> Result<Vec<StepRecord
         undo,
     ) in rows
     {
-        let operation = OperationId::try_from_u64(row_id(operation)?)?;
-        if operation != op {
+        if OperationId::try_from_u64(row_id(owner)?)? != op {
             return Err(DeployError::Io);
         }
         let ordinal = u32::try_from(ordinal).map_err(|_| DeployError::Io)?;
@@ -1191,6 +1288,25 @@ fn read_steps(connection: &Connection, op: OperationId) -> Result<Vec<StepRecord
             staged,
             retain,
         };
+        if !stage_matches_output(&prepared, &prepared.spec.original.observation) {
+            return Err(DeployError::Io);
+        }
+        if let Some(approved) = &approved {
+            let intent = approved.get(ordinal as usize).ok_or(DeployError::Io)?;
+            if prepared.spec.target != intent.target
+                || prepared.spec.original.observation != intent.original
+                || prepared.spec.pre != intent.original
+                || prepared.spec.output != StepOutput::Source(intent.source.clone())
+            {
+                return Err(DeployError::Io);
+            }
+        } else if bindings
+            .as_ref()
+            .and_then(|bindings| bindings.get(&ordinal))
+            .is_none_or(|binding| binding.managed != prepared.spec.pre)
+        {
+            return Err(DeployError::Io);
+        }
         let undo = undo
             .as_deref()
             .map(decode_prepared)
@@ -1202,7 +1318,29 @@ fn read_steps(connection: &Connection, op: OperationId) -> Result<Vec<StepRecord
             .transpose()?;
         let phase = parse_step_phase(&phase)?;
         let evidence = observed.as_deref().map(decode_evidence).transpose()?;
-        if matches!(phase, StepPhase::Applied | StepPhase::Undone) && evidence.is_none() {
+        use StepPhase::{Applied, Attempting, Ready, UndoAttempting, Undone};
+        let valid_evidence = match (phase, &evidence, &undo) {
+            (Ready, None, None) | (Attempting, None, _) | (UndoAttempting, None, Some(_)) => true,
+            (Attempting, Some(evidence), None) if kind == OperationKind::Restore => {
+                matches_pre(&prepared, evidence)
+            }
+            (Applied, Some(evidence), _) => matches_post(&prepared, evidence),
+            (Undone, Some(evidence), Some(undo)) => matches_post(undo, evidence),
+            (Undone, Some(evidence), None) => matches_pre(&prepared, evidence),
+            _ => false,
+        };
+        let valid_phase = match operation.phase {
+            Phase::Preparing | Phase::Prepared | Phase::Cancelled => phase == Ready,
+            Phase::Applying | Phase::Restoring => matches!(phase, Ready | Attempting | Applied),
+            Phase::RollingBack => true,
+            Phase::Completed => phase == Applied,
+            Phase::RolledBack => phase == Undone,
+        };
+        if !valid_evidence
+            || !valid_phase
+            || (undo.is_some()
+                && !matches!(operation.phase, Phase::RollingBack | Phase::RolledBack))
+        {
             return Err(DeployError::Io);
         }
         steps.push(StepRecord {
@@ -1212,7 +1350,25 @@ fn read_steps(connection: &Connection, op: OperationId) -> Result<Vec<StepRecord
             undo,
         });
     }
-    Ok(steps)
+    match digest {
+        Some(digest)
+            if operation.phase != Phase::Preparing
+                && digest == steps_digest(steps.iter().map(|row| &row.prepared))
+                && approved
+                    .as_ref()
+                    .map(Vec::len)
+                    .or_else(|| bindings.as_ref().map(BTreeMap::len))
+                    == Some(steps.len()) =>
+        {
+            Ok(steps)
+        }
+        None if steps.is_empty()
+            && matches!(operation.phase, Phase::Preparing | Phase::Cancelled) =>
+        {
+            Ok(steps)
+        }
+        _ => Err(DeployError::Io),
+    }
 }
 
 fn step_context(
@@ -1226,8 +1382,11 @@ fn step_context(
             let from_generation = row.from_generation.ok_or(DeployError::Io)?;
             let deploy: i64 = connection
                 .query_row(
-                    "SELECT deploy_op FROM generations WHERE id = ?1",
-                    [from_generation],
+                    "SELECT g.deploy_op FROM generations g JOIN operations d ON d.id = g.deploy_op
+                     WHERE g.id = ?1 AND g.data = ?2 AND g.installation = ?3
+                     AND d.data = g.data AND d.installation = g.installation
+                     AND d.result_generation = g.id AND d.kind = 'deploy' AND d.phase = 'completed'",
+                    params![from_generation, row.data, row.installation],
                     |row| row.get(0),
                 )
                 .map_err(|_| DeployError::Io)?;
@@ -1242,59 +1401,101 @@ struct DeployBinding {
     target: BoundTarget,
     original: PreState,
     original_backup: Option<BackupRef>,
+    managed: PreState,
 }
 
 fn deploy_bindings(
     connection: &Connection,
     deploy: OperationId,
 ) -> Result<BTreeMap<u32, DeployBinding>, DeployError> {
-    let rows = {
-        let mut statement = connection
-            .prepare(
-                "SELECT ordinal, target, original_observation, original_backup \
-                 FROM operation_steps WHERE operation_id = ?1 ORDER BY ordinal ASC",
-            )
-            .map_err(|_| DeployError::Io)?;
-        let rows = statement
-            .query_map([sql_id(deploy.get())?], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, Option<Vec<u8>>>(3)?,
-                ))
-            })
-            .map_err(|_| DeployError::Io)?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|_| DeployError::Io)?
-    };
-    let mut bindings = BTreeMap::new();
-    for (ordinal, target, original, backup) in rows {
-        let ordinal = u32::try_from(ordinal).map_err(|_| DeployError::Io)?;
-        let original = decode_pre_state(&original)?;
-        let backup = backup.as_deref().map(decode_backup).transpose()?;
-        let expected = match &original {
-            PreState::Absent => None,
-            PreState::Regular(_) => Some(BackupRef::from_record(
-                deploy,
-                ordinal,
-                StepDirection::Forward,
-                BackupSlot::Original,
-            )),
-        };
-        if backup != expected {
-            return Err(DeployError::Io);
+    read_steps(connection, deploy)?
+        .into_iter()
+        .map(|row| {
+            let step = row.prepared;
+            let (_, managed) = step.staged.ok_or(DeployError::Io)?;
+            Ok((
+                step.ordinal,
+                DeployBinding {
+                    target: step.spec.target,
+                    original: step.spec.original.observation,
+                    original_backup: step.spec.original.backup,
+                    managed: PreState::Regular(managed),
+                },
+            ))
+        })
+        .collect()
+}
+
+fn stage_matches_output(step: &PreparedStep, original: &PreState) -> bool {
+    match (&step.spec.output, &step.staged, original) {
+        (StepOutput::Absent, None, _) => true,
+        (StepOutput::Source(source), Some((_, fp)), _) => {
+            fp.len == source.len && fp.sha256 == source.sha256
         }
-        bindings.insert(
-            ordinal,
-            DeployBinding {
-                target: decode_bound(&target)?,
-                original,
-                original_backup: backup,
-            },
-        );
+        (StepOutput::Original(_), Some((_, fp)), PreState::Regular(original)) => {
+            fp.len == original.len
+                && fp.sha256 == original.sha256
+                && fp.metadata == original.metadata
+        }
+        _ => false,
     }
-    Ok(bindings)
+}
+
+fn plan_digest(intents: &[FileIntent]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"marduk-plan-v1");
+    for intent in intents {
+        hash_record(&mut digest, &encode_bound(&intent.target));
+        hash_record(&mut digest, &encode_source(&intent.source));
+        hash_record(&mut digest, &encode_pre_state(&intent.original));
+    }
+    digest.finalize().into()
+}
+
+fn steps_digest<'a>(steps: impl IntoIterator<Item = &'a PreparedStep>) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"marduk-seal-v1");
+    for step in steps {
+        hash_record(&mut digest, &encode_prepared(step));
+    }
+    digest.finalize().into()
+}
+
+fn hash_record(digest: &mut Sha256, bytes: &[u8]) {
+    digest.update((bytes.len() as u64).to_le_bytes());
+    digest.update(bytes);
+}
+
+fn direction_tag(direction: StepDirection) -> i64 {
+    match direction {
+        StepDirection::Forward => 0,
+        StepDirection::Undo => 1,
+    }
+}
+
+fn read_displacement(
+    connection: &Connection,
+    op: OperationId,
+) -> Result<Option<(u32, StepDirection, BackupRef)>, DeployError> {
+    let row: Option<(i64, i64, Vec<u8>, Vec<u8>)> = connection.query_row(
+        "SELECT ordinal, direction, reported_ref, evidence FROM unexpected_displacements WHERE operation_id = ?1",
+        [sql_id(op.get())?],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).optional().map_err(|_| DeployError::Io)?;
+    row.map(|(ordinal, direction, at, evidence)| {
+        decode_evidence(&evidence)?;
+        let direction = match direction {
+            0 => StepDirection::Forward,
+            1 => StepDirection::Undo,
+            _ => return Err(DeployError::Io),
+        };
+        Ok((
+            u32::try_from(ordinal).map_err(|_| DeployError::Io)?,
+            direction,
+            decode_backup(&at)?,
+        ))
+    })
+    .transpose()
 }
 
 fn validate_undo(forward: &PreparedStep, undo: &PreparedStep) -> Result<(), DeployError> {
@@ -1310,6 +1511,7 @@ fn validate_undo(forward: &PreparedStep, undo: &PreparedStep) -> Result<(), Depl
         || undo.direction != StepDirection::Undo
         || undo.spec.target != forward.spec.target
         || undo.spec.pre != expected_post
+        || !stage_matches_output(undo, &forward.spec.pre)
         || !valid_pre_image(&undo.spec.original)
         || undo.spec.original.observation != forward.spec.original.observation
         || undo.spec.original.backup != forward.spec.original.backup
@@ -1350,7 +1552,7 @@ fn read_intents(connection: &Connection, plan: i64) -> Result<Vec<FileIntent>, D
         let mut statement = connection
             .prepare(
                 "SELECT role, path, parent, leaf, source_id, source_path, source_sha, \
-                 source_len, original FROM plan_intents WHERE plan_id = ?1 ORDER BY ordinal ASC",
+                 source_len, original, ordinal FROM plan_intents WHERE plan_id = ?1 ORDER BY ordinal ASC",
             )
             .map_err(|_| DeployError::Io)?;
         let rows = statement
@@ -1365,6 +1567,7 @@ fn read_intents(connection: &Connection, plan: i64) -> Result<Vec<FileIntent>, D
                     row.get::<_, Vec<u8>>(6)?,
                     row.get::<_, i64>(7)?,
                     row.get::<_, Vec<u8>>(8)?,
+                    row.get::<_, i64>(9)?,
                 ))
             })
             .map_err(|_| DeployError::Io)?;
@@ -1373,9 +1576,20 @@ fn read_intents(connection: &Connection, plan: i64) -> Result<Vec<FileIntent>, D
     };
 
     let mut intents = Vec::with_capacity(rows.len());
-    for (role, path, parent, leaf, source_id, source_path, source_sha, source_len, original) in rows
+    for (
+        role,
+        path,
+        parent,
+        leaf,
+        source_id,
+        source_path,
+        source_sha,
+        source_len,
+        original,
+        ordinal,
+    ) in rows
     {
-        if role != "data" {
+        if role != "data" || usize::try_from(ordinal).ok() != Some(intents.len()) {
             return Err(DeployError::Io);
         }
         intents.push(FileIntent {
@@ -1396,21 +1610,17 @@ fn read_intents(connection: &Connection, plan: i64) -> Result<Vec<FileIntent>, D
             original: decode_pre_state(&original)?,
         });
     }
+    let digest: Vec<u8> = connection
+        .query_row(
+            "SELECT intents_sha FROM plan_proofs WHERE plan_id = ?1",
+            [plan],
+            |row| row.get(0),
+        )
+        .map_err(|_| DeployError::Io)?;
+    if digest != plan_digest(&intents) {
+        return Err(DeployError::Io);
+    }
     Ok(intents)
-}
-
-fn read_plan_paths(connection: &Connection, plan: i64) -> Result<Vec<String>, DeployError> {
-    let rows = {
-        let mut statement = connection
-            .prepare("SELECT path FROM plan_intents WHERE plan_id = ?1 ORDER BY ordinal ASC")
-            .map_err(|_| DeployError::Io)?;
-        let rows = statement
-            .query_map([plan], |row| row.get::<_, String>(0))
-            .map_err(|_| DeployError::Io)?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|_| DeployError::Io)?
-    };
-    Ok(rows)
 }
 
 fn write_intent(
@@ -1463,7 +1673,9 @@ fn operation_for_plan(
 fn pending_is(connection: &Connection, data: &[u8], op: OperationId) -> Result<bool, DeployError> {
     let found: Option<i64> = connection
         .query_row(
-            "SELECT 1 FROM root_leases WHERE data = ?1 AND pending_op = ?2",
+            "SELECT 1 FROM root_leases l JOIN operations o
+             ON o.id = l.pending_op AND o.data = l.data AND o.installation = l.installation
+             WHERE l.data = ?1 AND l.pending_op = ?2",
             params![data, sql_id(op.get())?],
             |row| row.get(0),
         )
@@ -1484,18 +1696,6 @@ fn clear_pending(connection: &Connection, data: &[u8], op: OperationId) -> Resul
         return Err(DeployError::Io);
     }
     Ok(())
-}
-
-fn all_steps_applied(connection: &Connection, op: i64) -> Result<bool, DeployError> {
-    let (total, applied): (i64, i64) = connection
-        .query_row(
-            "SELECT count(*), COALESCE(sum(CASE WHEN phase = 'applied' THEN 1 ELSE 0 END), 0) \
-             FROM operation_steps WHERE operation_id = ?1",
-            [op],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|_| DeployError::Io)?;
-    Ok(total == applied)
 }
 
 fn valid_pre_image(image: &PreImage) -> bool {
@@ -1616,6 +1816,17 @@ fn empty_locator() -> Vec<u8> {
 #[cfg(windows)]
 fn empty_locator() -> Vec<u8> {
     vec![1]
+}
+
+#[cfg(unix)]
+fn valid_locator(location: &[u8]) -> bool {
+    matches!(location, [0, path @ ..] if !path.is_empty() && !path.contains(&0))
+}
+
+#[cfg(windows)]
+fn valid_locator(location: &[u8]) -> bool {
+    matches!(location, [1, path @ ..] if !path.is_empty() && path.len() % 2 == 0
+        && path.chunks_exact(2).all(|unit| unit != [0, 0]))
 }
 
 #[cfg(unix)]

@@ -192,6 +192,16 @@ pub trait DeploymentInputs: CopyEffects {
         installation: &RootIdentity,
         data: &RootIdentity,
     ) -> Result<(), DeployError>;
+    /// Native adapters must reopen the journal's recorded locator and verify
+    /// the exact pair. Synthetic ports may use their existing in-memory binding.
+    fn verify_recovery_root(
+        &mut self,
+        installation: &RootIdentity,
+        data: &RootIdentity,
+        _locator: Option<&[u8]>,
+    ) -> Result<(), DeployError> {
+        self.verify_root(installation, data)
+    }
     fn resolve_target(&mut self, target: &TargetFile) -> Result<BoundTarget, RootError>;
     fn profile_revision(&mut self, profile: ProfileId) -> Result<ProfileRevision, DeployError>;
     fn source(
@@ -369,7 +379,9 @@ pub fn commit_deployment<J: Journal, P: DeploymentInputs>(
         return finish(journal, op, Finalize::Cancelled);
     }
 
+    validate_prepared(journal, port, op, &steps)?;
     journal.set_phase(op, Phase::Prepared, Phase::Applying)?;
+    drop(_library);
 
     for step in &steps {
         journal.record_step(
@@ -387,7 +399,7 @@ pub fn commit_deployment<J: Journal, P: DeploymentInputs>(
     // without pretending later external edits are excluded.
     for step in &steps {
         let evidence = port.inspect_step(step);
-        if let Err(error) = validate_settled(step, &evidence) {
+        if let Err(error) = crate::recovery::check_post(port, step, &evidence) {
             journal.block(op, Some(error))?;
             return Err(error);
         }
@@ -412,6 +424,7 @@ pub fn restore<J: Journal, P: DeploymentInputs>(
 
     let state = journal.root_state(data)?;
     if let Some(op) = state.pending {
+        journal.verify_pending_pair(op, installation, data)?;
         let status = journal.status(op)?.ok_or(DeployError::UnknownOperation)?;
         if status.kind == OperationKind::Restore {
             return Ok(status);
@@ -485,7 +498,9 @@ pub fn restore<J: Journal, P: DeploymentInputs>(
         let _ = journal.finish(op, Finalize::Cancelled);
         return Err(error);
     }
+    validate_prepared(journal, port, op, &steps)?;
     journal.set_phase(op, Phase::Prepared, Phase::Restoring)?;
+    drop(_library);
 
     for step in &steps {
         journal.record_step(
@@ -501,13 +516,29 @@ pub fn restore<J: Journal, P: DeploymentInputs>(
 
     for step in &steps {
         let evidence = port.inspect_step(step);
-        if let Err(error) = validate_settled(step, &evidence) {
+        if let Err(error) = crate::recovery::check_post(port, step, &evidence) {
             journal.block(op, Some(error))?;
             return Err(error);
         }
     }
 
     finish(journal, op, Finalize::RestoreCompleted)
+}
+
+fn validate_prepared<J: Journal, P: CopyEffects>(
+    journal: &mut J,
+    port: &mut P,
+    op: OperationId,
+    steps: &[PreparedStep],
+) -> Result<(), DeployError> {
+    for step in steps {
+        let evidence = port.inspect_step(step);
+        if let Err(error) = crate::recovery::check_pre(port, step, &evidence) {
+            journal.block(op, Some(error))?;
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 pub fn operation_status<J: Journal>(
@@ -575,10 +606,7 @@ pub(crate) fn validate_settled(
     step: &PreparedStep,
     evidence: &Evidence,
 ) -> Result<(), DeployError> {
-    if evidence.target != expected_post(step)
-        || evidence.stage != Artifact::Absent
-        || evidence.retained != expected_retained(step)
-    {
+    if !crate::recovery::matches_post(step, evidence) {
         return Err(DeployError::RecoveryConflict);
     }
     Ok(())
@@ -608,60 +636,20 @@ pub(crate) fn settle_forward<J: Journal, P: CopyEffects>(
     step: &PreparedStep,
     outcome: EffectOutcome,
 ) -> Result<(), DeployError> {
-    settle_forward_from(journal, port, op, step, StepPhase::Attempting, outcome)
-}
-
-/// Settle a forward effect recorded as `from`, validating every reported
-/// artifact before the step becomes `Applied`.
-pub(crate) fn settle_forward_from<J: Journal, P: CopyEffects>(
-    journal: &mut J,
-    port: &mut P,
-    op: OperationId,
-    step: &PreparedStep,
-    from: StepPhase,
-    outcome: EffectOutcome,
-) -> Result<(), DeployError> {
-    let evidence = match outcome {
-        EffectOutcome::Observed(evidence) => {
-            if let Err(error) = validate_settled(step, &evidence) {
-                journal.block(op, Some(error))?;
-                return Err(error);
-            }
-            evidence
-        }
-        EffectOutcome::Displaced { evidence, at } => {
-            if let Err(error) = validate_settled(step, &evidence) {
-                journal.block(op, Some(error))?;
-                return Err(error);
-            }
-            if at != step.retain {
-                journal.block(op, Some(DeployError::RecoveryConflict))?;
-                return Err(DeployError::RecoveryConflict);
-            }
-            evidence
-        }
-        EffectOutcome::Conflict(_) => {
-            journal.block(op, Some(DeployError::RecoveryConflict))?;
-            return Err(DeployError::RecoveryConflict);
-        }
-        EffectOutcome::Unavailable(error) => {
-            let error = map_root_error(error);
-            journal.block(op, Some(error))?;
-            return Err(error);
-        }
-        EffectOutcome::Ambiguous(_) => {
-            journal.block(op, Some(DeployError::Io))?;
-            return Err(DeployError::Io);
-        }
-    };
-
+    let evidence = effect_evidence(journal, op, step, outcome)?;
     match port.durability_barrier(step, &evidence) {
         BarrierOutcome::Durable(evidence) => {
             if let Err(error) = validate_settled(step, &evidence) {
                 journal.block(op, Some(error))?;
                 return Err(error);
             }
-            journal.record_step(op, step.ordinal, from, StepPhase::Applied, Some(evidence))
+            journal.record_step(
+                op,
+                step.ordinal,
+                StepPhase::Attempting,
+                StepPhase::Applied,
+                Some(evidence),
+            )
         }
         BarrierOutcome::Unavailable(error) => {
             let error = map_root_error(error);
@@ -669,6 +657,43 @@ pub(crate) fn settle_forward_from<J: Journal, P: CopyEffects>(
             Err(error)
         }
         BarrierOutcome::Ambiguous(_) => {
+            journal.block(op, Some(DeployError::Io))?;
+            Err(DeployError::Io)
+        }
+    }
+}
+
+pub(crate) fn effect_evidence<J: Journal>(
+    journal: &mut J,
+    op: OperationId,
+    step: &PreparedStep,
+    outcome: EffectOutcome,
+) -> Result<Evidence, DeployError> {
+    match outcome {
+        EffectOutcome::Observed(evidence) => {
+            if let Err(error) = validate_settled(step, &evidence) {
+                journal.block(op, Some(error))?;
+                return Err(error);
+            }
+            Ok(evidence)
+        }
+        EffectOutcome::Displaced { evidence, at } => {
+            if at != step.retain || validate_settled(step, &evidence).is_err() {
+                journal.block_displacement(op, step, at, &evidence)?;
+                return Err(DeployError::RecoveryConflict);
+            }
+            Ok(evidence)
+        }
+        EffectOutcome::Conflict(_) => {
+            journal.block(op, Some(DeployError::RecoveryConflict))?;
+            Err(DeployError::RecoveryConflict)
+        }
+        EffectOutcome::Unavailable(error) => {
+            let error = map_root_error(error);
+            journal.block(op, Some(error))?;
+            Err(error)
+        }
+        EffectOutcome::Ambiguous(_) => {
             journal.block(op, Some(DeployError::Io))?;
             Err(DeployError::Io)
         }
@@ -687,7 +712,22 @@ pub(crate) fn finish<J: Journal>(
         Err(DeployError::Io) => {
             journal.reopen()?;
             match journal.status(op)? {
-                Some(status) if status.phase.is_terminal() => Ok(status),
+                Some(status)
+                    if match how {
+                        Finalize::DeployCommitted => {
+                            status.kind == OperationKind::Deploy && status.phase == Phase::Completed
+                        }
+                        Finalize::RestoreCompleted => {
+                            status.kind == OperationKind::Restore
+                                && status.phase == Phase::Completed
+                        }
+                        Finalize::RolledBack => status.phase == Phase::RolledBack,
+                        Finalize::Cancelled => status.phase == Phase::Cancelled,
+                    } =>
+                {
+                    Ok(status)
+                }
+                Some(status) if status.phase.is_terminal() => Err(DeployError::Io),
                 Some(_) => {
                     journal.block(op, Some(DeployError::Io))?;
                     Err(DeployError::Io)

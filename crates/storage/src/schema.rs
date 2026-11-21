@@ -9,11 +9,13 @@ use rusqlite::{Connection, TransactionBehavior};
 
 pub(crate) const CATALOG_FILE: &str = "catalog.sqlite3";
 pub(crate) const LOCK_FILE: &str = "library.lock";
+pub(crate) const JOURNAL_LOCK_FILE: &str = "journal.lock";
 pub(crate) const MIGRATION_VERSION: i64 = 2;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SCHEMA_V1: &str = include_str!("../migrations/0001_library.sql");
 const SCHEMA_V2: &str = include_str!("../migrations/0002_operations.sql");
+const RECOVERY_PROOFS: &str = include_str!("../migrations/v2_recovery_proofs.sql");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SchemaError;
@@ -32,8 +34,14 @@ pub(crate) fn catalog_path(root: &Path) -> std::path::PathBuf {
 /// PRAGMAs back from the live connection.
 pub(crate) fn prepare(connection: &mut Connection) -> Result<(), SchemaError> {
     configure(connection)?;
-    migrate(connection)?;
-    seed_profile(connection)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    migrate(&transaction)?;
+    transaction.execute_batch(RECOVERY_PROOFS)?;
+    transaction.execute(
+        "INSERT INTO profiles (id, revision) VALUES (1, 0) ON CONFLICT (id) DO NOTHING",
+        [],
+    )?;
+    transaction.commit()?;
     verify_pragmas(connection)
 }
 
@@ -55,45 +63,24 @@ fn configure(connection: &Connection) -> Result<(), SchemaError> {
     Ok(())
 }
 
-fn migrate(connection: &mut Connection) -> Result<(), SchemaError> {
+fn migrate(connection: &Connection) -> Result<(), SchemaError> {
     let version = user_version(connection)?;
     if version < 0 || version > MIGRATION_VERSION {
         return Err(SchemaError);
     }
 
     if version < 1 {
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if user_version(&transaction)? != 0 {
-            return Err(SchemaError);
-        }
-        transaction.execute_batch(SCHEMA_V1)?;
-        transaction.pragma_update(None, "user_version", 1)?;
-        transaction.commit()?;
+        connection.execute_batch(SCHEMA_V1)?;
     }
 
-    if user_version(connection)? < 2 {
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if user_version(&transaction)? != 1 {
-            return Err(SchemaError);
-        }
-        transaction.execute_batch(SCHEMA_V2)?;
-        transaction.pragma_update(None, "user_version", 2)?;
-        transaction.commit()?;
+    if version < 2 {
+        connection.execute_batch(SCHEMA_V2)?;
+        connection.pragma_update(None, "user_version", 2)?;
     }
 
     if user_version(connection)? != MIGRATION_VERSION {
         return Err(SchemaError);
     }
-    Ok(())
-}
-
-fn seed_profile(connection: &mut Connection) -> Result<(), SchemaError> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute(
-        "INSERT INTO profiles (id, revision) VALUES (1, 0) ON CONFLICT (id) DO NOTHING",
-        [],
-    )?;
-    transaction.commit()?;
     Ok(())
 }
 

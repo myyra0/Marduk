@@ -43,7 +43,7 @@ fn fingerprint(bytes: &[u8], ino: u8) -> Fingerprint {
         sha256: Sha256::digest(bytes).into(),
         metadata: FileMetadata::Windows {
             attributes: 0x20,
-            last_write_100ns: 301 + i64::from(ino),
+            last_write_100ns: 301,
             links: 1,
             security_sha256: [71; 32],
         },
@@ -597,7 +597,7 @@ fn recovery_reuses_recorded_undo_after_lost_phase_write() {
         forward.retain,
         MemFile {
             bytes: BASE.to_vec(),
-            fingerprint: fingerprint(BASE, 11),
+            fingerprint: fingerprint(BASE, 10),
         },
     );
     let step_ref = forward.step_pre.backup.unwrap();
@@ -642,6 +642,9 @@ fn recovery_reuses_recorded_undo_after_lost_phase_write() {
         )),
         retain: BackupRef::from_record(op, 0, StepDirection::Undo, BackupSlot::Displaced),
     };
+    journal
+        .set_phase(op, Phase::Applying, Phase::RollingBack)
+        .unwrap();
     journal.record_undo(op, 0, undo.clone()).unwrap();
     effects.remember(undo.clone());
     effects.staged.insert(
@@ -656,6 +659,20 @@ fn recovery_reuses_recorded_undo_after_lost_phase_write() {
         MemFile {
             bytes: BASE.to_vec(),
             fingerprint: fingerprint(BASE, 11),
+        },
+    );
+    effects.store_backup(
+        forward.spec.original.backup.unwrap(),
+        MemFile {
+            bytes: BASE.to_vec(),
+            fingerprint: fingerprint(BASE, 12),
+        },
+    );
+    effects.store_backup(
+        undo.step_pre.backup.unwrap(),
+        MemFile {
+            bytes: POST.to_vec(),
+            fingerprint: fingerprint(POST, 13),
         },
     );
 
@@ -715,6 +732,13 @@ fn recovery_reexecutes_a_reverted_applied_restore_step() {
     };
     journal.seal(restore, vec![step.clone()]).unwrap();
     effects.remember(step.clone());
+    effects.store_backup(
+        step.step_pre.backup.unwrap(),
+        MemFile {
+            bytes: POST.to_vec(),
+            fingerprint: fingerprint(POST, 13),
+        },
+    );
     effects.staged.insert(
         StageRef::from_record(restore, 0, StepDirection::Forward),
         MemFile {

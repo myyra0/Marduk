@@ -265,6 +265,17 @@ pub trait Journal {
 
     fn root_state(&mut self, data: &RootIdentity) -> Result<RootState, DeployError>;
 
+    /// Check that the pending operation owns the exact requested root pair.
+    /// Durable journals must check their recorded locator binding too.
+    fn verify_pending_pair(
+        &mut self,
+        _op: OperationId,
+        _installation: &RootIdentity,
+        _data: &RootIdentity,
+    ) -> Result<Option<Vec<u8>>, DeployError> {
+        Ok(None)
+    }
+
     fn claim(&mut self, claim: Claim) -> Result<OperationId, DeployError>;
 
     fn seal(&mut self, op: OperationId, steps: Vec<PreparedStep>) -> Result<(), DeployError>;
@@ -281,6 +292,23 @@ pub trait Journal {
     ) -> Result<(), DeployError>;
 
     fn block(&mut self, op: OperationId, error: Option<DeployError>) -> Result<(), DeployError>;
+
+    /// Keep a known unexpected displacement available for operator recovery.
+    /// Durable journals must retain the reported reference and evidence.
+    fn block_displacement(
+        &mut self,
+        op: OperationId,
+        _step: &PreparedStep,
+        _at: BackupRef,
+        _evidence: &Evidence,
+    ) -> Result<(), DeployError> {
+        self.block(op, Some(DeployError::RecoveryConflict))
+    }
+
+    /// An unexpected displacement requires operator review, not auto-retry.
+    fn has_unresolved_displacement(&mut self, _op: OperationId) -> Result<bool, DeployError> {
+        Ok(false)
+    }
 
     fn finish(&mut self, op: OperationId, how: Finalize) -> Result<OperationStatus, DeployError>;
 
@@ -315,12 +343,18 @@ pub fn recover_pending<J: Journal, P: crate::deployment::DeploymentInputs>(
         return Ok(None);
     };
 
-    if let Err(error) = port.verify_root(installation, data) {
+    if let Err(error) = journal
+        .verify_pending_pair(op, installation, data)
+        .and_then(|locator| port.verify_recovery_root(installation, data, locator.as_deref()))
+    {
         journal.block(op, Some(error))?;
         return journal.status(op);
     }
 
     let status = journal.status(op)?.ok_or(DeployError::UnknownOperation)?;
+    if journal.has_unresolved_displacement(op)? {
+        return Ok(Some(status));
+    }
     match status.kind {
         OperationKind::Deploy => recover_deploy(journal, port, op, status),
         OperationKind::Restore => recover_restore(journal, port, op, status),
@@ -334,167 +368,144 @@ fn recover_deploy<J: Journal, P: CopyEffects>(
     status: OperationStatus,
 ) -> Result<Option<OperationStatus>, DeployError> {
     let rows = journal.steps(op)?;
-    if rows.is_empty() {
-        return match status.phase {
-            Phase::Preparing | Phase::Prepared => Ok(Some(crate::deployment::finish(
-                journal,
-                op,
-                Finalize::Cancelled,
-            )?)),
-            Phase::Applying => {
-                journal.set_phase(op, Phase::Applying, Phase::RollingBack)?;
-                Ok(Some(crate::deployment::finish(
-                    journal,
-                    op,
-                    Finalize::RolledBack,
-                )?))
-            }
-            Phase::RollingBack => Ok(Some(crate::deployment::finish(
-                journal,
-                op,
-                Finalize::RolledBack,
-            )?)),
-            _ => Ok(Some(status)),
-        };
-    }
-
     match status.phase {
-        Phase::Prepared => {
-            // No public phase was opened. Only cancel after confirming every
-            // destination still matches the recorded pre-state.
-            for row in rows.iter().rev() {
-                let observed = match observe(port, &row.prepared.spec.target) {
-                    Ok(observed) => observed,
-                    Err(error) => {
-                        journal.block(op, Some(error))?;
-                        return journal.status(op);
-                    }
-                };
-                if observed != row.prepared.spec.pre {
-                    journal.block(op, Some(DeployError::RecoveryConflict))?;
-                    return journal.status(op);
+        Phase::Preparing | Phase::Prepared => {
+            for row in &rows {
+                let evidence = port.inspect_step(&row.prepared);
+                if let Err(error) = check_pre(port, &row.prepared, &evidence) {
+                    return blocked(journal, op, error);
                 }
             }
-            return Ok(Some(crate::deployment::finish(
-                journal,
-                op,
-                Finalize::Cancelled,
-            )?));
+            return crate::deployment::finish(journal, op, Finalize::Cancelled).map(Some);
         }
         Phase::Applying => journal.set_phase(op, Phase::Applying, Phase::RollingBack)?,
         Phase::RollingBack => {}
-        phase if phase.is_terminal() => return Ok(Some(status)),
         _ => return Ok(Some(status)),
     }
 
     for row in rows.iter().rev() {
-        if row.phase == StepPhase::Undone {
-            continue;
-        }
         let forward = &row.prepared;
-        let observed = match observe(port, &forward.spec.target) {
-            Ok(observed) => observed,
-            Err(error) => {
-                journal.block(op, Some(error))?;
-                return journal.status(op);
+        let result = if let Some(undo) = &row.undo {
+            resume_undo(journal, port, row, undo)
+        } else {
+            let evidence = port.inspect_step(forward);
+            if evidence.target == as_observation(&forward.spec.pre) {
+                let result = check_pre(port, forward, &evidence);
+                result.and_then(|()| {
+                    if row.phase == StepPhase::Undone {
+                        return Ok(());
+                    }
+                    if !matches!(row.phase, StepPhase::Ready | StepPhase::Attempting) {
+                        return Err(DeployError::RecoveryConflict);
+                    }
+                    let durable = barrier(port, forward, &evidence)?;
+                    check_pre(port, forward, &durable)?;
+                    journal.record_step(
+                        op,
+                        forward.ordinal,
+                        row.phase,
+                        StepPhase::Undone,
+                        Some(durable),
+                    )
+                })
+            } else {
+                (|| {
+                    if !matches!(row.phase, StepPhase::Attempting | StepPhase::Applied) {
+                        return Err(observation_error(&evidence.target));
+                    }
+                    check_post(port, forward, &evidence)?;
+                    let undo = prepare_undo(
+                        port,
+                        forward,
+                        &crate::deployment::expected_post_state(forward),
+                    )?;
+                    journal.record_undo(op, forward.ordinal, undo.clone())?;
+                    resume_undo(journal, port, row, &undo)
+                })()
             }
         };
+        if let Err(error) = result {
+            return blocked(journal, op, error);
+        }
+    }
 
-        if row.phase == StepPhase::UndoAttempting {
-            let undo = row.undo.as_ref().ok_or(DeployError::RecoveryConflict)?;
-            if observed == forward.spec.pre {
-                // The undo result is visible; only barrier evidence is missing.
+    // Recheck earlier resolutions after later effects, before releasing the lease.
+    for row in journal.steps(op)? {
+        let result = match &row.undo {
+            Some(undo) => {
                 let evidence = port.inspect_step(undo);
-                if let Err(error) = crate::deployment::validate_settled(undo, &evidence) {
-                    journal.block(op, Some(error))?;
-                    return journal.status(op);
-                }
-                match port.durability_barrier(undo, &evidence) {
-                    BarrierOutcome::Durable(evidence) => {
-                        if let Err(error) = crate::deployment::validate_settled(undo, &evidence) {
-                            journal.block(op, Some(error))?;
-                            return journal.status(op);
-                        }
-                        journal.record_step(
-                            op,
-                            forward.ordinal,
-                            StepPhase::UndoAttempting,
-                            StepPhase::Undone,
-                            Some(evidence),
-                        )?;
-                    }
-                    BarrierOutcome::Ambiguous(_) => {
-                        journal.block(op, Some(DeployError::Io))?;
-                        return Err(DeployError::Io);
-                    }
-                    BarrierOutcome::Unavailable(error) => {
-                        let error = crate::deployment::map_root_error(error);
-                        journal.block(op, Some(error))?;
-                        return journal.status(op);
-                    }
-                }
-                continue;
+                check_forward_slots(port, &row.prepared)
+                    .and_then(|()| check_post(port, undo, &evidence))
             }
-            if observed == crate::deployment::expected_post_state(forward) {
-                let outcome = crate::deployment::execute_undo(port, undo)?;
-                match settle_undo(journal, port, op, forward.ordinal, undo, outcome) {
-                    Ok(()) => continue,
-                    Err(DeployError::Io) => return Err(DeployError::Io),
-                    Err(_) => return journal.status(op),
-                }
-            }
-            journal.block(op, Some(DeployError::RecoveryConflict))?;
-            return journal.status(op);
-        }
-
-        if observed == forward.spec.pre {
-            // Matching pre-state with intact expected slots: no undo.
-            continue;
-        }
-        if observed != crate::deployment::expected_post_state(forward) {
-            // Unknown bytes, unknown identity, or an unavailable object.
-            journal.block(op, Some(DeployError::RecoveryConflict))?;
-            return journal.status(op);
-        }
-
-        // Reuse a recorded undo intent even if the phase write was lost.
-        let undo = match &row.undo {
-            Some(undo) => undo.clone(),
             None => {
-                let undo = match prepare_undo(port, forward, &observed) {
-                    Ok(undo) => undo,
-                    Err(error) => {
-                        journal.block(op, Some(error))?;
-                        return journal.status(op);
-                    }
-                };
-                journal.record_undo(op, forward.ordinal, undo.clone())?;
-                undo
+                let evidence = port.inspect_step(&row.prepared);
+                check_pre(port, &row.prepared, &evidence)
             }
         };
+        if let Err(error) = result {
+            return blocked(journal, op, error);
+        }
+    }
+    if status.blocker.is_some() {
+        journal.block(op, None)?;
+    }
+    crate::deployment::finish(journal, op, Finalize::RolledBack).map(Some)
+}
+
+fn resume_undo<J: Journal, P: CopyEffects>(
+    journal: &mut J,
+    port: &mut P,
+    row: &StepRecord,
+    undo: &PreparedStep,
+) -> Result<(), DeployError> {
+    let forward = &row.prepared;
+    check_forward_slots(port, forward)?;
+    let evidence = port.inspect_step(undo);
+    if matches!(row.phase, StepPhase::UndoAttempting | StepPhase::Undone)
+        && evidence.target == crate::deployment::expected_post(undo)
+    {
+        check_post(port, undo, &evidence)?;
+        if row.phase == StepPhase::Undone {
+            return Ok(());
+        }
+        let durable = barrier(port, undo, &evidence)?;
+        check_post(port, undo, &durable)?;
+        return journal.record_step(
+            undo.op,
+            undo.ordinal,
+            StepPhase::UndoAttempting,
+            StepPhase::Undone,
+            Some(durable),
+        );
+    }
+    if !matches!(
+        row.phase,
+        StepPhase::Attempting | StepPhase::Applied | StepPhase::UndoAttempting
+    ) {
+        return Err(observation_error(&evidence.target));
+    }
+    check_pre(port, undo, &evidence)?;
+    if row.phase != StepPhase::UndoAttempting {
         journal.record_step(
-            op,
-            forward.ordinal,
+            undo.op,
+            undo.ordinal,
             row.phase,
             StepPhase::UndoAttempting,
             None,
         )?;
-        let outcome = crate::deployment::execute_undo(port, &undo)?;
-        match settle_undo(journal, port, op, forward.ordinal, &undo, outcome) {
-            Ok(()) => {}
-            Err(DeployError::Io) => return Err(DeployError::Io),
-            Err(_) => return journal.status(op),
-        }
     }
-
-    if status.blocker.is_some() {
-        journal.block(op, None)?;
-    }
-    Ok(Some(crate::deployment::finish(
-        journal,
-        op,
-        Finalize::RolledBack,
-    )?))
+    let outcome = crate::deployment::execute_undo(port, undo)?;
+    let evidence = crate::deployment::effect_evidence(journal, undo.op, undo, outcome)?;
+    check_post(port, undo, &evidence)?;
+    let durable = barrier(port, undo, &evidence)?;
+    check_post(port, undo, &durable)?;
+    journal.record_step(
+        undo.op,
+        undo.ordinal,
+        StepPhase::UndoAttempting,
+        StepPhase::Undone,
+        Some(durable),
+    )
 }
 
 fn recover_restore<J: Journal, P: CopyEffects>(
@@ -506,197 +517,202 @@ fn recover_restore<J: Journal, P: CopyEffects>(
     let rows = journal.steps(op)?;
     match status.phase {
         Phase::Preparing | Phase::Prepared => {
-            // No public restore effect yet: a terminal cancellation leaves the
-            // active generation untouched.
-            return Ok(Some(crate::deployment::finish(
-                journal,
-                op,
-                Finalize::Cancelled,
-            )?));
+            for row in &rows {
+                let evidence = port.inspect_step(&row.prepared);
+                if let Err(error) = check_pre(port, &row.prepared, &evidence) {
+                    return blocked(journal, op, error);
+                }
+            }
+            return crate::deployment::finish(journal, op, Finalize::Cancelled).map(Some);
         }
         Phase::Restoring => {}
-        phase if phase.is_terminal() => return Ok(Some(status)),
         _ => return Ok(Some(status)),
-    }
-    if rows.is_empty() {
-        return match status.phase {
-            Phase::Preparing | Phase::Prepared => Ok(Some(crate::deployment::finish(
-                journal,
-                op,
-                Finalize::Cancelled,
-            )?)),
-            Phase::Restoring => {
-                if status.blocker.is_some() {
-                    journal.block(op, None)?;
-                }
-                Ok(Some(crate::deployment::finish(
-                    journal,
-                    op,
-                    Finalize::RestoreCompleted,
-                )?))
-            }
-            _ => Ok(Some(status)),
-        };
     }
 
     for row in rows.iter().rev() {
         let step = &row.prepared;
-        let observed = match observe(port, &step.spec.target) {
-            Ok(observed) => observed,
-            Err(error) => {
-                journal.block(op, Some(error))?;
-                return journal.status(op);
+        let result = (|| {
+            let evidence = port.inspect_step(step);
+            let from = row.phase;
+            if !matches!(
+                from,
+                StepPhase::Ready | StepPhase::Attempting | StepPhase::Applied
+            ) {
+                return Err(DeployError::RecoveryConflict);
             }
-        };
-        match row.phase {
-            StepPhase::Applied => {
-                if observed == crate::deployment::expected_post_state(step) {
-                    // Already visible; require barrier evidence without
-                    // claiming a second effect.
-                    let evidence = port.inspect_step(step);
-                    if let Err(error) = crate::deployment::validate_settled(step, &evidence) {
-                        journal.block(op, Some(error))?;
-                        return journal.status(op);
-                    }
-                    match port.durability_barrier(step, &evidence) {
-                        BarrierOutcome::Durable(evidence) => {
-                            if let Err(error) = crate::deployment::validate_settled(step, &evidence)
-                            {
-                                journal.block(op, Some(error))?;
-                                return journal.status(op);
-                            }
-                        }
-                        BarrierOutcome::Ambiguous(_) => {
-                            journal.block(op, Some(DeployError::Io))?;
-                            return Err(DeployError::Io);
-                        }
-                        BarrierOutcome::Unavailable(error) => {
-                            let error = crate::deployment::map_root_error(error);
-                            journal.block(op, Some(error))?;
-                            return journal.status(op);
-                        }
-                    }
-                } else if observed == step.spec.pre {
-                    // The recorded result is not visible. Classify from the
-                    // adapter's observation, then re-execute from the sealed
-                    // intent and settle from the recorded phase.
-                    let evidence = port.inspect_step(step);
-                    if evidence.target != as_observation(&step.spec.pre) {
-                        journal.block(op, Some(DeployError::RecoveryConflict))?;
-                        return journal.status(op);
-                    }
-                    let outcome = crate::deployment::execute(port, step)?;
-                    match crate::deployment::settle_forward_from(
-                        journal,
-                        port,
+            if evidence.target == crate::deployment::expected_post(step) {
+                if from == StepPhase::Ready {
+                    return Err(DeployError::RecoveryConflict);
+                }
+                check_post(port, step, &evidence)?;
+                let durable = barrier(port, step, &evidence)?;
+                check_post(port, step, &durable)?;
+                if from == StepPhase::Attempting {
+                    journal.record_step(
                         op,
-                        step,
+                        step.ordinal,
+                        from,
                         StepPhase::Applied,
-                        outcome,
-                    ) {
-                        Ok(()) => {}
-                        Err(DeployError::Io) => return Err(DeployError::Io),
-                        Err(_) => return journal.status(op),
-                    }
-                } else {
-                    journal.block(op, Some(DeployError::RecoveryConflict))?;
-                    return journal.status(op);
+                        Some(durable),
+                    )?;
                 }
-            }
-            StepPhase::Ready | StepPhase::Attempting => {
-                if observed == crate::deployment::expected_post_state(step) {
-                    // The public effect is visible but its SQL acknowledgement
-                    // was lost. Acknowledge it with fresh barrier evidence.
-                    let evidence = port.inspect_step(step);
-                    if let Err(error) = crate::deployment::validate_settled(step, &evidence) {
-                        journal.block(op, Some(error))?;
-                        return journal.status(op);
-                    }
-                    match port.durability_barrier(step, &evidence) {
-                        BarrierOutcome::Durable(evidence) => {
-                            if let Err(error) = crate::deployment::validate_settled(step, &evidence)
-                            {
-                                journal.block(op, Some(error))?;
-                                return journal.status(op);
-                            }
-                            journal.record_step(
-                                op,
-                                step.ordinal,
-                                row.phase,
-                                StepPhase::Applied,
-                                Some(evidence),
-                            )?;
-                        }
-                        BarrierOutcome::Ambiguous(_) => {
-                            journal.block(op, Some(DeployError::Io))?;
-                            return Err(DeployError::Io);
-                        }
-                        BarrierOutcome::Unavailable(error) => {
-                            let error = crate::deployment::map_root_error(error);
-                            journal.block(op, Some(error))?;
-                            return journal.status(op);
-                        }
-                    }
-                } else if observed == step.spec.pre {
-                    let evidence = port.inspect_step(step);
-                    if evidence.target != as_observation(&step.spec.pre) {
-                        journal.block(op, Some(DeployError::RecoveryConflict))?;
-                        return journal.status(op);
-                    }
-                    let from = if row.phase == StepPhase::Ready {
-                        journal.record_step(
-                            op,
-                            step.ordinal,
-                            StepPhase::Ready,
-                            StepPhase::Attempting,
-                            None,
-                        )?;
-                        StepPhase::Attempting
-                    } else {
-                        row.phase
-                    };
-                    let outcome = crate::deployment::execute(port, step)?;
-                    match crate::deployment::settle_forward_from(
-                        journal, port, op, step, from, outcome,
-                    ) {
-                        Ok(()) => {}
-                        Err(DeployError::Io) => return Err(DeployError::Io),
-                        Err(_) => return journal.status(op),
-                    }
-                } else {
-                    journal.block(op, Some(DeployError::RecoveryConflict))?;
-                    return journal.status(op);
+            } else {
+                check_pre(port, step, &evidence)?;
+                if from != StepPhase::Attempting {
+                    journal.record_step(
+                        op,
+                        step.ordinal,
+                        from,
+                        StepPhase::Attempting,
+                        (from == StepPhase::Applied).then_some(evidence),
+                    )?;
                 }
+                let outcome = crate::deployment::execute(port, step)?;
+                crate::deployment::settle_forward(journal, port, op, step, outcome)?;
             }
-            StepPhase::UndoAttempting | StepPhase::Undone => {
-                journal.block(op, Some(DeployError::RecoveryConflict))?;
-                return journal.status(op);
-            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            return blocked(journal, op, error);
         }
     }
 
+    for row in &rows {
+        let evidence = port.inspect_step(&row.prepared);
+        if let Err(error) = check_post(port, &row.prepared, &evidence) {
+            return blocked(journal, op, error);
+        }
+    }
     if status.blocker.is_some() {
         journal.block(op, None)?;
     }
-    Ok(Some(crate::deployment::finish(
-        journal,
-        op,
-        Finalize::RestoreCompleted,
-    )?))
+    crate::deployment::finish(journal, op, Finalize::RestoreCompleted).map(Some)
+}
+
+fn blocked<J: Journal>(
+    journal: &mut J,
+    op: OperationId,
+    error: DeployError,
+) -> Result<Option<OperationStatus>, DeployError> {
+    journal.block(op, Some(error))?;
+    if error == DeployError::Io {
+        return Err(error);
+    }
+    journal.status(op)
+}
+
+fn observation_error(observation: &Observation) -> DeployError {
+    match observation {
+        Observation::Unavailable(error) => crate::deployment::map_root_error(error.clone()),
+        _ => DeployError::RecoveryConflict,
+    }
+}
+
+fn check_backup<P: CopyEffects>(port: &mut P, image: &PreImage) -> Result<(), DeployError> {
+    match (&image.observation, image.backup) {
+        (PreState::Absent, None) => Ok(()),
+        (PreState::Regular(expected), Some(at)) => port.validate_backup(at, expected),
+        _ => Err(DeployError::RecoveryConflict),
+    }
+}
+
+pub(crate) fn check_pre<P: CopyEffects>(
+    port: &mut P,
+    step: &PreparedStep,
+    evidence: &Evidence,
+) -> Result<(), DeployError> {
+    if !matches_pre(step, evidence) {
+        return Err(observation_error(&evidence.target));
+    }
+    check_backup(port, &step.spec.original)?;
+    check_backup(port, &step.step_pre)
+}
+
+/// Compare recorded evidence against the complete pre-effect namespace.
+pub fn matches_pre(step: &PreparedStep, evidence: &Evidence) -> bool {
+    matches_step_state(
+        &step.spec.pre,
+        step.staged.as_ref().map(|(_, fp)| fp),
+        false,
+        evidence,
+    )
+}
+
+/// Compare recorded evidence against the complete post-effect namespace.
+pub fn matches_post(step: &PreparedStep, evidence: &Evidence) -> bool {
+    matches_step_state(
+        &step.spec.pre,
+        step.staged.as_ref().map(|(_, fp)| fp),
+        true,
+        evidence,
+    )
+}
+
+/// Check phase evidence against the recorded pre-image and staged token.
+pub fn matches_step_state(
+    pre: &PreState,
+    staged: Option<&Fingerprint>,
+    post: bool,
+    evidence: &Evidence,
+) -> bool {
+    if post {
+        evidence.target == staged.map_or(Observation::Absent, |fp| Observation::Regular(fp.clone()))
+            && evidence.stage == Artifact::Absent
+            && evidence.retained
+                == match pre {
+                    PreState::Absent => Artifact::Absent,
+                    PreState::Regular(fp) => Artifact::Regular(fp.clone()),
+                }
+    } else {
+        evidence.target == as_observation(pre)
+            && evidence.stage == staged.map_or(Artifact::Absent, |fp| Artifact::Regular(fp.clone()))
+            && evidence.retained == Artifact::Absent
+    }
+}
+
+pub(crate) fn check_post<P: CopyEffects>(
+    port: &mut P,
+    step: &PreparedStep,
+    evidence: &Evidence,
+) -> Result<(), DeployError> {
+    if !matches_post(step, evidence) {
+        return Err(observation_error(&evidence.target));
+    }
+    check_backup(port, &step.spec.original)?;
+    check_backup(port, &step.step_pre)
+}
+
+fn check_forward_slots<P: CopyEffects>(
+    port: &mut P,
+    forward: &PreparedStep,
+) -> Result<(), DeployError> {
+    let evidence = port.inspect_step(forward);
+    if matches!(evidence.target, Observation::Unavailable(_))
+        || evidence.stage != Artifact::Absent
+        || evidence.retained != crate::deployment::expected_retained(forward)
+    {
+        return Err(observation_error(&evidence.target));
+    }
+    check_backup(port, &forward.spec.original)?;
+    check_backup(port, &forward.step_pre)
+}
+
+fn barrier<P: CopyEffects>(
+    port: &mut P,
+    step: &PreparedStep,
+    evidence: &Evidence,
+) -> Result<Evidence, DeployError> {
+    match port.durability_barrier(step, evidence) {
+        BarrierOutcome::Durable(evidence) => Ok(evidence),
+        BarrierOutcome::Unavailable(error) => Err(crate::deployment::map_root_error(error)),
+        BarrierOutcome::Ambiguous(_) => Err(DeployError::Io),
+    }
 }
 
 fn as_observation(state: &PreState) -> Observation {
     match state {
         PreState::Absent => Observation::Absent,
         PreState::Regular(fingerprint) => Observation::Regular(fingerprint.clone()),
-    }
-}
-
-fn observe<P: CopyEffects>(port: &mut P, target: &BoundTarget) -> Result<PreState, DeployError> {
-    match port.observe(target) {
-        Observation::Absent => Ok(PreState::Absent),
-        Observation::Regular(fingerprint) => Ok(PreState::Regular(fingerprint)),
-        Observation::Unavailable(error) => Err(crate::deployment::map_root_error(error)),
     }
 }
 
@@ -733,71 +749,4 @@ fn prepare_undo<P: CopyEffects>(
             output,
         },
     )
-}
-
-fn settle_undo<J: Journal, P: CopyEffects>(
-    journal: &mut J,
-    port: &mut P,
-    op: OperationId,
-    ordinal: u32,
-    undo: &PreparedStep,
-    outcome: EffectOutcome,
-) -> Result<(), DeployError> {
-    let evidence = match outcome {
-        EffectOutcome::Observed(evidence) => {
-            if let Err(error) = crate::deployment::validate_settled(undo, &evidence) {
-                journal.block(op, Some(error))?;
-                return Err(error);
-            }
-            evidence
-        }
-        EffectOutcome::Displaced { evidence, at } => {
-            if let Err(error) = crate::deployment::validate_settled(undo, &evidence) {
-                journal.block(op, Some(error))?;
-                return Err(error);
-            }
-            if at != undo.retain {
-                journal.block(op, Some(DeployError::RecoveryConflict))?;
-                return Err(DeployError::RecoveryConflict);
-            }
-            evidence
-        }
-        EffectOutcome::Conflict(_) => {
-            journal.block(op, Some(DeployError::RecoveryConflict))?;
-            return Err(DeployError::RecoveryConflict);
-        }
-        EffectOutcome::Unavailable(error) => {
-            let error = crate::deployment::map_root_error(error);
-            journal.block(op, Some(error))?;
-            return Err(error);
-        }
-        EffectOutcome::Ambiguous(_) => {
-            journal.block(op, Some(DeployError::Io))?;
-            return Err(DeployError::Io);
-        }
-    };
-    match port.durability_barrier(undo, &evidence) {
-        BarrierOutcome::Durable(evidence) => {
-            if let Err(error) = crate::deployment::validate_settled(undo, &evidence) {
-                journal.block(op, Some(error))?;
-                return Err(error);
-            }
-            journal.record_step(
-                op,
-                ordinal,
-                StepPhase::UndoAttempting,
-                StepPhase::Undone,
-                Some(evidence),
-            )
-        }
-        BarrierOutcome::Unavailable(error) => {
-            let error = crate::deployment::map_root_error(error);
-            journal.block(op, Some(error))?;
-            Err(error)
-        }
-        BarrierOutcome::Ambiguous(_) => {
-            journal.block(op, Some(DeployError::Io))?;
-            Err(DeployError::Io)
-        }
-    }
 }

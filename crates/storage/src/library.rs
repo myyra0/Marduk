@@ -389,7 +389,9 @@ impl Catalog {
         })
     }
 
-    fn lock(&self) -> Result<WriterGuard, ImportError> {
+    /// Pin library revision and source files during deployment validation.
+    /// Journal writes take a separate gate and can run inside this guard.
+    pub fn lock(&self) -> Result<WriterGuard, ImportError> {
         self.gate.try_lock().map_err(gate_error)
     }
 
