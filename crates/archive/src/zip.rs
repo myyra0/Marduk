@@ -84,6 +84,7 @@ pub fn admit_zip<R: Read + Seek>(
 
     let directory = read_directory(&mut input, &end)?;
     let mut records = parse_directory(&directory, &end)?;
+    verify_local_extents(&mut input, &records, end.directory_offset)?;
 
     validate_names(&mut records)?;
     validate_duplicate_names(&records)?;
@@ -147,7 +148,7 @@ impl<R: Read + Seek> AdmittedZip<R> {
             // its own checksum validation.
             let read = file
                 .read(&mut buffer)
-                .map_err(|_| ArchiveError::CorruptEntry { index })?;
+                .map_err(|error| read_error(error, index))?;
             if read == 0 {
                 break;
             }
@@ -170,6 +171,7 @@ impl<R: Read + Seek> AdmittedZip<R> {
 const EOCD_SIGNATURE: u32 = 0x0605_4b50;
 const ZIP64_LOCATOR_SIGNATURE: u32 = 0x0706_4b50;
 const CENTRAL_SIGNATURE: u32 = 0x0201_4b50;
+const LOCAL_SIGNATURE: u32 = 0x0403_4b50;
 
 /// Fixed EOCD size plus the classic 64 KiB comment window.
 const EOCD_TAIL: u64 = 22 + 65_536;
@@ -212,7 +214,6 @@ struct Record {
     external: u32,
     local_offset: u32,
     name_len: u16,
-    extra_len: u16,
     has_aes_extra: bool,
     spelling: String,
     is_dir: bool,
@@ -235,19 +236,20 @@ fn read_end_of_central_directory<R: Read + Seek>(
         vec![0u8; usize::try_from(tail_len).map_err(|_| ArchiveError::InvalidContainer)?];
     input.read_exact(&mut tail).map_err(source_error)?;
 
-    // Only the last signature may speak for the archive: an earlier one could point
-    // the reader at an alternate directory.
+    // Classic ZIP has exactly one EOCD. Any second signature in the bounded window
+    // could point the reader at an alternate directory, so refuse the ambiguity.
     let signature = EOCD_SIGNATURE.to_le_bytes();
-    let mut found = None;
-    let mut cursor = tail.len();
-    while cursor >= signature.len() {
-        if tail[cursor - signature.len()..cursor] == signature {
-            found = Some(cursor - signature.len());
-            break;
+    let mut accepted = None;
+    for (at, window) in tail.windows(signature.len()).enumerate() {
+        if window != signature {
+            continue;
         }
-        cursor -= 1;
+        if accepted.is_some() {
+            return Err(ArchiveError::UnsupportedContainer);
+        }
+        accepted = Some(at);
     }
-    let Some(offset) = found else {
+    let Some(offset) = accepted else {
         return Err(ArchiveError::InvalidContainer);
     };
     if offset + EOCD_FIXED > tail.len() {
@@ -370,7 +372,6 @@ fn parse_directory(
             external,
             local_offset,
             name_len,
-            extra_len,
             has_aes_extra,
             spelling: String::new(),
             is_dir: false,
@@ -392,19 +393,92 @@ fn parse_directory(
     if !records.is_empty() && !offsets.contains(&0) {
         return Err(ArchiveError::UnsupportedContainer);
     }
-    for record in &records {
-        let extent = u64::from(record.local_offset)
+
+    Ok(records)
+}
+
+/// Bound every local header and its data before the reader is constructed.
+///
+/// The local header, not the central record, decides where entry data starts, so
+/// the extent is computed from the local name/extra lengths. The central name and
+/// compressed size still bound it as a redundant minimum.
+fn verify_local_extents<R: Read + Seek>(
+    input: &mut R,
+    records: &[Record],
+    directory_offset: u64,
+) -> Result<(), ArchiveError> {
+    let mut header = [0u8; LOCAL_FIXED as usize];
+    for record in records {
+        let start = u64::from(record.local_offset);
+        let header_end = start
             .checked_add(LOCAL_FIXED)
-            .and_then(|extent| extent.checked_add(u64::from(record.name_len)))
-            .and_then(|extent| extent.checked_add(u64::from(record.extra_len)))
-            .and_then(|extent| extent.checked_add(u64::from(record.compressed)))
+            .filter(|header_end| *header_end <= directory_offset)
             .ok_or(ArchiveError::InvalidContainer)?;
-        if extent > end.directory_offset {
+        input.seek(SeekFrom::Start(start)).map_err(source_error)?;
+        input.read_exact(&mut header).map_err(source_error)?;
+        if u32_at(&header, 0) != LOCAL_SIGNATURE {
+            return Err(ArchiveError::InvalidContainer);
+        }
+        if u32_at(&header, 18) == u32::MAX || u32_at(&header, 22) == u32::MAX {
+            return Err(ArchiveError::UnsupportedContainer);
+        }
+
+        let name_len = usize::from(u16_at(&header, 26));
+        let extra_len = usize::from(u16_at(&header, 28));
+        let variable_end = header_end
+            .checked_add(name_len as u64)
+            .and_then(|variable_end| variable_end.checked_add(extra_len as u64))
+            .filter(|variable_end| *variable_end <= directory_offset)
+            .ok_or(ArchiveError::InvalidContainer)?;
+
+        let mut variables = vec![0u8; name_len + extra_len];
+        input.read_exact(&mut variables).map_err(source_error)?;
+        if variables[..name_len] != record.raw_name[..] {
+            return Err(ArchiveError::InvalidContainer);
+        }
+        if local_extra_has_zip64(&variables[name_len..])? {
+            return Err(ArchiveError::UnsupportedContainer);
+        }
+
+        let extent = variable_end
+            .checked_add(u64::from(record.compressed))
+            .ok_or(ArchiveError::InvalidContainer)?;
+        if extent > directory_offset {
+            return Err(ArchiveError::InvalidContainer);
+        }
+
+        // Redundant lower bound from the central record. A larger central extra
+        // field is legal because it does not move the local data start.
+        let minimum = start
+            .checked_add(LOCAL_FIXED)
+            .and_then(|minimum| minimum.checked_add(u64::from(record.name_len)))
+            .and_then(|minimum| minimum.checked_add(u64::from(record.compressed)))
+            .ok_or(ArchiveError::InvalidContainer)?;
+        if minimum > directory_offset {
             return Err(ArchiveError::InvalidContainer);
         }
     }
+    Ok(())
+}
 
-    Ok(records)
+fn local_extra_has_zip64(extra: &[u8]) -> Result<bool, ArchiveError> {
+    let mut cursor = 0usize;
+    while cursor < extra.len() {
+        let payload_start = cursor
+            .checked_add(4)
+            .filter(|payload_start| *payload_start <= extra.len())
+            .ok_or(ArchiveError::InvalidContainer)?;
+        let id = u16_at(extra, cursor);
+        let payload_end = payload_start
+            .checked_add(usize::from(u16_at(extra, cursor + 2)))
+            .filter(|payload_end| *payload_end <= extra.len())
+            .ok_or(ArchiveError::InvalidContainer)?;
+        if id == ZIP64_EXTRA_ID {
+            return Ok(true);
+        }
+        cursor = payload_end;
+    }
+    Ok(false)
 }
 
 fn parse_extra_fields(extra: &[u8], raw_name: &[u8], index: usize) -> Result<bool, ArchiveError> {
@@ -445,7 +519,7 @@ fn unicode_path_rewrites(extra: &[u8], raw_name: &[u8]) -> bool {
         return false;
     }
     let content = &extra[5..];
-    std::str::from_utf8(content).is_ok() && content != raw_name
+    content != raw_name
 }
 
 /// Validation pass 1: strict raw UTF-8 and C01 relative-path rules.
@@ -660,11 +734,12 @@ fn drain_directories<R: Read + Seek>(
         loop {
             match file.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(_) | Err(_) => {
+                Ok(_) => {
                     return Err(ArchiveError::CorruptEntry {
                         index: record.index,
                     });
                 }
+                Err(error) => return Err(read_error(error, record.index)),
             }
         }
     }
@@ -695,6 +770,16 @@ fn entry_open_error(error: ZipError, index: usize) -> ArchiveError {
     match error {
         ZipError::Io(inner) if inner.kind() != io::ErrorKind::UnexpectedEof => ArchiveError::Io,
         _ => ArchiveError::CorruptEntry { index },
+    }
+}
+
+/// Entry reads are integrity checks unless the source itself fails.
+fn read_error(error: io::Error, index: usize) -> ArchiveError {
+    match error.kind() {
+        io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidData => {
+            ArchiveError::CorruptEntry { index }
+        }
+        _ => ArchiveError::Io,
     }
 }
 
