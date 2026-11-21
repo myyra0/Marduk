@@ -17,6 +17,8 @@ Represent separately: `InstallationBinding` (platform-owned live directory autho
 
 ## Identity and path rules
 
+Linux root tokens include the mount view ID reported by `statx` (`STATX_MNT_ID`) as well as filesystem and object identity. A remount that changes this ID returns `TargetUnavailable` on reopen and requires explicit rebind. The kernel can recycle mount IDs; the ID alone is not durable or globally unique, and equality still requires every other identity field.
+
 - Linux ext4 and Btrfs share the bounded path implementation. Scope opaque equality to the verified filesystem/object and include subvolume identity on Btrfs; do not accept matching inode numbers in different subvolumes. In Windows NTFS qualify volume and native file identity, not a drive letter or a path-derived string. Plan IDs still bind exact preview inputs; a stable root token is not an assertion that all files are unchanged.
 - Resolve each component under the approved root without following unexpected symlinks, junctions, or reparse objects. Reject crossing an unapproved nested mount/subvolume boundary. A separately approved game root may itself live on a subvolume. The *library* need not reside in the same domain: final staging is scoped to the resolved target's rename domain as defined in the [filesystem matrix](../research/filesystem-support.md).
 - Treat both logical aliases and native object identity as checks. Two differently cased existing files can coexist on one Linux target but cannot be silently made one Skyrim resource. The path `Textures` must not turn into a second directory beside an existing unambiguous `textures`. Do not re-use an unrelated existing directory as the writable stage.

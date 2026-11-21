@@ -11,6 +11,8 @@ pub enum NativeIdentity {
     Linux {
         fs_magic: u64,
         fs_id: [u8; 16],
+        /// Mount view reported by Linux `statx`, not a filesystem identifier.
+        view_id: u64,
         tree_id: Option<u64>,
         ino: u64,
         birth: (i64, u32),

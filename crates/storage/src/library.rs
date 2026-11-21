@@ -1694,6 +1694,7 @@ fn synthetic_owner(id: ImportId, archive_sha256: &[u8; 32]) -> RootIdentity {
         RootIdentity::from_adapter_evidence(NativeIdentity::Linux {
             fs_magic: 0x4d31_0001, // synthetic fixture marker, not a native filesystem
             fs_id,
+            view_id: id.get(),
             tree_id: Some(id.get()),
             ino: id.get(),
             birth: (birth, 0),
@@ -1708,6 +1709,7 @@ fn encode_owner(owner: &RootIdentity) -> Vec<u8> {
         NativeIdentity::Linux {
             fs_magic,
             fs_id,
+            view_id,
             tree_id,
             ino,
             birth,
@@ -1715,6 +1717,7 @@ fn encode_owner(owner: &RootIdentity) -> Vec<u8> {
             encoded.push(0);
             encoded.extend_from_slice(&fs_magic.to_le_bytes());
             encoded.extend_from_slice(fs_id);
+            encoded.extend_from_slice(&view_id.to_le_bytes());
             match tree_id {
                 Some(tree_id) => {
                     encoded.push(1);

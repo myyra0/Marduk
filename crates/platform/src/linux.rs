@@ -102,9 +102,9 @@ fn open_error(error: io::Error) -> GateError {
 //
 // Every object below the selected installation is opened relative to a verified
 // directory descriptor with `openat2` restrictions, then re-verified by
-// `fstat`/`statx`/`fstatfs`. Live `st_dev`, mount ID and Btrfs tree ID are
-// boundary evidence; only the filesystem magic, filesystem ID, tree ID, inode
-// and birth time form the persistable identity.
+// `fstat`/`statx`/`fstatfs`. `st_dev` is live boundary evidence only. The
+// mount ID is also part of the saved token: another view can expose the
+// same filesystem, inode and birth time.
 // ---------------------------------------------------------------------------
 
 use marduk_core::root_identity::{
@@ -616,7 +616,7 @@ fn verify_root(file: File) -> Result<RootDir, RootError> {
     if stx.stx_mode as u32 & libc::S_IFMT != libc::S_IFDIR {
         return Err(RootError::TargetUnavailable);
     }
-    let boundary = boundary_of(&file, &stx)?;
+    let boundary = mount_id(&stx)?;
     let identity = RootIdentity::from_adapter_evidence(identity_from(&file, &stx)?);
     let tree_id = tree_id_of(&file)?;
     Ok(RootDir {
@@ -657,8 +657,8 @@ fn statx_at(dirfd: RawFd, name: &str, flags: c_int) -> io::Result<libc::statx> {
     Ok(unsafe { stx.assume_init() })
 }
 
-fn boundary_of(_file: &File, stx: &libc::statx) -> Result<u64, RootError> {
-    if stx.stx_mask & libc::STATX_MNT_ID == 0 {
+fn mount_id(stx: &libc::statx) -> Result<u64, RootError> {
+    if stx.stx_mask & libc::STATX_MNT_ID == 0 || stx.stx_mnt_id == 0 {
         return Err(RootError::UnsupportedTarget(
             UnsupportedReason::Configuration,
         ));
@@ -686,6 +686,7 @@ fn identity_from(file: &File, stx: &libc::statx) -> Result<NativeIdentity, RootE
     Ok(NativeIdentity::Linux {
         fs_magic: magic,
         fs_id,
+        view_id: mount_id(stx)?,
         tree_id,
         ino: stx.stx_ino,
         birth: (stx.stx_btime.tv_sec, stx.stx_btime.tv_nsec),
@@ -759,7 +760,7 @@ fn same_domain(left: &RootDir, right: &RootDir) -> bool {
 }
 
 fn ensure_within(root: &RootDir, file: &File, stx: &libc::statx) -> Result<(), RootError> {
-    let boundary = boundary_of(file, stx)?;
+    let boundary = mount_id(stx)?;
     if stx.stx_dev_major != root.dev_major
         || stx.stx_dev_minor != root.dev_minor
         || boundary != root.mnt_id
