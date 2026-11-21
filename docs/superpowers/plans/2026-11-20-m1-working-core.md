@@ -35,7 +35,7 @@ The [C01 worker contract](../../contracts/m1-file-resolution.md) owns exact logi
 
 ### M1-A00 — Baseline, workspace and native CI
 
-**Predecessor:** User confirms repository/location, baseline/scaffold scope and CI execution location. No repository setup, hosted CI or scaffold implementation is authorized by this document. Does not wait on native durability, frontend stack selection or the full C0 audit. **Status:** `blocked` on baseline approval and an exact reviewed toolchain/runner brief.
+**Predecessor:** User approves the existing checkout, scaffold and GitHub-hosted CI scope in the [exact execution brief](2026-11-21-m1-a00-baseline.md); orchestrator verifies the starting revision and completes brief review and preflight. Does not wait on native durability, frontend stack selection or the full C0 audit. **Status:** `draft` pending approval and preflight. This catalog does not authorize implementation.
 
 **Owns:** Root `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `crates/core/{Cargo.toml,src/lib.rs}` as an empty buildable first member, and checked command/runner definitions. Name exact CI file paths and native Linux/Windows x86-64 runner images before dispatch, after repository hosting is decided. Do not create placeholder adapters, frontend projects or a custom runner. Each later packet adds its crate and workspace membership; M1-U01 owns frontend/app scaffold, lockfile and desktop build steps. Serialize edits to shared manifests and lockfiles through the orchestrator.
 
