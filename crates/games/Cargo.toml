@@ -1,0 +1,12 @@
+[package]
+name = "marduk-games"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+marduk-core = { path = "../core" }
+
+[dev-dependencies]
+marduk-platform = { path = "../platform" }
+tempfile = "=3.27.0"

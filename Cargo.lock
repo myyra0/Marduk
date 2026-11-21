@@ -225,11 +225,21 @@ name = "marduk-core"
 version = "0.1.0"
 
 [[package]]
+name = "marduk-games"
+version = "0.1.0"
+dependencies = [
+ "marduk-core",
+ "marduk-platform",
+ "tempfile",
+]
+
+[[package]]
 name = "marduk-platform"
 version = "0.1.0"
 dependencies = [
  "libc",
  "marduk-core",
+ "sha2",
  "tempfile",
  "windows-sys",
 ]
