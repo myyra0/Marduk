@@ -91,31 +91,39 @@ pub fn resolve_files(
         }
     }
 
-    let mut aliases_checked = BTreeSet::new();
-    let mut groups: BTreeMap<CanonicalTarget, Group> = BTreeMap::new();
-
+    // Manifest presence is membership validation: check every enabled member in
+    // profile order before any per-manifest file-entry validation.
+    let mut manifests = Vec::new();
     for member in profile.members.iter().filter(|member| member.enabled) {
         let manifest = inputs
             .manifests
             .get(&member.installed)
             .ok_or(ResolveError::MissingManifest(member.installed))?;
+        manifests.push((member, manifest));
+    }
 
-        if aliases_checked.insert(member.installed) {
-            let mut firsts: BTreeMap<CanonicalTarget, TargetFile> = BTreeMap::new();
-            for target in manifest {
-                let key = CanonicalTarget::of(target);
-                if let Some(first) = firsts.get(&key) {
-                    return Err(ResolveError::AliasedEntries {
-                        installed: member.installed,
-                        first: first.clone(),
-                        second: target.clone(),
-                    });
-                }
-                firsts.insert(key, target.clone());
-            }
+    let mut aliases_checked = BTreeSet::new();
+    for (member, manifest) in &manifests {
+        if !aliases_checked.insert(member.installed) {
+            continue;
         }
+        let mut firsts: BTreeMap<CanonicalTarget, TargetFile> = BTreeMap::new();
+        for target in *manifest {
+            let key = CanonicalTarget::of(target);
+            if let Some(first) = firsts.get(&key) {
+                return Err(ResolveError::AliasedEntries {
+                    installed: member.installed,
+                    first: first.clone(),
+                    second: target.clone(),
+                });
+            }
+            firsts.insert(key, target.clone());
+        }
+    }
 
-        for target in manifest {
+    let mut groups: BTreeMap<CanonicalTarget, Group> = BTreeMap::new();
+    for (member, manifest) in &manifests {
+        for target in *manifest {
             let key = CanonicalTarget::of(target);
             let group = groups.entry(key).or_insert_with(|| Group {
                 target: target.clone(),
