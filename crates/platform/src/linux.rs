@@ -427,62 +427,26 @@ pub(crate) fn observe_target(target: &ResolvedTarget<'_>) -> Result<TargetObserv
         return Err(RootError::Io);
     }
     ensure_within(&target.binding.data, &file, &before)?;
-    if !supported_metadata(&file) {
-        return Ok(TargetObservation::Unsupported {
-            reason: UnsupportedReason::Metadata,
-        });
-    }
 
-    let identity = identity_from(&file, &before)?;
-    let mut hasher = Sha256::new();
-    let mut reader = &file;
-    let mut buffer = [0u8; 64 * 1024];
-    let mut len = 0u64;
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => {
-                hasher.update(&buffer[..read]);
-                len += read as u64;
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => return Err(RootError::Io),
+    let fingerprint = match fingerprint_open_file(&file) {
+        Ok(fingerprint) => fingerprint,
+        Err(RootError::UnsupportedTarget(reason)) => {
+            return Ok(TargetObservation::Unsupported { reason });
         }
-    }
-
-    let after = statx_fd(&file)?;
-    if !same_object(&before, &after) || len != before.stx_size {
-        return Err(RootError::Io);
-    }
-    if !supported_metadata(&file) {
-        return Ok(TargetObservation::Unsupported {
-            reason: UnsupportedReason::Metadata,
-        });
-    }
+        Err(error) => return Err(error),
+    };
+    // The chain and the public leaf are checked again after the read so the
+    // fingerprint still belongs to the authorized name.
     target.check_chain()?;
     let name = leaf_matches(parent, &target.logical_leaf)?.ok_or(RootError::TargetUnavailable)?;
     let current = statx_at(parent.as_raw_fd(), &name, libc::AT_SYMLINK_NOFOLLOW)
         .map_err(|_| RootError::TargetUnavailable)?;
+    let after = statx_fd(&file)?;
     if !same_object(&after, &current) {
         return Err(RootError::TargetUnavailable);
     }
 
-    let mut sha256 = [0u8; 32];
-    sha256.copy_from_slice(&hasher.finalize());
-    Ok(TargetObservation::Regular {
-        fingerprint: Fingerprint {
-            identity,
-            len,
-            sha256,
-            metadata: FileMetadata::Linux {
-                mode: before.stx_mode as u32,
-                uid: before.stx_uid,
-                gid: before.stx_gid,
-                mtime: (before.stx_mtime.tv_sec, before.stx_mtime.tv_nsec),
-                nlink: u64::from(before.stx_nlink),
-            },
-        },
-    })
+    Ok(TargetObservation::Regular { fingerprint })
 }
 
 fn open_absolute(
@@ -814,9 +778,10 @@ fn supported_metadata(file: &File) -> bool {
     }
 }
 
-/// Fingerprint an already verified handle without assuming a root boundary.
-/// Used only by synthetic proof witnesses for operation-owned artifacts.
-pub(crate) fn fingerprint_file(file: &File) -> Result<Fingerprint, RootError> {
+/// Fingerprint an already open regular file. The caller owns the boundary
+/// decision; this helper only proves the object's own shape, metadata, bytes
+/// and stability across the read.
+pub(crate) fn fingerprint_open_file(file: &File) -> Result<Fingerprint, RootError> {
     let before = statx_fd(file)?;
     if before.stx_mode as u32 & libc::S_IFMT != libc::S_IFREG {
         return Err(RootError::UnsupportedTarget(UnsupportedReason::ObjectKind));

@@ -438,31 +438,18 @@ mod root {
             });
         }
 
-        let mut hasher = Sha256::new();
-        let mut reader = &file;
-        let mut buffer = [0u8; 64 * 1024];
-        let mut len = 0u64;
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => {
-                    hasher.update(&buffer[..read]);
-                    len += read as u64;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => return Err(RootError::Io),
+        let fingerprint = match fingerprint_open_file(&file) {
+            Ok(fingerprint) => fingerprint,
+            Err(RootError::UnsupportedTarget(reason)) => {
+                return Ok(TargetObservation::Unsupported { reason });
             }
+            Err(error) => return Err(error),
+        };
+        if fingerprint.identity != enumerated {
+            return Err(RootError::TargetUnavailable);
         }
-
-        check_original(&file, &enumerated, &before_basic, &standard)?;
-        if len != standard.EndOfFile as u64 {
-            return Err(RootError::Io);
-        }
-        if eligible_metadata(&file, &before_basic, &standard) != Some(security_sha256) {
-            return Ok(TargetObservation::Unsupported {
-                reason: UnsupportedReason::Metadata,
-            });
-        }
+        // The public leaf is checked again after the read so the fingerprint
+        // still belongs to the authorized name.
         let current =
             leaf_match(parent, &target.logical_leaf)?.ok_or(RootError::TargetUnavailable)?;
         if entry_identity(parent.volume, &current) != enumerated {
@@ -470,21 +457,7 @@ mod root {
         }
         target.check_chain()?;
 
-        let mut sha256 = [0u8; 32];
-        sha256.copy_from_slice(&hasher.finalize());
-        Ok(TargetObservation::Regular {
-            fingerprint: Fingerprint {
-                identity: enumerated,
-                len,
-                sha256,
-                metadata: FileMetadata::Windows {
-                    attributes: before_basic.FileAttributes,
-                    last_write_100ns: before_basic.LastWriteTime,
-                    links: standard.NumberOfLinks,
-                    security_sha256,
-                },
-            },
-        })
+        Ok(TargetObservation::Regular { fingerprint })
     }
 
     fn open_selection(path: &Path) -> Result<Vec<RootDir>, RootError> {
@@ -1247,42 +1220,22 @@ mod root {
         )
     }
 
-    /// Fingerprint an operation-owned artifact outside the installation tree.
-    /// Synthetic proof only; the caller is responsible for its own binding.
-    pub(crate) fn fingerprint_path(path: &Path) -> Result<Fingerprint, RootError> {
-        let text = path.to_str().ok_or(RootError::TargetUnavailable)?;
-        let metadata = open_path(text, METADATA_ACCESS).map_err(|code| {
-            if matches!(code, ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) {
-                RootError::TargetUnavailable
-            } else {
-                RootError::Io
-            }
-        })?;
-        let tag = attribute_tag(&metadata)?;
-        let standard = standard_info(&metadata)?;
-        let basic = basic_info(&metadata)?;
-        if is_reparse(&tag) || standard.Directory {
+    /// Fingerprint an already open regular file. The caller owns the boundary
+    /// decision; this helper only proves the object's own shape, metadata,
+    /// bytes and stability across the read.
+    pub(crate) fn fingerprint_open_file(file: &File) -> Result<Fingerprint, RootError> {
+        let basic = basic_info(file)?;
+        let standard = standard_info(file)?;
+        if is_reparse(&attribute_tag(file)?) || standard.Directory {
             return Err(RootError::UnsupportedTarget(UnsupportedReason::ObjectKind));
         }
-        let identity = identity(&metadata)?;
-        let Some(security_sha256) = eligible_metadata(&metadata, &basic, &standard) else {
+        let identity = identity(file)?;
+        let Some(security_sha256) = eligible_metadata(file, &basic, &standard) else {
             return Err(RootError::UnsupportedTarget(UnsupportedReason::Metadata));
         };
-        let handle = unsafe {
-            ReOpenFile(
-                metadata.as_raw_handle() as HANDLE,
-                GENERIC_READ,
-                FILE_SHARE_READ,
-                NO_FOLLOW,
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(RootError::Io);
-        }
-        let file = unsafe { File::from_raw_handle(handle) };
 
         let mut hasher = Sha256::new();
-        let mut reader = &file;
+        let mut reader = file;
         let mut buffer = [0u8; 64 * 1024];
         let mut len = 0u64;
         loop {
@@ -1296,9 +1249,9 @@ mod root {
                 Err(_) => return Err(RootError::Io),
             }
         }
-        check_original(&file, &identity, &basic, &standard)?;
+        check_original(file, &identity, &basic, &standard)?;
         if len != standard.EndOfFile as u64
-            || eligible_metadata(&file, &basic, &standard) != Some(security_sha256)
+            || eligible_metadata(file, &basic, &standard) != Some(security_sha256)
         {
             return Err(RootError::Io);
         }
@@ -1315,6 +1268,20 @@ mod root {
                 security_sha256,
             },
         })
+    }
+
+    /// Fingerprint an operation-owned artifact outside the installation tree.
+    /// Synthetic proof only; the caller is responsible for its own binding.
+    pub(crate) fn fingerprint_path(path: &Path) -> Result<Fingerprint, RootError> {
+        let text = path.to_str().ok_or(RootError::TargetUnavailable)?;
+        let file = open_path(text, GENERIC_READ).map_err(|code| {
+            if matches!(code, ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) {
+                RootError::TargetUnavailable
+            } else {
+                RootError::Io
+            }
+        })?;
+        fingerprint_open_file(&file)
     }
 
     pub(crate) fn directory_identity(path: &Path) -> Result<RootIdentity, RootError> {

@@ -69,7 +69,7 @@ impl NativeStage {
             .root
             .join(REVISIONS_DIR)
             .join(allocation.id.get().to_string());
-        fs::create_dir(&directory).map_err(|_| ImportError::StageUnavailable)?;
+        private_create_dir(&directory).map_err(|_| ImportError::StageUnavailable)?;
         let owner =
             fsops::directory_identity(&directory).map_err(|_| ImportError::StageUnavailable)?;
         record_owner(&owner)?;
@@ -129,12 +129,42 @@ impl NativeStage {
     }
 }
 
+/// The staged tree is private application data: no group or other access.
+fn private_create_dir(path: &Path) -> io::Result<()> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+fn private_create_dir_all(path: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+fn private_create_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 fn copy_archive(input: &mut dyn Read, path: &Path) -> Result<[u8; 32], ImportError> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|_| ImportError::StageUnavailable)?;
+    let mut file = private_create_file(path).map_err(|_| ImportError::StageUnavailable)?;
     let mut hasher = Sha256::new();
     let mut total = 0u64;
     let mut buffer = [0u8; 64 * 1024];
@@ -175,13 +205,9 @@ fn extract(directory: &Path, archive: &Path) -> Result<Vec<PayloadFile>, ImportE
         };
         let path = payload_path(directory, relative.as_str());
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|_| ImportError::Storage)?;
+            private_create_dir_all(parent).map_err(|_| ImportError::Storage)?;
         }
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|_| ImportError::StageChanged)?;
+        let file = private_create_file(&path).map_err(|_| ImportError::StageChanged)?;
         let mut writer = HashingFile::new(file);
         let written = admitted
             .copy_entry(index, &mut writer)
@@ -230,12 +256,13 @@ fn sync_ancestors(path: &Path, root: &Path) -> Result<(), ImportError> {
     Ok(())
 }
 
+/// Only a proved digest, length or shape mismatch is `StageChanged`.
+/// Permissions and transient I/O failures leave the stage unverified.
 fn verify_tree(directory: &Path, evidence: &StageEvidence) -> Result<(), ImportError> {
     match fsops::directory_identity(directory) {
         Ok(actual) if actual == evidence.owner => {}
         Ok(_) => return Err(ImportError::StageChanged),
-        Err(RootError::TargetUnavailable) => return Err(ImportError::StageUnavailable),
-        Err(_) => return Err(ImportError::StageChanged),
+        Err(_) => return Err(ImportError::StageUnavailable),
     }
 
     let archive = directory.join(ARCHIVE_FILE);
@@ -243,26 +270,25 @@ fn verify_tree(directory: &Path, evidence: &StageEvidence) -> Result<(), ImportE
     if archive_sha256 != evidence.archive_sha256 {
         return Err(ImportError::StageChanged);
     }
-    let archive_file = fsops::open_regular(&archive).map_err(|_| ImportError::StageChanged)?;
+    let archive_file = fsops::open_regular(&archive).map_err(|_| ImportError::StageUnavailable)?;
     admit_zip(archive_file, M1_ZIP_LIMITS).map_err(|_| ImportError::StageChanged)?;
 
     let payload = directory.join(PAYLOAD_DIR);
     let mut top_level = BTreeSet::new();
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(ImportError::StageUnavailable);
-        }
-        Err(_) => return Err(ImportError::StageChanged),
+        Err(_) => return Err(ImportError::StageUnavailable),
     };
     for entry in entries {
-        let entry = entry.map_err(|_| ImportError::StageChanged)?;
+        let entry = entry.map_err(|_| ImportError::StageUnavailable)?;
         let name = entry
             .file_name()
             .to_str()
             .map(str::to_owned)
             .ok_or(ImportError::StageChanged)?;
-        let kind = entry.file_type().map_err(|_| ImportError::StageChanged)?;
+        let kind = entry
+            .file_type()
+            .map_err(|_| ImportError::StageUnavailable)?;
         match (name.as_str(), kind.is_file(), kind.is_dir()) {
             (ARCHIVE_FILE, true, false) => {}
             (PAYLOAD_DIR, false, true) => {}
@@ -298,8 +324,8 @@ fn verify_tree(directory: &Path, evidence: &StageEvidence) -> Result<(), ImportE
 
     match fsops::directory_identity(directory) {
         Ok(actual) if actual == evidence.owner => Ok(()),
-        Err(RootError::TargetUnavailable) => Err(ImportError::StageUnavailable),
-        _ => Err(ImportError::StageChanged),
+        Ok(_) => Err(ImportError::StageChanged),
+        Err(_) => Err(ImportError::StageUnavailable),
     }
 }
 
@@ -308,9 +334,9 @@ fn collect_files(
     prefix: &str,
     found: &mut BTreeSet<String>,
 ) -> Result<(), ImportError> {
-    let entries = fs::read_dir(root).map_err(|_| ImportError::StageChanged)?;
+    let entries = fs::read_dir(root).map_err(|_| ImportError::StageUnavailable)?;
     for entry in entries {
-        let entry = entry.map_err(|_| ImportError::StageChanged)?;
+        let entry = entry.map_err(|_| ImportError::StageUnavailable)?;
         let name = entry
             .file_name()
             .to_str()
@@ -321,7 +347,9 @@ fn collect_files(
         } else {
             format!("{prefix}/{name}")
         };
-        let kind = entry.file_type().map_err(|_| ImportError::StageChanged)?;
+        let kind = entry
+            .file_type()
+            .map_err(|_| ImportError::StageUnavailable)?;
         if kind.is_dir() {
             collect_files(&entry.path(), &relative, found)?;
         } else if kind.is_file() {
@@ -337,19 +365,16 @@ fn hash_regular(path: &Path) -> Result<([u8; 32], u64), ImportError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => {}
         Ok(_) => return Err(ImportError::StageChanged),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(ImportError::StageUnavailable);
-        }
-        Err(_) => return Err(ImportError::StageChanged),
+        Err(_) => return Err(ImportError::StageUnavailable),
     }
-    let mut file = fsops::open_regular(path).map_err(|_| ImportError::StageChanged)?;
+    let mut file = fsops::open_regular(path).map_err(|_| ImportError::StageUnavailable)?;
     let mut hasher = Sha256::new();
     let mut total = 0u64;
     let mut buffer = [0u8; 64 * 1024];
     loop {
         let read = file
             .read(&mut buffer)
-            .map_err(|_| ImportError::StageChanged)?;
+            .map_err(|_| ImportError::StageUnavailable)?;
         if read == 0 {
             break;
         }
@@ -499,6 +524,45 @@ mod fsops {
 
     pub fn sync_dir(_path: &Path) -> Result<(), RootError> {
         // No ordinary-token directory barrier is qualified on Windows.
-        Ok(())
+        Err(RootError::UnsupportedTarget(
+            marduk_core::root_identity::UnsupportedReason::Configuration,
+        ))
+    }
+}
+
+#[cfg(all(test, unix))]
+mod permissions_tests {
+    use super::{private_create_dir, private_create_dir_all, private_create_file};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn staged_revision_tree_is_private() {
+        let tmp = tempfile::tempdir().unwrap();
+        let revisions = tmp.path().join("revisions");
+        fs::create_dir(&revisions).unwrap();
+        let revision = revisions.join("7");
+        private_create_dir(&revision).unwrap();
+        private_create_dir_all(&revision.join("payload/deep")).unwrap();
+        drop(private_create_file(&revision.join("archive.zip")).unwrap());
+        drop(private_create_file(&revision.join("payload/deep/a.dds")).unwrap());
+
+        for path in [
+            &revision,
+            &revision.join("payload"),
+            &revision.join("payload/deep"),
+        ] {
+            assert_eq!(mode(path), 0o700, "{path:?}");
+        }
+        for path in [
+            revision.join("archive.zip"),
+            revision.join("payload/deep/a.dds"),
+        ] {
+            assert_eq!(mode(&path), 0o600, "{path:?}");
+        }
+    }
+
+    fn mode(path: &std::path::Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 }

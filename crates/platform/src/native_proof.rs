@@ -9,8 +9,12 @@
 //! typed operation references, never from caller-supplied strings.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+#[cfg(target_os = "linux")]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
+use std::io;
+#[cfg(target_os = "linux")]
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use marduk_core::deployment::{
@@ -25,6 +29,7 @@ use marduk_core::root_identity::{
     Fingerprint, GameLayout, RootError, RootIdentity, TargetObservation, UnsupportedReason,
 };
 use marduk_core::targets::{RelativePath, TargetFile};
+#[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
 
 use crate::native;
@@ -229,28 +234,19 @@ impl ProofSession {
         };
         let directory = self.op_dir(key.operation, key.ordinal, direction(key));
         let stage_observation = artifact(&directory.join("stage"));
-        let stage = match (&stage_observation, record.staged.as_ref(), &record.pre) {
-            (Artifact::Regular(actual), Some(staged), _) if actual == staged => {
-                Artifact::Regular(actual.clone())
-            }
-            (Artifact::Regular(actual), Some(_), PreState::Regular(pre))
-                if record.exchange && actual == pre =>
-            {
-                Artifact::Absent
-            }
-            (Artifact::Absent, _, _) => Artifact::Absent,
-            (other, _, _) => other.clone(),
-        };
-        let retained = if record.exchange {
+        let (stage, retained) = if record.exchange {
+            // The exchange renames the staged object onto the public target, so
+            // the former stage slot is now the displaced artifact. The logical
+            // stage survives only while the slot still holds the staged bytes;
+            // otherwise those bytes are the retention evidence.
             match &stage_observation {
-                Artifact::Regular(actual) if record.staged.as_ref() != Some(actual) => {
-                    Artifact::Regular(actual.clone())
+                Artifact::Regular(actual) if record.staged.as_ref() == Some(actual) => {
+                    (Artifact::Regular(actual.clone()), Artifact::Absent)
                 }
-                Artifact::Regular(_) => Artifact::Absent,
-                other => other.clone(),
+                other => (Artifact::Absent, other.clone()),
             }
         } else {
-            artifact(&directory.join("displaced"))
+            (stage_observation, artifact(&directory.join("displaced")))
         };
         Evidence {
             target: self.observe_bound(target),
@@ -283,6 +279,7 @@ impl ProofSession {
     fn exchange_target(
         &mut self,
         target: &BoundTarget,
+        expected: &Fingerprint,
         staged: StageRef,
         retain: BackupRef,
     ) -> EffectOutcome {
@@ -293,9 +290,17 @@ impl ProofSession {
         let Some(staged_fingerprint) = record.staged.clone() else {
             return EffectOutcome::Unavailable(RootError::TargetUnavailable);
         };
-        let PreState::Regular(expected) = record.pre.clone() else {
-            return EffectOutcome::Unavailable(RootError::TargetUnavailable);
-        };
+        if record.pre != PreState::Regular(expected.clone())
+            || retain
+                != BackupRef::from_record(
+                    staged.operation(),
+                    staged.ordinal(),
+                    staged.direction(),
+                    BackupSlot::Displaced,
+                )
+        {
+            return EffectOutcome::Conflict(self.evidence(target, key));
+        }
         let stage_path = self.stage_path(staged);
         let stage_directory = stage_path
             .parent()
@@ -362,15 +367,15 @@ impl ProofSession {
         let evidence = self.evidence(target, key);
 
         if let Err(_error) = result {
-            return if evidence.target == Observation::Regular(expected)
-                && evidence.stage == Artifact::Regular(staged_fingerprint.clone())
-                && evidence.retained == Artifact::Absent
-            {
-                EffectOutcome::Conflict(evidence)
-            } else if evidence.target == Observation::Regular(staged_fingerprint.clone()) {
-                EffectOutcome::Ambiguous(evidence)
-            } else {
-                EffectOutcome::Unavailable(RootError::Io)
+            return match evidence.target {
+                Observation::Unavailable(error) => EffectOutcome::Unavailable(error),
+                _ if evidence.target == Observation::Regular(expected.clone())
+                    && evidence.stage == Artifact::Regular(staged_fingerprint.clone())
+                    && evidence.retained == Artifact::Absent =>
+                {
+                    EffectOutcome::Conflict(evidence)
+                }
+                _ => EffectOutcome::Ambiguous(evidence),
             };
         }
 
@@ -381,10 +386,12 @@ impl ProofSession {
             && evidence.stage == Artifact::Absent
         {
             match &evidence.retained {
-                Artifact::Regular(actual) if *actual == expected => {
+                Artifact::Regular(actual) if actual == expected => {
                     return EffectOutcome::Observed(evidence);
                 }
-                Artifact::Absent | Artifact::Regular(_) => {
+                // A report may name only bytes that are actually retained;
+                // absent bytes are an unproven outcome, not a displacement.
+                Artifact::Regular(_) => {
                     return EffectOutcome::Displaced {
                         evidence,
                         at: retain,
@@ -472,13 +479,21 @@ impl ProofSession {
         let evidence = self.evidence(target, key);
 
         if let Err(_error) = result {
-            return match evidence.target {
-                Observation::Absent if evidence.stage == Artifact::Regular(staged_fingerprint) => {
+            return match &evidence.target {
+                Observation::Unavailable(error) => EffectOutcome::Unavailable(*error),
+                Observation::Absent
+                    if evidence.stage == Artifact::Regular(staged_fingerprint.clone())
+                        && evidence.retained == Artifact::Absent =>
+                {
                     EffectOutcome::Conflict(evidence)
                 }
+                Observation::Absent => EffectOutcome::Ambiguous(evidence),
+                // The staged bytes at the public name mean the move applied
+                // despite the reported error; that is not a conflict.
+                Observation::Regular(actual) if *actual == staged_fingerprint => {
+                    EffectOutcome::Ambiguous(evidence)
+                }
                 Observation::Regular(_) => EffectOutcome::Conflict(evidence),
-                Observation::Unavailable(error) => EffectOutcome::Unavailable(error),
-                _ => EffectOutcome::Ambiguous(evidence),
             };
         }
         if fault == Fault::LoseAcknowledgement {
@@ -504,7 +519,15 @@ impl ProofSession {
         let Some(record) = self.records.get(&key) else {
             return EffectOutcome::Unavailable(RootError::TargetUnavailable);
         };
-        if record.pre != PreState::Regular(expected.clone()) {
+        if record.pre != PreState::Regular(expected.clone())
+            || retain
+                != BackupRef::from_record(
+                    retain.operation(),
+                    retain.ordinal(),
+                    retain.direction(),
+                    BackupSlot::Displaced,
+                )
+        {
             return EffectOutcome::Conflict(self.evidence(target, key));
         }
         let displaced_path = self.backup_path(retain);
@@ -569,15 +592,15 @@ impl ProofSession {
         let evidence = self.evidence(target, key);
 
         if let Err(_error) = result {
-            return if evidence.target == Observation::Regular(expected.clone())
-                && evidence.stage == Artifact::Absent
-                && evidence.retained == Artifact::Absent
-            {
-                EffectOutcome::Conflict(evidence)
-            } else if evidence.target == Observation::Absent {
-                EffectOutcome::Ambiguous(evidence)
-            } else {
-                EffectOutcome::Unavailable(RootError::Io)
+            return match evidence.target {
+                Observation::Unavailable(error) => EffectOutcome::Unavailable(error),
+                _ if evidence.target == Observation::Regular(expected.clone())
+                    && evidence.stage == Artifact::Absent
+                    && evidence.retained == Artifact::Absent =>
+                {
+                    EffectOutcome::Conflict(evidence)
+                }
+                _ => EffectOutcome::Ambiguous(evidence),
             };
         }
         if fault == Fault::LoseAcknowledgement {
@@ -815,11 +838,11 @@ impl CopyEffects for ProofSession {
     fn replace_existing_retain_displaced(
         &mut self,
         target: &BoundTarget,
-        _expected: &Fingerprint,
+        expected: &Fingerprint,
         staged: StageRef,
         retain: BackupRef,
     ) -> EffectOutcome {
-        self.exchange_target(target, staged, retain)
+        self.exchange_target(target, expected, staged, retain)
     }
 
     fn detach_existing_retain(
@@ -836,6 +859,16 @@ impl CopyEffects for ProofSession {
             &step.spec.target,
             key(step.op, step.ordinal, step.direction),
         )
+    }
+
+    fn inspect_alternate_displacement(&mut self, step: &PreparedStep) -> Artifact {
+        let key = key(step.op, step.ordinal, step.direction);
+        if !self.records.contains_key(&key) {
+            // Same missing-record fallback as `inspect_step`: no record means
+            // no operation-owned slot to attribute.
+            return Artifact::Unavailable;
+        }
+        artifact(&self.backup_path(step.alternate_displacement()))
     }
 
     fn durability_barrier(&mut self, step: &PreparedStep, observed: &Evidence) -> BarrierOutcome {
@@ -893,11 +926,11 @@ impl ProofSession {
             }
             current = path.parent();
         }
-        if let Ok(resolved) = self.resolved(&step.spec.target)
-            && let Ok(target_directory) = resolved.parent_dir()
-        {
-            target_directory.sync_all().map_err(|_| RootError::Io)?;
-        }
+        // The changed target parent is part of the barrier. A failed
+        // re-resolution or open must not leave the effect reported durable.
+        let resolved = self.resolved(&step.spec.target)?;
+        let target_directory = resolved.parent_dir()?;
+        target_directory.sync_all().map_err(|_| RootError::Io)?;
         Ok(())
     }
 }
@@ -1086,10 +1119,9 @@ mod fsops {
             hasher.update(&buffer[..read]);
             len += read as u64;
         }
-        output.sync_all().map_err(|_| RootError::Io)?;
-
         // Scoped metadata: mode, ownership and mtime. Eligibility already
-        // refused links, xattrs, flags and special modes.
+        // refused links, xattrs, flags and special modes. Metadata lands
+        // before the sync so the durable artifact is the complete copy.
         let mode = metadata.mode() & 0o7777;
         if unsafe { libc::fchmod(output.as_raw_fd(), mode as libc::mode_t) } != 0
             || unsafe { libc::fchown(output.as_raw_fd(), metadata.uid(), metadata.gid()) } != 0
@@ -1109,6 +1141,7 @@ mod fsops {
         if unsafe { libc::futimens(output.as_raw_fd(), times.as_ptr()) } != 0 {
             return Err(RootError::UnsupportedTarget(UnsupportedReason::Metadata));
         }
+        output.sync_all().map_err(|_| RootError::Io)?;
         let mut sha256 = [0u8; 32];
         sha256.copy_from_slice(&hasher.finalize());
         Ok((len, sha256))
@@ -1118,24 +1151,38 @@ mod fsops {
 #[cfg(windows)]
 mod fsops {
     use super::*;
-    use std::time::SystemTime;
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
 
     pub fn directory_identity(path: &Path) -> Result<RootIdentity, RootError> {
         crate::native::directory_identity(path)
     }
 
     pub fn open_directory(path: &Path) -> Result<File, RootError> {
-        let text = path.to_str().ok_or(RootError::TargetUnavailable)?;
-        std::fs::File::open(text).map_err(|_| RootError::TargetUnavailable)
+        // A directory needs backup semantics to open as a handle.
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .map_err(|_| RootError::TargetUnavailable)
     }
 
     pub fn open_file(path: &Path) -> Result<File, RootError> {
-        std::fs::File::open(path).map_err(|_| RootError::TargetUnavailable)
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|_| RootError::TargetUnavailable)
     }
 
     pub fn sync_directory(_path: &Path) -> Result<(), RootError> {
         // No documented ordinary-token directory barrier is qualified here.
-        Ok(())
+        Err(RootError::UnsupportedTarget(
+            UnsupportedReason::Configuration,
+        ))
     }
 
     pub fn publish(
@@ -1219,42 +1266,20 @@ mod fsops {
         }
     }
 
-    pub fn copy_file(source: &Path, destination: &Path) -> Result<(u64, [u8; 32]), RootError> {
-        let mut input = std::fs::File::open(source).map_err(|_| RootError::TargetUnavailable)?;
-        let metadata = input.metadata().map_err(|_| RootError::Io)?;
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(destination)
-            .map_err(|_| RootError::UnsupportedTarget(UnsupportedReason::Metadata))?;
-        let mut hasher = Sha256::new();
-        let mut buffer = [0u8; 64 * 1024];
-        let mut len = 0u64;
-        loop {
-            let read = input.read(&mut buffer).map_err(|_| RootError::Io)?;
-            if read == 0 {
-                break;
-            }
-            output
-                .write_all(&buffer[..read])
-                .map_err(|_| RootError::Io)?;
-            hasher.update(&buffer[..read]);
-            len += read as u64;
-        }
-        output.sync_all().map_err(|_| RootError::Io)?;
-        let times = std::fs::FileTimes::new()
-            .set_modified(metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH));
-        output.set_times(times).map_err(|_| RootError::Io)?;
-        let mut sha256 = [0u8; 32];
-        sha256.copy_from_slice(&hasher.finalize());
-        Ok((len, sha256))
+    pub fn copy_file(_source: &Path, _destination: &Path) -> Result<(u64, [u8; 32]), RootError> {
+        // A scoped copy that restores attributes, timestamps and security is
+        // not runtime-qualified on NTFS, and a data-only copy silently drops
+        // them. Fail preparation closed instead of faking a complete backup.
+        Err(RootError::UnsupportedTarget(
+            UnsupportedReason::Configuration,
+        ))
     }
 }
 
 #[cfg(target_os = "linux")]
 fn fingerprint_path(path: &Path) -> Result<Fingerprint, RootError> {
     let file = crate::native::open_file(path)?;
-    crate::native::fingerprint_file(&file)
+    crate::native::fingerprint_open_file(&file)
 }
 
 #[cfg(windows)]

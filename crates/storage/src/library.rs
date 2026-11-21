@@ -25,6 +25,7 @@ use marduk_core::import::{
 };
 use marduk_core::import::{ImportAllocation, PayloadFile, StageEvidence};
 use marduk_core::profiles::{ProfileMember, ProfileSnapshot};
+#[cfg(test)]
 use marduk_core::root_identity::{NativeIdentity, RootIdentity};
 use marduk_core::targets::RelativePath;
 use marduk_core::targets::{RootRole, TargetFile};
@@ -126,7 +127,7 @@ impl Catalog {
                 };
                 let connection = &mut self.connection;
                 let receipt = stage.stage(&_guard, allocation, &mut input, &mut |owner| {
-                    let owner = encode_owner(owner);
+                    let owner = crate::operation_journal::encode_root(owner);
                     let changed = connection
                         .execute(
                             "UPDATE imports SET owner = ?1 \
@@ -144,7 +145,7 @@ impl Catalog {
                     &mut self.connection,
                     id,
                     &evidence.archive_sha256,
-                    &encode_owner(&evidence.owner),
+                    &crate::operation_journal::encode_root(&evidence.owner),
                     &evidence.files,
                 )?;
                 Ok(PreparedImport {
@@ -645,7 +646,7 @@ impl FixtureStage {
 
         let archive_sha256 = copy_archive(input, &directory.join(ARCHIVE_FILE))?;
         let owner = synthetic_owner(id, &archive_sha256);
-        let owner_bytes = encode_owner(&owner);
+        let owner_bytes = crate::operation_journal::encode_root(&owner);
         let changed = connection
             .execute(
                 "UPDATE imports SET owner = ?1, archive_sha = ?2 \
@@ -780,7 +781,8 @@ impl FixtureStage {
 #[cfg(test)]
 fn verified_owner(stage: &StageRecord) -> Result<&[u8; 32], ImportError> {
     let (archive_sha256, owner) = fixture_receipt(stage)?;
-    let expected_owner = encode_owner(&synthetic_owner(stage.id, archive_sha256));
+    let expected_owner =
+        crate::operation_journal::encode_root(&synthetic_owner(stage.id, archive_sha256));
     if owner != expected_owner.as_slice() {
         return Err(ImportError::StageChanged);
     }
@@ -1655,49 +1657,12 @@ fn synthetic_owner(id: ImportId, archive_sha256: &[u8; 32]) -> RootIdentity {
     }
 }
 
-fn encode_owner(owner: &RootIdentity) -> Vec<u8> {
-    let mut encoded = vec![1u8];
-    match owner.evidence() {
-        NativeIdentity::Linux {
-            fs_magic,
-            fs_id,
-            view_id,
-            tree_id,
-            ino,
-            birth,
-        } => {
-            encoded.push(0);
-            encoded.extend_from_slice(&fs_magic.to_le_bytes());
-            encoded.extend_from_slice(fs_id);
-            encoded.extend_from_slice(&view_id.to_le_bytes());
-            match tree_id {
-                Some(tree_id) => {
-                    encoded.push(1);
-                    encoded.extend_from_slice(&tree_id.to_le_bytes());
-                }
-                None => encoded.push(0),
-            }
-            encoded.extend_from_slice(&ino.to_le_bytes());
-            encoded.extend_from_slice(&birth.0.to_le_bytes());
-            encoded.extend_from_slice(&birth.1.to_le_bytes());
-        }
-        NativeIdentity::Windows {
-            volume_serial,
-            file_id,
-            creation_100ns,
-        } => {
-            encoded.push(1);
-            encoded.extend_from_slice(&volume_serial.to_le_bytes());
-            encoded.extend_from_slice(file_id);
-            encoded.extend_from_slice(&creation_100ns.to_le_bytes());
-        }
-    }
-    encoded
-}
-
 fn native_evidence(stage: &StageRecord) -> Result<StageEvidence, ImportError> {
     let archive_sha256 = stage.archive_sha256.ok_or(ImportError::StageChanged)?;
-    let owner = decode_owner(stage.owner.as_deref().ok_or(ImportError::StageChanged)?)?;
+    let owner = crate::operation_journal::decode_root(
+        stage.owner.as_deref().ok_or(ImportError::StageChanged)?,
+    )
+    .map_err(|_| ImportError::StageChanged)?;
     let files = stage
         .files
         .iter()
@@ -1719,81 +1684,6 @@ fn native_evidence(stage: &StageRecord) -> Result<StageEvidence, ImportError> {
         files,
         owner,
     })
-}
-
-struct OwnerReader<'a> {
-    bytes: &'a [u8],
-    at: usize,
-}
-
-impl<'a> OwnerReader<'a> {
-    fn take(&mut self, len: usize) -> Result<&'a [u8], ImportError> {
-        let end = self.at.checked_add(len).ok_or(ImportError::Storage)?;
-        let slice = self.bytes.get(self.at..end).ok_or(ImportError::Storage)?;
-        self.at = end;
-        Ok(slice)
-    }
-
-    fn u64(&mut self) -> Result<u64, ImportError> {
-        Ok(u64::from_le_bytes(
-            self.take(8)?.try_into().map_err(|_| ImportError::Storage)?,
-        ))
-    }
-
-    fn i64(&mut self) -> Result<i64, ImportError> {
-        Ok(i64::from_le_bytes(
-            self.take(8)?.try_into().map_err(|_| ImportError::Storage)?,
-        ))
-    }
-
-    fn array16(&mut self) -> Result<[u8; 16], ImportError> {
-        self.take(16)?.try_into().map_err(|_| ImportError::Storage)
-    }
-}
-
-fn decode_owner(bytes: &[u8]) -> Result<RootIdentity, ImportError> {
-    let mut reader = OwnerReader { bytes, at: 0 };
-    if reader.take(1)?[0] != 1 {
-        return Err(ImportError::Storage);
-    }
-    let identity = match reader.take(1)?[0] {
-        0 => {
-            let fs_magic = reader.u64()?;
-            let fs_id = reader.array16()?;
-            let view_id = reader.u64()?;
-            let tree_id = match reader.take(1)?[0] {
-                0 => None,
-                1 => Some(reader.u64()?),
-                _ => return Err(ImportError::Storage),
-            };
-            let ino = reader.u64()?;
-            let seconds = reader.i64()?;
-            let nanos = u32::from_le_bytes(
-                reader
-                    .take(4)?
-                    .try_into()
-                    .map_err(|_| ImportError::Storage)?,
-            );
-            NativeIdentity::Linux {
-                fs_magic,
-                fs_id,
-                view_id,
-                tree_id,
-                ino,
-                birth: (seconds, nanos),
-            }
-        }
-        1 => NativeIdentity::Windows {
-            volume_serial: reader.u64()?,
-            file_id: reader.array16()?,
-            creation_100ns: reader.i64()?,
-        },
-        _ => return Err(ImportError::Storage),
-    };
-    if reader.at != bytes.len() {
-        return Err(ImportError::Storage);
-    }
-    Ok(RootIdentity::from_adapter_evidence(identity))
 }
 
 fn sha_from_blob(blob: Vec<u8>) -> Result<[u8; 32], ImportError> {

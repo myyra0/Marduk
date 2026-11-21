@@ -1878,7 +1878,7 @@ fn encode_locator(locator: &Path) -> Vec<u8> {
 // Portable evidence encoding v1. Every blob is length-prefixed and rejected on
 // a short read, unknown tag or trailing bytes.
 
-fn encode_root(root: &RootIdentity) -> Vec<u8> {
+pub(crate) fn encode_root(root: &RootIdentity) -> Vec<u8> {
     let mut out = vec![1u8];
     encode_identity(&mut out, root.evidence());
     out
@@ -1922,7 +1922,7 @@ fn encode_identity(out: &mut Vec<u8>, identity: &NativeIdentity) {
     }
 }
 
-fn decode_root(blob: &[u8]) -> Result<RootIdentity, DeployError> {
+pub(crate) fn decode_root(blob: &[u8]) -> Result<RootIdentity, DeployError> {
     let mut reader = Reader::new(blob);
     if reader.u8()? != 1 {
         return Err(DeployError::Io);
@@ -2475,5 +2475,71 @@ impl<'a> Reader<'a> {
         } else {
             Err(DeployError::Io)
         }
+    }
+}
+
+#[cfg(test)]
+mod identity_codec_tests {
+    use super::{decode_root, encode_root};
+    use marduk_core::deployment::DeployError;
+    use marduk_core::root_identity::{NativeIdentity, RootIdentity};
+
+    fn linux(tree: Option<u64>) -> RootIdentity {
+        RootIdentity::from_adapter_evidence(NativeIdentity::Linux {
+            fs_magic: 0x9123_4567_89ab_cdef,
+            fs_id: [7u8; 16],
+            view_id: 42,
+            tree_id: tree,
+            ino: 9_000_000_001,
+            birth: (-1234, 5678),
+        })
+    }
+
+    fn windows() -> RootIdentity {
+        RootIdentity::from_adapter_evidence(NativeIdentity::Windows {
+            volume_serial: 0xfeed_face,
+            file_id: [3u8; 16],
+            creation_100ns: 132_000_000_000,
+        })
+    }
+
+    #[test]
+    fn identity_codec_round_trips_both_domains() {
+        for root in [linux(Some(11)), linux(None), windows()] {
+            let encoded = encode_root(&root);
+            assert_eq!(decode_root(&encoded).unwrap(), root);
+        }
+    }
+
+    #[test]
+    fn identity_codec_refuses_malformed_blobs() {
+        let valid = encode_root(&linux(Some(11)));
+        asserts_io_err(&[]);
+        asserts_io_err(&[0]);
+        asserts_io_err(&[2]);
+        asserts_io_err(&valid[..valid.len() - 1]);
+        // Unknown tree marker.
+        let mut unknown_tree = valid.clone();
+        let marker = 1 + 1 + 8 + 16 + 8;
+        unknown_tree[marker] = 2;
+        asserts_io_err(&unknown_tree);
+        // Unknown identity tag.
+        let mut unknown_tag = valid;
+        unknown_tag[1] = 2;
+        asserts_io_err(&unknown_tag);
+    }
+
+    #[test]
+    fn identity_codec_refuses_trailing_bytes() {
+        let mut blob = encode_root(&windows());
+        blob.push(0);
+        asserts_io_err(&blob);
+        let mut blob = encode_root(&linux(None));
+        blob.extend_from_slice(&[1, 2, 3]);
+        asserts_io_err(&blob);
+    }
+
+    fn asserts_io_err(blob: &[u8]) {
+        assert_eq!(decode_root(blob), Err(DeployError::Io), "{blob:?}");
     }
 }
