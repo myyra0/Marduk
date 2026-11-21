@@ -525,11 +525,16 @@ fn recover_restore<J: Journal, P: CopyEffects>(
                 op,
                 Finalize::Cancelled,
             )?)),
-            Phase::Restoring => Ok(Some(crate::deployment::finish(
-                journal,
-                op,
-                Finalize::RestoreCompleted,
-            )?)),
+            Phase::Restoring => {
+                if status.blocker.is_some() {
+                    journal.block(op, None)?;
+                }
+                Ok(Some(crate::deployment::finish(
+                    journal,
+                    op,
+                    Finalize::RestoreCompleted,
+                )?))
+            }
             _ => Ok(Some(status)),
         };
     }
