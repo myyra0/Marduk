@@ -1,7 +1,7 @@
 // Recovery witnesses against the real journal with a synthetic effect port.
 
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -127,6 +127,7 @@ struct MemEffects {
     fault: Option<Fault>,
     mutations: usize,
     root_gate: Rc<Cell<bool>>,
+    unreadable_retains: BTreeSet<BackupRef>,
 }
 
 impl MemEffects {
@@ -152,6 +153,7 @@ impl MemEffects {
             fault: None,
             mutations: 0,
             root_gate: Rc::default(),
+            unreadable_retains: BTreeSet::new(),
         }
     }
 
@@ -195,7 +197,11 @@ impl MemEffects {
                     StageRef::from_record(step.op, step.ordinal, step.direction)
                 }),
             )),
-            retained: self.artifact(self.backups.get(&step.retain)),
+            retained: if self.unreadable_retains.contains(&step.retain) {
+                Artifact::Unavailable
+            } else {
+                self.artifact(self.backups.get(&step.retain))
+            },
         }
     }
 

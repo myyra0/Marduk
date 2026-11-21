@@ -78,6 +78,62 @@ fn assert_displacement_cut(alternate: bool) {
     );
     assert_eq!(effects.mutations, 0);
     assert_eq!(
+        effects.public[FILE].bytes, POST,
+        "a blocked inspection must not publish"
+    );
+    assert_eq!(
+        journal.root_state(&root(2)).unwrap(),
+        RootState {
+            pending: Some(op),
+            active: None
+        }
+    );
+}
+
+#[test]
+fn unreadable_canonical_retain_blocks_recovery_without_effect() {
+    let dir = fixture_v1();
+    let mut journal = open_fixture(&dir);
+    let mut effects = MemEffects::new();
+    let plan = save_plan(&mut journal);
+    let op = journal.claim(Claim::Deploy(plan)).unwrap();
+    let step = deploy_step(op);
+    journal.seal(op, vec![step.clone()]).unwrap();
+    journal
+        .set_phase(op, Phase::Prepared, Phase::Applying)
+        .unwrap();
+    journal
+        .record_step(op, 0, StepPhase::Ready, StepPhase::Attempting, None)
+        .unwrap();
+
+    effects.unreadable_retains.insert(step.retain);
+    let alternate = step.alternate_displacement();
+    effects.backups.insert(
+        alternate,
+        MemFile {
+            bytes: EDIT.to_vec(),
+            fingerprint: fingerprint(EDIT, 42),
+        },
+    );
+    drop(journal);
+    let mut journal = OperationJournal::open(dir.path()).unwrap();
+    let status = recover_pending(&mut journal, &mut effects, &root(1), &root(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.blocker, Some(DeployError::RecoveryConflict));
+    assert!(status.retained.contains(&step.retain));
+    assert!(status.retained.contains(&alternate));
+    assert_eq!(journal.unexpected_displacements(op).unwrap().len(), 2);
+    assert_eq!(effects.mutations, 0);
+    assert_eq!(effects.public[FILE].bytes, BASE);
+
+    // A second recovery must not retry the effect either.
+    let again = recover_pending(&mut journal, &mut effects, &root(1), &root(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.blocker, Some(DeployError::RecoveryConflict));
+    assert_eq!(effects.mutations, 0);
+    assert_eq!(
         journal.root_state(&root(2)).unwrap(),
         RootState {
             pending: Some(op),

@@ -1488,7 +1488,14 @@ fn owned_displacements(
         };
         let at = decode_backup(&at)?;
         let evidence = decode_evidence(&evidence)?;
-        if at.operation() == op && at.ordinal() == ordinal && at.direction() == step.direction {
+        // Only the sealed canonical retain and its deterministic alternate are
+        // displacement locations. Any other reported ref stays a blocker (the
+        // evidence row still prevents finalization) but is never advertised.
+        if at.operation() == op
+            && at.ordinal() == ordinal
+            && at.direction() == step.direction
+            && (at == step.retain || at == step.alternate_displacement())
+        {
             owned.push((at, evidence));
         }
     }

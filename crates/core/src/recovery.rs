@@ -129,8 +129,9 @@ pub struct PreparedStep {
 }
 
 impl PreparedStep {
-    /// The only other permitted displacement destination. Its identity is
-    /// derived from the sealed step, not from the effect result.
+    /// The deterministic alternate detection slot. It is never a publication
+    /// destination; recovery only inspects it so evidence found there can be
+    /// reported. Its identity is derived from the sealed step.
     pub fn alternate_displacement(&self) -> BackupRef {
         BackupRef::from_record(
             self.op,
@@ -423,6 +424,12 @@ pub(crate) fn preserve_canonical_displacement<J: Journal>(
     step: &PreparedStep,
     evidence: &Evidence,
 ) -> Result<bool, DeployError> {
+    // An unreadable canonical slot proves nothing about its contents, so it
+    // can never pass the displacement check and let an effect run.
+    if evidence.retained == Artifact::Unavailable {
+        journal.block_displacement(step.op, step, step.retain, evidence)?;
+        return Ok(true);
+    }
     if matches!(
         evidence.retained,
         Artifact::Regular(_) | Artifact::Unsupported(_)

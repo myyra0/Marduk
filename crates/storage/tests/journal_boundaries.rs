@@ -210,6 +210,8 @@ fn unexpectedly_displaced_ref_survives_reopen_and_prevents_finalize() {
     journal
         .record_step(op, 0, StepPhase::Ready, StepPhase::Attempting, None)
         .unwrap();
+    // A ref that was never allocated as a displacement destination is still
+    // evidence of an unexpected write, but it is not a reported location.
     let at = BackupRef::from_record(op, 0, StepDirection::Forward, BackupSlot::Step);
     journal
         .block_displacement(op, &step, at, &applied())
@@ -219,7 +221,8 @@ fn unexpectedly_displaced_ref_survives_reopen_and_prevents_finalize() {
     let mut journal = OperationJournal::open(dir.path()).unwrap();
     let status = journal.status(op).unwrap().unwrap();
     assert_eq!(status.blocker, Some(DeployError::RecoveryConflict));
-    assert_eq!(status.retained, [at]);
+    assert!(status.retained.is_empty());
+    assert!(journal.unexpected_displacements(op).unwrap().is_empty());
     assert!(journal.has_unresolved_displacement(op).unwrap());
     assert!(
         journal

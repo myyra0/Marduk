@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind, panic_any, resume_unwind};
 use std::rc::Rc;
 
@@ -136,6 +136,9 @@ struct Effects {
     prepared: Vec<PreparedStep>,
     backup_receipts: Vec<(BackupRef, File)>,
     barrier_fault: Option<(&'static str, bool)>,
+    retain_reads: BTreeMap<u32, usize>,
+    unreadable_retain_after: Option<(u32, usize)>,
+    unreadable_retains: BTreeSet<BackupRef>,
 }
 
 impl Effects {
@@ -169,6 +172,9 @@ impl Effects {
             prepared: Vec::new(),
             backup_receipts: Vec::new(),
             barrier_fault: None,
+            retain_reads: BTreeMap::new(),
+            unreadable_retain_after: None,
+            unreadable_retains: BTreeSet::new(),
         }
     }
 
@@ -520,6 +526,12 @@ impl CopyEffects for Effects {
                 retained: Artifact::Unavailable,
             };
         }
+        let reads = self.retain_reads.entry(step.ordinal).or_insert(0);
+        *reads += 1;
+        let unreadable = self.unreadable_retains.contains(&step.retain)
+            || self
+                .unreadable_retain_after
+                .is_some_and(|(ordinal, after)| ordinal == step.ordinal && *reads >= after);
         Evidence {
             target,
             stage: artifact(
@@ -527,7 +539,11 @@ impl CopyEffects for Effects {
                     .as_ref()
                     .and_then(|(at, _)| lookup(&self.visible.staged, *at)),
             ),
-            retained: artifact(lookup(&self.visible.backups, step.retain)),
+            retained: if unreadable {
+                Artifact::Unavailable
+            } else {
+                artifact(lookup(&self.visible.backups, step.retain))
+            },
         }
     }
 
@@ -1472,6 +1488,46 @@ fn cancelled_before_public_phase_has_no_effect_or_generation() {
     assert!(f.recover().is_none());
     assert_eq!(f.commit(id).unwrap().phase, Phase::Cancelled);
     f.mutations(&[]);
+}
+
+#[test]
+fn unreadable_canonical_retain_after_preflight_runs_no_effect() {
+    let mut f = Fixture::new(WINNER);
+    let plan = f.plan();
+    // Preflight inspects each canonical retain once. The next read during
+    // apply finds the slot unreadable, before the first effect can run.
+    f.effects.unreadable_retain_after = Some((0, 2));
+    assert_eq!(f.commit(plan), Err(DeployError::RecoveryConflict));
+    f.mutations(&[]);
+    f.files(None, BASE);
+    let op = f.journal.visible.pending.unwrap();
+    assert_eq!(f.state(op).blocker, Some(DeployError::RecoveryConflict));
+    f.root_state(Some(op), None);
+}
+
+#[test]
+fn unreadable_canonical_retain_during_recovery_runs_no_effect() {
+    let mut f = Fixture::new(WINNER);
+    let plan = f.plan();
+    let op = f.cut_apply(plan, Cut::BeforeFirstPublish);
+    let retain = f.journal.durable.steps[&op]
+        .iter()
+        .find(|row| row.prepared.ordinal == 0)
+        .unwrap()
+        .prepared
+        .retain;
+    f.boot();
+    f.effects.unreadable_retains.insert(retain);
+    let status = f.recover().unwrap();
+    f.assert_status(
+        &status,
+        OperationKind::Deploy,
+        Phase::Applying,
+        Some(DeployError::RecoveryConflict),
+    );
+    f.mutations(&[]);
+    f.files(None, BASE);
+    f.root_state(Some(op), None);
 }
 
 #[test]
