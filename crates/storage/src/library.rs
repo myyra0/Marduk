@@ -1,22 +1,35 @@
 //! SQLite-backed immutable library catalog.
 //!
-//! Only `open`, `named_profile` and `snapshot` are implemented in the scaffold.
-//! Prepared imports, publication, discard, reconciliation and reordering are
-//! frozen as typed refusals until the stage adapter exists.
+//! One local catalog owns profiles, installed revisions, staged imports and
+//! recorded publication results. Payload bytes stay under `revisions/<id>/`;
+//! the catalog changes visibility, never payload paths.
 
-use std::collections::BTreeMap;
-use std::fs;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(test)]
+use std::fs::OpenOptions;
+#[cfg(test)]
+use std::io::Write as _;
+
+use marduk_archive::{M1_ZIP_LIMITS, admit_zip};
 use marduk_core::ids::{InstalledRevisionId, MemberId, ProfileId, ProfileRevision};
+#[cfg(test)]
+use marduk_core::import::{ArchiveError, ImportAllocation, PayloadFile, StageEvidence};
 use marduk_core::import::{
-    BeginImport, ImportError, ImportId, NamedProfile, PreparedImport, ProfileEditError,
+    BeginImport, ImportError, ImportId, ImportTarget, NamedProfile, PreparedImport,
+    ProfileEditError,
 };
 use marduk_core::profiles::{ProfileMember, ProfileSnapshot};
-use marduk_platform::{GateError, WriterGate};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
+use marduk_core::root_identity::{NativeIdentity, RootIdentity};
+#[cfg(test)]
+use marduk_core::targets::{RootRole, TargetFile};
+use marduk_platform::{GateError, WriterGate, WriterGuard};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
 
 #[cfg(test)]
 mod contract_tests;
@@ -24,6 +37,8 @@ mod contract_tests;
 const CATALOG_FILE: &str = "catalog.sqlite3";
 const LOCK_FILE: &str = "library.lock";
 const REVISIONS_DIR: &str = "revisions";
+const PAYLOAD_DIR: &str = "payload";
+const ARCHIVE_FILE: &str = "archive.zip";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MIGRATION_VERSION: i64 = 1;
 const SCHEMA_V1: &str = include_str!("../migrations/0001_library.sql");
@@ -31,6 +46,7 @@ const SCHEMA_V1: &str = include_str!("../migrations/0001_library.sql");
 pub struct Catalog {
     root: PathBuf,
     connection: Connection,
+    gate: WriterGate,
     stage: StageAdapter,
 }
 
@@ -55,6 +71,7 @@ impl Catalog {
         Ok(Self {
             root: root.to_path_buf(),
             connection,
+            gate,
             stage: StageAdapter::Unavailable(UnavailableStage),
         })
     }
@@ -78,21 +95,121 @@ impl Catalog {
 
     pub fn prepare_import(
         &mut self,
-        mut input: impl Read,
+        input: impl Read,
         plan: BeginImport,
     ) -> Result<PreparedImport, ImportError> {
-        self.stage.prepare(&mut input, plan)
+        let target = match plan.target {
+            ImportTarget::Append { display_name } => ImportTarget::Append {
+                display_name: validate_label(&display_name)?,
+            },
+            ImportTarget::Replace { member } => ImportTarget::Replace { member },
+        };
+
+        let _guard = self.lock()?;
+
+        #[cfg(test)]
+        {
+            let mut input = input;
+            match &mut self.stage {
+                StageAdapter::Unavailable(stage) => stage.prepare(),
+                StageAdapter::Fixture(stage) => stage.prepare(
+                    &mut self.connection,
+                    &self.root,
+                    &mut input,
+                    plan.profile,
+                    plan.expected_revision,
+                    target,
+                ),
+            }
+        }
+        #[cfg(not(test))]
+        {
+            let _ = (input, target);
+            match &mut self.stage {
+                StageAdapter::Unavailable(stage) => stage.prepare(),
+            }
+        }
     }
 
-    pub fn publish_import(&mut self, _id: ImportId) -> Result<ProfileSnapshot, ImportError> {
-        Err(ImportError::Storage)
+    pub fn publish_import(&mut self, id: ImportId) -> Result<ProfileSnapshot, ImportError> {
+        let _guard = self.lock()?;
+        let record = load_import(&self.connection, id)?;
+
+        // Replay precedence: a committed ID reports its recorded result even
+        // when the profile has moved on since.
+        if record.state == ImportState::Committed {
+            return read_result_snapshot(&self.connection, id);
+        }
+        if record.state != ImportState::Prepared {
+            return Err(ImportError::ImportNotPrepared);
+        }
+
+        verify_stage(&self.connection, &self.root, &record)?;
+
+        let revision = read_profile_revision(&self.connection, record.profile)?;
+        if revision.get() != record.expected_revision.get() {
+            return Err(ImportError::StalePlan);
+        }
+        if let ImportTarget::Replace { member } = record.target {
+            ensure_member(&self.connection, record.profile, member)?;
+        }
+
+        match self.commit_publication(&record) {
+            Ok(()) => read_result_snapshot(&self.connection, id),
+            Err(error) => {
+                // An ambiguous SQL outcome is inspected before reporting: if the
+                // commit landed, the recorded result is authoritative.
+                if load_import(&self.connection, id)
+                    .is_ok_and(|record| record.state == ImportState::Committed)
+                {
+                    read_result_snapshot(&self.connection, id)
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 
-    pub fn discard_import(&mut self, _id: ImportId) -> Result<(), ImportError> {
-        Err(ImportError::Storage)
+    pub fn discard_import(&mut self, id: ImportId) -> Result<(), ImportError> {
+        let _guard = self.lock()?;
+        let record = load_import(&self.connection, id)?;
+        match record.state {
+            ImportState::Committed | ImportState::Discarded => {
+                return Err(ImportError::ImportNotPrepared);
+            }
+            ImportState::Writing | ImportState::Prepared => {}
+        }
+
+        // Tombstone first; reclamation below is best-effort and only removes
+        // bytes whose recorded ownership and digests still verify.
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE imports SET state = 'discarded' \
+                 WHERE id = ?1 AND state IN ('writing', 'prepared')",
+                [sql_import_id(id)?],
+            )
+            .map_err(storage_error)?;
+        if changed != 1 {
+            return Err(ImportError::Storage);
+        }
+
+        if !is_published(&self.connection, id)? {
+            let files = stored_files(&self.connection, id)?;
+            if verify_stage(&self.connection, &self.root, &record).is_ok() {
+                reclaim_stage(&self.root, id, &files)?;
+            }
+        }
+        Ok(())
     }
 
+    /// Account for abandoned reservations and retain durable prepared stages.
+    ///
+    /// A `Writing` row without a proven ownership receipt is left quarantined;
+    /// it is not pending and cannot publish. `Prepared` stages are returned in
+    /// ID order for explicit Apply or discard.
     pub fn reconcile(&mut self) -> Result<Vec<ImportId>, ImportError> {
+        let _guard = self.lock()?;
         Err(ImportError::Storage)
     }
 
@@ -102,7 +219,111 @@ impl Catalog {
         _expected: ProfileRevision,
         _order: &[MemberId],
     ) -> Result<ProfileSnapshot, ProfileEditError> {
+        let _guard = self.lock_edit()?;
         Err(ProfileEditError::Storage)
+    }
+
+    fn lock(&self) -> Result<WriterGuard, ImportError> {
+        self.gate.try_lock().map_err(gate_error)
+    }
+
+    fn lock_edit(&self) -> Result<WriterGuard, ProfileEditError> {
+        self.gate.try_lock().map_err(|error| match error {
+            GateError::Busy => ProfileEditError::Busy,
+            GateError::Unavailable | GateError::Io => ProfileEditError::Storage,
+        })
+    }
+
+    fn commit_publication(&mut self, record: &ImportRecord) -> Result<(), ImportError> {
+        let import_value = sql_import_id(record.id)?;
+        let profile_value = sql_profile_id(record.profile)?;
+        let expected_value = nonnegative_sql(record.expected_revision.get())?;
+        let next = record
+            .expected_revision
+            .get()
+            .checked_add(1)
+            .ok_or(ImportError::Storage)?;
+        let next_value = nonnegative_sql(next)?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+
+        transaction
+            .execute(
+                "INSERT INTO installed_revisions (id) VALUES (?1)",
+                [import_value],
+            )
+            .map_err(storage_error)?;
+        transaction
+            .execute(
+                "INSERT INTO revision_files (revision_id, ordinal, role, path, len, sha) \
+                 SELECT import_id, ordinal, role, path, len, sha FROM staged_files \
+                 WHERE import_id = ?1",
+                [import_value],
+            )
+            .map_err(storage_error)?;
+
+        match &record.target {
+            ImportTarget::Append { display_name } => {
+                let ordinal = next_ordinal(&transaction, profile_value)?;
+                transaction
+                    .execute(
+                        "INSERT INTO members \
+                         (profile_id, ordinal, installed_id, enabled, display_name) \
+                         VALUES (?1, ?2, ?3, 1, ?4)",
+                        params![profile_value, ordinal, import_value, display_name],
+                    )
+                    .map_err(storage_error)?;
+            }
+            ImportTarget::Replace { member } => {
+                let member_value = sql_member_id(*member)?;
+                let changed = transaction
+                    .execute(
+                        "UPDATE members SET installed_id = ?1 \
+                         WHERE id = ?2 AND profile_id = ?3",
+                        params![import_value, member_value, profile_value],
+                    )
+                    .map_err(storage_error)?;
+                if changed != 1 {
+                    return Err(ImportError::MemberNotFound);
+                }
+            }
+        }
+
+        transaction
+            .execute(
+                "INSERT INTO import_result_members \
+                 (import_id, ordinal, member_id, installed_id, enabled, display_name) \
+                 SELECT ?1, ordinal, id, installed_id, enabled, display_name \
+                 FROM members WHERE profile_id = ?2",
+                params![import_value, profile_value],
+            )
+            .map_err(storage_error)?;
+
+        let changed = transaction
+            .execute(
+                "UPDATE profiles SET revision = ?1 WHERE id = ?2 AND revision = ?3",
+                params![next_value, profile_value, expected_value],
+            )
+            .map_err(storage_error)?;
+        if changed != 1 {
+            return Err(ImportError::StalePlan);
+        }
+
+        let changed = transaction
+            .execute(
+                "UPDATE imports SET state = 'committed', result_revision = ?1 \
+                 WHERE id = ?2 AND state = 'prepared'",
+                params![next_value, import_value],
+            )
+            .map_err(storage_error)?;
+        if changed != 1 {
+            return Err(ImportError::Storage);
+        }
+
+        transaction.commit().map_err(storage_error)
     }
 
     /// Test-only constructor used by the frozen library contract oracle.
@@ -122,36 +343,18 @@ enum StageAdapter {
     Fixture(FixtureStage),
 }
 
-impl StageAdapter {
-    fn prepare(
-        &mut self,
-        input: &mut dyn Read,
-        plan: BeginImport,
-    ) -> Result<PreparedImport, ImportError> {
-        match self {
-            Self::Unavailable(stage) => stage.prepare(input, plan),
-            #[cfg(test)]
-            Self::Fixture(stage) => stage.prepare(input, plan),
-        }
-    }
-}
-
 /// Production seam. Native payload publication arrives in Task 5; until a
 /// qualified adapter exists every prepare attempt is refused rather than faked.
 struct UnavailableStage;
 
 impl UnavailableStage {
-    fn prepare(
-        &mut self,
-        _input: &mut dyn Read,
-        _plan: BeginImport,
-    ) -> Result<PreparedImport, ImportError> {
+    fn prepare(&mut self) -> Result<PreparedImport, ImportError> {
         Err(ImportError::StageUnavailable)
     }
 }
 
-/// Test-only fixture seam. The contract oracle replaces `contract_tests.rs` and
-/// this adapter is filled in with the implementation.
+/// Test-only fixture seam. Its owner record is synthetic and derived from the
+/// staged archive bytes; it is not native evidence.
 #[cfg(test)]
 struct FixtureStage;
 
@@ -159,11 +362,295 @@ struct FixtureStage;
 impl FixtureStage {
     fn prepare(
         &mut self,
-        _input: &mut dyn Read,
-        _plan: BeginImport,
+        connection: &mut Connection,
+        root: &Path,
+        input: &mut dyn Read,
+        profile: ProfileId,
+        expected_revision: ProfileRevision,
+        target: ImportTarget,
     ) -> Result<PreparedImport, ImportError> {
-        Err(ImportError::StageUnavailable)
+        let id = reserve_import(connection, profile, expected_revision, &target)?;
+        let directory = revision_dir(root, id);
+        fs::create_dir(&directory).map_err(|_| ImportError::Storage)?;
+
+        let archive_sha256 = copy_archive(input, &directory.join(ARCHIVE_FILE))?;
+        let owner = synthetic_owner(id, &archive_sha256);
+        let owner_bytes = encode_owner(&owner);
+        let changed = connection
+            .execute(
+                "UPDATE imports SET owner = ?1, archive_sha = ?2 \
+                 WHERE id = ?3 AND state = 'writing'",
+                params![
+                    owner_bytes.as_slice(),
+                    archive_sha256.as_slice(),
+                    sql_import_id(id)?
+                ],
+            )
+            .map_err(storage_error)?;
+        if changed != 1 {
+            return Err(ImportError::Storage);
+        }
+
+        let archive = File::open(directory.join(ARCHIVE_FILE))
+            .map_err(|_| ImportError::Archive(ArchiveError::Io))?;
+        let mut admitted = admit_zip(archive, M1_ZIP_LIMITS).map_err(ImportError::Archive)?;
+
+        let mut payload_files = Vec::with_capacity(admitted.entries().len());
+        for index in 0..admitted.entries().len() {
+            let (relative, declared_len) = {
+                let entry = &admitted.entries()[index];
+                (entry.path.clone(), entry.uncompressed_len)
+            };
+
+            let path = payload_file(&directory, relative.as_str());
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|_| ImportError::Storage)?;
+            }
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|_| ImportError::Storage)?;
+            let mut writer = HashingWriter::new(file);
+            let written = admitted
+                .copy_entry(index, &mut writer)
+                .map_err(ImportError::Archive)?;
+            if written != declared_len {
+                return Err(ImportError::StageChanged);
+            }
+            writer.flush().map_err(|_| ImportError::Storage)?;
+            let (sha256, file) = writer.finish();
+            file.sync_all().map_err(|_| ImportError::Storage)?;
+
+            payload_files.push(PayloadFile {
+                target: TargetFile {
+                    root: RootRole::Data,
+                    relative,
+                },
+                len: written,
+                sha256,
+            });
+        }
+
+        let evidence = StageEvidence {
+            allocation: ImportAllocation {
+                id,
+                revision: InstalledRevisionId::new(id.get()),
+            },
+            archive_sha256,
+            files: payload_files,
+            owner,
+        };
+
+        let expected = evidence
+            .files
+            .iter()
+            .map(|file| ExpectedFile {
+                path: file.target.relative.as_str().to_owned(),
+                len: file.len,
+                sha: file.sha256,
+            })
+            .collect::<Vec<_>>();
+        verify_files(&directory, &evidence.archive_sha256, &expected)?;
+
+        persist_stage(
+            connection,
+            id,
+            &evidence.archive_sha256,
+            &owner_bytes,
+            &evidence.files,
+        )?;
+
+        Ok(PreparedImport {
+            id,
+            profile,
+            expected_revision,
+            archive_sha256: evidence.archive_sha256,
+            files: evidence.files.into_iter().map(|file| file.target).collect(),
+        })
     }
+}
+
+fn validate_label(raw: &str) -> Result<String, ImportError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 120 || trimmed.chars().any(char::is_control) {
+        return Err(ImportError::InvalidName);
+    }
+    Ok(trimmed.to_owned())
+}
+
+#[cfg(test)]
+fn reserve_import(
+    connection: &mut Connection,
+    profile: ProfileId,
+    expected_revision: ProfileRevision,
+    target: &ImportTarget,
+) -> Result<ImportId, ImportError> {
+    let profile_value = sql_profile_id(profile)?;
+    let expected_value = nonnegative_sql(expected_revision.get())?;
+    let (kind, display_name, member_id) = match target {
+        ImportTarget::Append { display_name } => ("append", Some(display_name.as_str()), None),
+        ImportTarget::Replace { member } => ("replace", None, Some(sql_member_id(*member)?)),
+    };
+
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(storage_error)?;
+
+    let revision: Option<i64> = transaction
+        .query_row(
+            "SELECT revision FROM profiles WHERE id = ?1",
+            [profile_value],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage_error)?;
+    let revision = revision.ok_or(ImportError::Storage)?;
+    if revision != expected_value {
+        return Err(ImportError::StalePlan);
+    }
+
+    if let Some(member_value) = member_id {
+        let exists: Option<i64> = transaction
+            .query_row(
+                "SELECT 1 FROM members WHERE id = ?1 AND profile_id = ?2",
+                params![member_value, profile_value],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        if exists.is_none() {
+            return Err(ImportError::MemberNotFound);
+        }
+    }
+
+    transaction
+        .execute(
+            "INSERT INTO imports \
+             (profile_id, expected_revision, target, display_name, member_id, state) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'writing')",
+            params![profile_value, expected_value, kind, display_name, member_id],
+        )
+        .map_err(storage_error)?;
+
+    let rowid = transaction.last_insert_rowid();
+    let id = ImportId::try_from_u64(u64::try_from(rowid).map_err(|_| ImportError::Storage)?)?;
+    transaction.commit().map_err(storage_error)?;
+    Ok(id)
+}
+
+#[cfg(test)]
+fn copy_archive(input: &mut dyn Read, path: &Path) -> Result<[u8; 32], ImportError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|_| ImportError::Storage)?;
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .map_err(|_| ImportError::Archive(ArchiveError::Io))?;
+        if read == 0 {
+            break;
+        }
+        total = total.checked_add(read as u64).ok_or(ImportError::Archive(
+            ArchiveError::LimitExceeded {
+                kind: marduk_core::import::LimitKind::ArchiveBytes,
+            },
+        ))?;
+        if total > M1_ZIP_LIMITS.max_archive_bytes {
+            return Err(ImportError::Archive(ArchiveError::LimitExceeded {
+                kind: marduk_core::import::LimitKind::ArchiveBytes,
+            }));
+        }
+        hasher.update(&buffer[..read]);
+        file.write_all(&buffer[..read])
+            .map_err(|_| ImportError::Storage)?;
+    }
+
+    file.sync_all().map_err(|_| ImportError::Storage)?;
+    Ok(hasher.finalize().into())
+}
+
+#[cfg(test)]
+struct HashingWriter {
+    file: File,
+    hasher: Sha256,
+}
+
+#[cfg(test)]
+impl HashingWriter {
+    fn new(file: File) -> Self {
+        Self {
+            file,
+            hasher: Sha256::new(),
+        }
+    }
+
+    fn finish(self) -> ([u8; 32], File) {
+        (self.hasher.finalize().into(), self.file)
+    }
+}
+
+#[cfg(test)]
+impl std::io::Write for HashingWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let written = self.file.write(buffer)?;
+        self.hasher.update(&buffer[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+#[cfg(test)]
+fn persist_stage(
+    connection: &mut Connection,
+    id: ImportId,
+    archive_sha256: &[u8; 32],
+    owner: &[u8],
+    files: &[PayloadFile],
+) -> Result<(), ImportError> {
+    let import_value = sql_import_id(id)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(storage_error)?;
+
+    for (ordinal, file) in files.iter().enumerate() {
+        let ordinal = i64::try_from(ordinal).map_err(|_| ImportError::Storage)?;
+        let len = i64::try_from(file.len).map_err(|_| ImportError::Storage)?;
+        transaction
+            .execute(
+                "INSERT INTO staged_files (import_id, ordinal, role, path, len, sha) \
+                 VALUES (?1, ?2, 'data', ?3, ?4, ?5)",
+                params![
+                    import_value,
+                    ordinal,
+                    file.target.relative.as_str(),
+                    len,
+                    file.sha256.as_slice()
+                ],
+            )
+            .map_err(storage_error)?;
+    }
+
+    let changed = transaction
+        .execute(
+            "UPDATE imports SET state = 'prepared', archive_sha = ?1, owner = ?2 \
+             WHERE id = ?3 AND state = 'writing'",
+            params![archive_sha256.as_slice(), owner, import_value],
+        )
+        .map_err(storage_error)?;
+    if changed != 1 {
+        return Err(ImportError::Storage);
+    }
+    transaction.commit().map_err(storage_error)
 }
 
 fn configure(connection: &Connection) -> Result<(), ImportError> {
@@ -261,7 +748,7 @@ fn read_snapshot(
     transaction: &Transaction<'_>,
     profile: ProfileId,
 ) -> Result<ProfileSnapshot, ImportError> {
-    let profile_value = i64::try_from(profile.get()).map_err(|_| ImportError::Storage)?;
+    let profile_value = sql_profile_id(profile)?;
     let revision: Option<i64> = transaction
         .query_row(
             "SELECT revision FROM profiles WHERE id = ?1",
@@ -311,7 +798,7 @@ fn read_names(
     transaction: &Transaction<'_>,
     profile: ProfileId,
 ) -> Result<BTreeMap<MemberId, String>, ImportError> {
-    let profile_value = i64::try_from(profile.get()).map_err(|_| ImportError::Storage)?;
+    let profile_value = sql_profile_id(profile)?;
     let rows = {
         let mut statement = transaction
             .prepare("SELECT id, display_name FROM members WHERE profile_id = ?1")
@@ -331,6 +818,492 @@ fn read_names(
     Ok(names)
 }
 
+fn read_profile_revision(
+    connection: &Connection,
+    profile: ProfileId,
+) -> Result<ProfileRevision, ImportError> {
+    let profile_value = sql_profile_id(profile)?;
+    let revision: Option<i64> = connection
+        .query_row(
+            "SELECT revision FROM profiles WHERE id = ?1",
+            [profile_value],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage_error)?;
+    let revision = revision.ok_or(ImportError::Storage)?;
+    Ok(ProfileRevision::new(nonnegative_value(revision)?))
+}
+
+fn ensure_member(
+    connection: &Connection,
+    profile: ProfileId,
+    member: MemberId,
+) -> Result<(), ImportError> {
+    let profile_value = sql_profile_id(profile)?;
+    let member_value = sql_member_id(member)?;
+    let exists: Option<i64> = connection
+        .query_row(
+            "SELECT 1 FROM members WHERE id = ?1 AND profile_id = ?2",
+            params![member_value, profile_value],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage_error)?;
+    if exists.is_none() {
+        return Err(ImportError::MemberNotFound);
+    }
+    Ok(())
+}
+
+fn next_ordinal(transaction: &Transaction<'_>, profile: i64) -> Result<i64, ImportError> {
+    let maximum: Option<i64> = transaction
+        .query_row(
+            "SELECT MAX(ordinal) FROM members WHERE profile_id = ?1",
+            [profile],
+            |row| row.get(0),
+        )
+        .map_err(storage_error)?;
+    let ordinal = match maximum {
+        Some(value) => value.checked_add(1).ok_or(ImportError::Storage)?,
+        None => 0,
+    };
+    if ordinal < 0 {
+        return Err(ImportError::Storage);
+    }
+    Ok(ordinal)
+}
+
+fn read_result_snapshot(
+    connection: &Connection,
+    id: ImportId,
+) -> Result<ProfileSnapshot, ImportError> {
+    let import_value = sql_import_id(id)?;
+    let row: Option<(i64, Option<i64>)> = connection
+        .query_row(
+            "SELECT profile_id, result_revision FROM imports WHERE id = ?1",
+            [import_value],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(storage_error)?;
+    let (profile_value, result_revision) = row.ok_or(ImportError::UnknownImport)?;
+    let result_revision = result_revision.ok_or(ImportError::Storage)?;
+
+    let rows = {
+        let mut statement = connection
+            .prepare(
+                "SELECT member_id, installed_id, enabled FROM import_result_members \
+                 WHERE import_id = ?1 ORDER BY ordinal ASC",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([import_value], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(storage_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(storage_error)?
+    };
+
+    let mut members = Vec::with_capacity(rows.len());
+    for (member, installed, enabled) in rows {
+        members.push(ProfileMember {
+            id: MemberId::new(positive_id(member)?),
+            installed: InstalledRevisionId::new(positive_id(installed)?),
+            enabled: enabled_flag(enabled)?,
+        });
+    }
+
+    Ok(ProfileSnapshot {
+        id: ProfileId::new(positive_id(profile_value)?),
+        revision: ProfileRevision::new(nonnegative_value(result_revision)?),
+        members,
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImportState {
+    Writing,
+    Prepared,
+    Committed,
+    Discarded,
+}
+
+impl ImportState {
+    fn parse(value: &str) -> Result<Self, ImportError> {
+        match value {
+            "writing" => Ok(Self::Writing),
+            "prepared" => Ok(Self::Prepared),
+            "committed" => Ok(Self::Committed),
+            "discarded" => Ok(Self::Discarded),
+            _ => Err(ImportError::Storage),
+        }
+    }
+}
+
+struct ImportRecord {
+    id: ImportId,
+    profile: ProfileId,
+    expected_revision: ProfileRevision,
+    target: ImportTarget,
+    state: ImportState,
+    owner: Option<Vec<u8>>,
+    archive_sha256: Option<[u8; 32]>,
+}
+
+fn load_import(connection: &Connection, id: ImportId) -> Result<ImportRecord, ImportError> {
+    let import_value = sql_import_id(id)?;
+    let row = connection
+        .query_row(
+            "SELECT profile_id, expected_revision, target, display_name, member_id, \
+             state, owner, archive_sha FROM imports WHERE id = ?1",
+            [import_value],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
+                    row.get::<_, Option<Vec<u8>>>(7)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(storage_error)?
+        .ok_or(ImportError::UnknownImport)?;
+
+    let (profile, expected_revision, target, display_name, member_id, state, owner, archive_sha) =
+        row;
+    let target = match target.as_str() {
+        "append" => ImportTarget::Append {
+            display_name: display_name.ok_or(ImportError::Storage)?,
+        },
+        "replace" => ImportTarget::Replace {
+            member: MemberId::new(positive_id(member_id.ok_or(ImportError::Storage)?)?),
+        },
+        _ => return Err(ImportError::Storage),
+    };
+    let archive_sha256 = match archive_sha {
+        Some(bytes) => Some(sha_from_blob(bytes)?),
+        None => None,
+    };
+
+    Ok(ImportRecord {
+        id,
+        profile: ProfileId::new(positive_id(profile)?),
+        expected_revision: ProfileRevision::new(nonnegative_value(expected_revision)?),
+        target,
+        state: ImportState::parse(&state)?,
+        owner,
+        archive_sha256,
+    })
+}
+
+struct StoredFile {
+    path: String,
+    len: u64,
+    sha: [u8; 32],
+}
+
+fn stored_files(connection: &Connection, id: ImportId) -> Result<Vec<StoredFile>, ImportError> {
+    let import_value = sql_import_id(id)?;
+    let rows = {
+        let mut statement = connection
+            .prepare(
+                "SELECT path, len, sha FROM staged_files \
+                 WHERE import_id = ?1 ORDER BY ordinal ASC",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([import_value], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(storage_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(storage_error)?
+    };
+
+    let mut files = Vec::with_capacity(rows.len());
+    for (path, len, sha) in rows {
+        files.push(StoredFile {
+            path,
+            len: nonnegative_value(len)?,
+            sha: sha_from_blob(sha)?,
+        });
+    }
+    Ok(files)
+}
+
+struct ExpectedFile {
+    path: String,
+    len: u64,
+    sha: [u8; 32],
+}
+
+fn verify_stage(
+    connection: &Connection,
+    root: &Path,
+    record: &ImportRecord,
+) -> Result<(), ImportError> {
+    let archive_sha256 = record.archive_sha256.ok_or(ImportError::StageChanged)?;
+    let owner = record.owner.as_deref().ok_or(ImportError::StageChanged)?;
+    let expected_owner = encode_owner(&synthetic_owner(record.id, &archive_sha256));
+    if owner != expected_owner.as_slice() {
+        return Err(ImportError::StageChanged);
+    }
+
+    let expected = stored_files(connection, record.id)?
+        .into_iter()
+        .map(|file| ExpectedFile {
+            path: file.path,
+            len: file.len,
+            sha: file.sha,
+        })
+        .collect::<Vec<_>>();
+    verify_files(&revision_dir(root, record.id), &archive_sha256, &expected)
+}
+
+fn verify_files(
+    directory: &Path,
+    archive_sha256: &[u8; 32],
+    files: &[ExpectedFile],
+) -> Result<(), ImportError> {
+    let archive_path = directory.join(ARCHIVE_FILE);
+    let (actual, _) = hash_file(&archive_path).map_err(|_| ImportError::StageChanged)?;
+    if actual != *archive_sha256 {
+        return Err(ImportError::StageChanged);
+    }
+
+    // The private snapshot is still a bounded, admissible container, not just
+    // bytes with a matching digest.
+    let archive = File::open(&archive_path).map_err(|_| ImportError::StageChanged)?;
+    admit_zip(archive, M1_ZIP_LIMITS).map_err(|_| ImportError::StageChanged)?;
+
+    let payload_root = directory.join(PAYLOAD_DIR);
+    let entries = fs::read_dir(directory).map_err(|_| ImportError::StageChanged)?;
+    for entry in entries {
+        let entry = entry.map_err(|_| ImportError::StageChanged)?;
+        let name = entry.file_name();
+        let kind = entry.file_type().map_err(|_| ImportError::StageChanged)?;
+        match name.to_str() {
+            Some(ARCHIVE_FILE) if kind.is_file() => {}
+            Some(PAYLOAD_DIR) if kind.is_dir() => {}
+            _ => return Err(ImportError::StageChanged),
+        }
+    }
+
+    let mut found = BTreeSet::new();
+    if payload_root.is_dir() {
+        collect_payload_files(&payload_root, "", &mut found)?;
+    } else if !files.is_empty() {
+        return Err(ImportError::StageChanged);
+    }
+
+    let mut expected = BTreeSet::new();
+    for file in files {
+        if !expected.insert(file.path.clone()) {
+            return Err(ImportError::StageChanged);
+        }
+        let path = payload_file(directory, &file.path);
+        let (sha, len) = hash_file(&path).map_err(|_| ImportError::StageChanged)?;
+        if sha != file.sha || len != file.len {
+            return Err(ImportError::StageChanged);
+        }
+    }
+
+    if found != expected {
+        return Err(ImportError::StageChanged);
+    }
+    Ok(())
+}
+
+fn collect_payload_files(
+    root: &Path,
+    prefix: &str,
+    found: &mut BTreeSet<String>,
+) -> Result<(), ImportError> {
+    let entries = fs::read_dir(root).map_err(|_| ImportError::StageChanged)?;
+    for entry in entries {
+        let entry = entry.map_err(|_| ImportError::StageChanged)?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .map(str::to_owned)
+            .ok_or(ImportError::StageChanged)?;
+        let relative = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let kind = entry.file_type().map_err(|_| ImportError::StageChanged)?;
+        if kind.is_dir() {
+            collect_payload_files(&entry.path(), &relative, found)?;
+        } else if kind.is_file() {
+            found.insert(relative);
+        } else {
+            return Err(ImportError::StageChanged);
+        }
+    }
+    Ok(())
+}
+
+fn hash_file(path: &Path) -> std::io::Result<([u8; 32], u64)> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| std::io::Error::other("file too large"))?;
+        hasher.update(&buffer[..read]);
+    }
+    Ok((hasher.finalize().into(), total))
+}
+
+fn is_published(connection: &Connection, id: ImportId) -> Result<bool, ImportError> {
+    let import_value = sql_import_id(id)?;
+    let found: Option<i64> = connection
+        .query_row(
+            "SELECT 1 FROM installed_revisions WHERE id = ?1",
+            [import_value],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage_error)?;
+    Ok(found.is_some())
+}
+
+fn reclaim_stage(root: &Path, id: ImportId, files: &[StoredFile]) -> Result<(), ImportError> {
+    let directory = revision_dir(root, id);
+    remove_if_present(&directory.join(ARCHIVE_FILE))?;
+    for file in files {
+        remove_if_present(&payload_file(&directory, &file.path))?;
+    }
+
+    let payload_root = directory.join(PAYLOAD_DIR);
+    remove_directory_if_empty(&payload_root)?;
+    remove_directory_if_empty(&directory)
+}
+
+fn remove_if_present(path: &Path) -> Result<(), ImportError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(ImportError::Storage),
+    }
+}
+
+fn remove_directory_if_empty(path: &Path) -> Result<(), ImportError> {
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(_) => Err(ImportError::Storage),
+    }
+}
+
+fn revision_dir(root: &Path, id: ImportId) -> PathBuf {
+    root.join(REVISIONS_DIR).join(id.get().to_string())
+}
+
+fn payload_file(revision_directory: &Path, relative: &str) -> PathBuf {
+    let mut path = revision_directory.join(PAYLOAD_DIR);
+    for component in relative.split('/') {
+        path.push(component);
+    }
+    path
+}
+
+fn synthetic_owner(id: ImportId, archive_sha256: &[u8; 32]) -> RootIdentity {
+    let mut fs_id = [0u8; 16];
+    fs_id.copy_from_slice(&archive_sha256[..16]);
+    let mut birth_bytes = [0u8; 8];
+    birth_bytes.copy_from_slice(&archive_sha256[16..24]);
+    let birth = i64::from_le_bytes(birth_bytes);
+
+    #[cfg(windows)]
+    {
+        RootIdentity::from_adapter_evidence(NativeIdentity::Windows {
+            volume_serial: id.get(),
+            file_id: fs_id,
+            creation_100ns: birth,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        RootIdentity::from_adapter_evidence(NativeIdentity::Linux {
+            fs_magic: 0x4d31_0001, // synthetic fixture marker, not a native filesystem
+            fs_id,
+            tree_id: Some(id.get()),
+            ino: id.get(),
+            birth: (birth, 0),
+        })
+    }
+}
+
+fn encode_owner(owner: &RootIdentity) -> Vec<u8> {
+    let mut encoded = vec![1u8];
+    match owner.evidence() {
+        NativeIdentity::Linux {
+            fs_magic,
+            fs_id,
+            tree_id,
+            ino,
+            birth,
+        } => {
+            encoded.push(0);
+            encoded.extend_from_slice(&fs_magic.to_le_bytes());
+            encoded.extend_from_slice(fs_id);
+            match tree_id {
+                Some(tree_id) => {
+                    encoded.push(1);
+                    encoded.extend_from_slice(&tree_id.to_le_bytes());
+                }
+                None => encoded.push(0),
+            }
+            encoded.extend_from_slice(&ino.to_le_bytes());
+            encoded.extend_from_slice(&birth.0.to_le_bytes());
+            encoded.extend_from_slice(&birth.1.to_le_bytes());
+        }
+        NativeIdentity::Windows {
+            volume_serial,
+            file_id,
+            creation_100ns,
+        } => {
+            encoded.push(1);
+            encoded.extend_from_slice(&volume_serial.to_le_bytes());
+            encoded.extend_from_slice(file_id);
+            encoded.extend_from_slice(&creation_100ns.to_le_bytes());
+        }
+    }
+    encoded
+}
+
+fn sha_from_blob(blob: Vec<u8>) -> Result<[u8; 32], ImportError> {
+    blob.try_into().map_err(|_| ImportError::Storage)
+}
+
 fn positive_id(value: i64) -> Result<u64, ImportError> {
     match u64::try_from(value) {
         Ok(value) if value > 0 => Ok(value),
@@ -348,6 +1321,28 @@ fn enabled_flag(value: i64) -> Result<bool, ImportError> {
         1 => Ok(true),
         _ => Err(ImportError::Storage),
     }
+}
+
+fn sql_profile_id(profile: ProfileId) -> Result<i64, ImportError> {
+    if profile.get() == 0 {
+        return Err(ImportError::Storage);
+    }
+    nonnegative_sql(profile.get())
+}
+
+fn sql_member_id(member: MemberId) -> Result<i64, ImportError> {
+    if member.get() == 0 {
+        return Err(ImportError::Storage);
+    }
+    nonnegative_sql(member.get())
+}
+
+fn sql_import_id(id: ImportId) -> Result<i64, ImportError> {
+    nonnegative_sql(id.get())
+}
+
+fn nonnegative_sql(value: u64) -> Result<i64, ImportError> {
+    i64::try_from(value).map_err(|_| ImportError::Storage)
 }
 
 fn gate_error(error: GateError) -> ImportError {
