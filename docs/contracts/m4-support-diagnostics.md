@@ -1,0 +1,30 @@
+# M4-A03: support diagnostics and log sharing
+
+**Status:** Draft, not dispatchable. This covers the support portion of M4-A03, not its packaging, appearance or help work. Keep human-readable logs separate from authoritative operations and recovery records.
+
+## Pinned routes
+
+| Route | Evidence and distinction |
+|---|---|
+| System Information | `gui_qt/settings/view.py:1757–1808` provides selectable local facts and Copy; Copy recollects facts. `Utils/diagnostics/system.py:134–163,265–300` collects runtime/package/renderer facts and displays values for known environment overrides. Retain useful diagnostics, not arbitrary variable values. Copy is local and must match the reviewed facts, not a second collection. |
+| Session log | `gui_qt/app.py:24321–24365` clears the dock and full log while keeping the System Information banner, opens the managed folder, or opens a share prompt. The warning/error filter affects reading, not the full persisted log selected by Share. Use an explicit source and scope for preview; a view filter is not consent to send either a filtered or full log. |
+| Retention | `Utils/config_paths.py:201–247` excludes active paths from age-based pruning and tolerates unavailable logs. Keep bounded manager-owned logs and protect active writers on both platforms. Do not use a filename or age alone to prove ownership, and never prune a recovery journal or unrelated file. |
+| Remote share | `gui_qt/support/log_upload.py:59–80,114–168,171–196` shows size, audience and retention, then reads and scrubs a log tail in the upload worker; there is no byte-level preview. On success it presents and copies a link. `Utils/sharing/paste.py:34–55,72–121` uses a bounded-intent text POST to a third party. A lost reply is not proof that nothing was published. Preserve explicit share and a copyable result, not the live reread or automatic clipboard write. |
+
+## Proposed review and effect boundaries
+
+- Produce one bounded, redacted UTF-8 snapshot with scope and omitted-byte information. Preview shows its text; local export and remote share use its exact bytes. Copy uses the same text with only the native clipboard representation applied (e.g. [Windows `CF_UNICODETEXT`](https://learn.microsoft.com/en-us/windows/win32/dataxchg/standard-clipboard-formats) uses CRLF and a terminator). Clipboard formatting never changes the exported or uploaded bytes. A refresh creates a new snapshot; later appends, rotation and filters never change an existing one. Count the truncation notice in the final cap and test multibyte boundaries. Local export binds a checked destination and preserves any prior bytes on failure or leaves a recoverable operation.
+- Minimize fields before recording them. Follow [OWASP's logging guidance](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html#data-to-exclude): exclude credentials and session grants at the producer, then redact untrusted tool output and errors before preview/export. Allowlist useful diagnostic facts and safe environment values; unknown values are omitted, not copied raw. Keep useful categories, error codes, ordering and path roles without disclosing user paths or private URLs. Use synthetic markers in checks.
+- Remote share requires separate approval of the exact bytes and recipient service, with audience and retention disclosed. Before dispatch, cancel causes no request; after dispatch, dismissal isn't withdrawal. Return verified link, known refusal or unknown outcome. Keep local export available on refusal and uncertainty. No automatic replay of uncertain POST without proven idempotency or evidence it was never applied ([RFC 9110 §9.2.2](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.2.2)). Do not echo returned share links into later default diagnostic exports.
+- **G-EXT remains open.** The [reference host's public documentation](https://paste.c-net.org/) was read on 2026-11-20; it says the ordinary 180-day expiry refreshes on access, and describes exceptions for hosting networks. It documents deletion credentials separately; the pinned client does not acquire them. That is not service approval, verified deletion, a guaranteed maximum lifetime or a reason to choose the same host. Qualify service terms, response identity, retention, and any offered deletion semantics before enabling real sharing. No paste was created, read back or deleted. If the remote route cannot be qualified, local export is still useful but does not close remote-share parity.
+
+## Proposed planner witnesses
+
+| Witness | Fixture and distinguishing result |
+|---|---|
+| `support_snapshot_does_not_reread_live_log` | Preview a bounded session tail with system facts, a filtered-out info line inside the tail and synthetic credential/path markers. Append and rotate while review is open. Export and fake remote body equal the reviewed bytes; clipboard readback equals the reviewed text after decoding and normalizing only native representation. None includes a later log record, split character or secret marker. |
+| `diagnostic_export_refuses_replaced_destination` | Pick an existing file, then replace its identity before the reviewed write. Refuse without modifying either sentinel. Interrupt an approved replacement before publication and verify original bytes or an actionable recovery result. |
+| `support_share_cannot_retry_an_unconfirmed_publication` | Cancel before send: zero transfers. Fake host receives the body and loses the reply: one send and unknown outcome, even after reopening; local export still works. Separately confirm a valid result is copyable; reject a result outside the approved service policy. |
+| `log_clear_and_prune_keep_recovery_and_active_writers` | Clear the current session with both log views open; preserve system context and show subsequent records consistently. Prune one expired manager-owned inactive log, not an old open stream, lookalike user file, or recovery journal; simulated permission failure does not block startup or report deletion. |
+
+Freeze schema, limits, owned storage policy and fake transports before review. No live transfer or filesystem mutation is authorized by this plan.
