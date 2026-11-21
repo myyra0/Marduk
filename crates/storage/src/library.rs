@@ -73,11 +73,19 @@ impl Catalog {
             root: root.to_path_buf(),
             connection,
             gate,
-            stage: match NativeStage::open(root) {
-                Ok(stage) => StageAdapter::Native(stage),
-                Err(_) => StageAdapter::Unavailable(UnavailableStage),
-            },
+            // Native staging stays disconnected until the publication gate
+            // qualifies it. `open_native` below is the retained reservation.
+            stage: StageAdapter::Unavailable(UnavailableStage),
         })
+    }
+
+    /// Reserved native constructor. It is intentionally unreachable from
+    /// [`Catalog::open`] and has no product injection path or feature flag.
+    #[allow(dead_code)]
+    fn open_native(root: &Path) -> Result<StageAdapter, ImportError> {
+        NativeStage::open(root)
+            .map(StageAdapter::Native)
+            .map_err(|_| ImportError::StageUnavailable)
     }
 
     pub fn root(&self) -> &Path {
