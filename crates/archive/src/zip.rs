@@ -436,9 +436,7 @@ fn verify_local_extents<R: Read + Seek>(
         if variables[..name_len] != record.raw_name[..] {
             return Err(ArchiveError::InvalidContainer);
         }
-        if local_extra_has_zip64(&variables[name_len..])? {
-            return Err(ArchiveError::UnsupportedContainer);
-        }
+        parse_extra_fields(&variables[name_len..], &record.raw_name, record.index)?;
 
         let extent = variable_end
             .checked_add(u64::from(record.compressed))
@@ -459,26 +457,6 @@ fn verify_local_extents<R: Read + Seek>(
         }
     }
     Ok(())
-}
-
-fn local_extra_has_zip64(extra: &[u8]) -> Result<bool, ArchiveError> {
-    let mut cursor = 0usize;
-    while cursor < extra.len() {
-        let payload_start = cursor
-            .checked_add(4)
-            .filter(|payload_start| *payload_start <= extra.len())
-            .ok_or(ArchiveError::InvalidContainer)?;
-        let id = u16_at(extra, cursor);
-        let payload_end = payload_start
-            .checked_add(usize::from(u16_at(extra, cursor + 2)))
-            .filter(|payload_end| *payload_end <= extra.len())
-            .ok_or(ArchiveError::InvalidContainer)?;
-        if id == ZIP64_EXTRA_ID {
-            return Ok(true);
-        }
-        cursor = payload_end;
-    }
-    Ok(false)
 }
 
 fn parse_extra_fields(extra: &[u8], raw_name: &[u8], index: usize) -> Result<bool, ArchiveError> {
