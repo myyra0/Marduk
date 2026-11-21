@@ -152,10 +152,14 @@ fn open_error(code: WIN32_ERROR) -> GateError {
 // the 64-bit volume serial from `FileIdInfo` prove containment. Handles pin
 // names without delete sharing.
 //
-// TOCTOU limit: observation is not write authority. The leaf is opened once
-// and hashed, and identity/metadata are re-read after the hash. A writer with
-// sufficient sharing can still change bytes after the final check; a later
-// native effect must re-observe under the same pinned handles.
+// TOCTOU limit: observation is not write authority. The pinned parent identity
+// and its recorded locator are rechecked, the leaf is re-enumerated from that
+// pinned handle, and the opened leaf's `FILE_ID_INFO` must equal the enumerated
+// entry before hashing. A rename of an ancestor changes the pinned parent's
+// final path and is refused. A rename after those checks cannot redirect the
+// opened object to unverified bytes (opened identity is compared again), but a
+// writer with shared access can still change bytes after the final hash; a
+// later native effect must re-observe under the same pinned handles.
 // ---------------------------------------------------------------------------
 mod root {
     use std::fs::File;
@@ -182,15 +186,15 @@ mod root {
         OWNER_SECURITY_INFORMATION,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_ENCRYPTED, FILE_ATTRIBUTE_OFFLINE,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SPARSE_FILE, FILE_ATTRIBUTE_TAG_INFO,
-        FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_NAME_NORMALIZED,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_STREAM_INFO,
-        FileAttributeTagInfo, FileBasicInfo, FileIdExtdDirectoryInfo,
-        FileIdExtdDirectoryRestartInfo, FileIdInfo, FileStandardInfo, FileStreamInfo,
-        GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
-        OPEN_EXISTING, VOLUME_NAME_GUID,
+        CreateFileW, FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_ENCRYPTED,
+        FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SPARSE_FILE,
+        FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO,
+        FILE_INFO_BY_HANDLE_CLASS, FILE_NAME_NORMALIZED, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_STANDARD_INFO, FILE_STREAM_INFO, FileAttributeTagInfo, FileBasicInfo,
+        FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo, FileIdInfo, FileStandardInfo,
+        FileStreamInfo, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
+        GetVolumeInformationByHandleW, OPEN_EXISTING, VOLUME_NAME_GUID,
     };
 
     pub(crate) struct RootDir {
@@ -211,13 +215,26 @@ mod root {
         }
     }
 
+    #[derive(Clone)]
+    struct DirectoryEntry {
+        name: String,
+        attributes: u32,
+        reparse_tag: u32,
+        file_id: [u8; 16],
+        creation_100ns: i64,
+    }
+
     pub(crate) struct ResolvedTarget<'a> {
         /// Held without delete sharing so the resolved parent cannot be
         /// renamed under the pending observation.
-        _parent: File,
+        parent: File,
+        /// Locator observed at resolution; a later ancestor rename changes it.
         parent_path: String,
         parent_identity: RootIdentity,
+        parent_volume: u64,
         leaf: String,
+        /// Identity enumerated from the pinned parent when the leaf existed.
+        leaf_identity: Option<NativeIdentity>,
         _binding: &'a Binding,
     }
 
@@ -303,6 +320,7 @@ mod root {
         let mut parent = binding.data.file.try_clone().map_err(|_| RootError::Io)?;
         let mut parent_path = binding.data.final_path.clone();
         let mut parent_identity = binding.data.identity.clone();
+        let mut parent_volume = binding.data.volume;
 
         for component in components {
             let name = single_match(&parent, component)?;
@@ -319,25 +337,32 @@ mod root {
 
             parent_path = final_path(&opened)?;
             parent_identity = RootIdentity::from_adapter_evidence(identity(&opened)?);
+            parent_volume = file_id(&opened)?.VolumeSerialNumber;
             parent = opened;
         }
 
-        let leaf = match leaf_match(&parent, &leaf_planned)? {
-            Some(name) => {
-                let opened = open_child(&parent_path, &name)?;
+        let (leaf, leaf_identity) = match leaf_match(&parent, &leaf_planned)? {
+            Some(entry) => {
+                let opened = open_child(&parent_path, &entry.name)?;
                 if is_reparse(&attribute_tag(&opened)?) {
                     return Err(RootError::OutsideBoundary);
                 }
-                name
+                let expected = entry_identity(parent_volume, &entry);
+                if identity(&opened)? != expected {
+                    return Err(RootError::TargetUnavailable);
+                }
+                (entry.name, Some(expected))
             }
-            None => leaf_planned,
+            None => (leaf_planned, None),
         };
 
         Ok(ResolvedTarget {
-            _parent: parent,
+            parent,
             parent_path,
             parent_identity,
+            parent_volume,
             leaf,
+            leaf_identity,
             _binding: binding,
         })
     }
@@ -345,7 +370,38 @@ mod root {
     pub(crate) fn observe_target(
         target: &ResolvedTarget<'_>,
     ) -> Result<TargetObservation, RootError> {
-        let path = join(&target.parent_path, &target.leaf);
+        // The pinned parent must still be the object recorded by resolution.
+        if identity(&target.parent).map_err(|_| RootError::TargetUnavailable)?
+            != *target.parent_identity.evidence()
+        {
+            return Err(RootError::TargetUnavailable);
+        }
+        // An ancestor rename or replacement changes the pinned parent's
+        // locator; the recorded path is then stale authority.
+        let current_path = final_path(&target.parent).map_err(|_| RootError::TargetUnavailable)?;
+        if !current_path.eq_ignore_ascii_case(&target.parent_path) {
+            return Err(RootError::TargetUnavailable);
+        }
+
+        // Re-enumerate from the pinned parent, not from a path string.
+        let mut found = matches(&target.parent, &target.leaf)?;
+        if found.is_empty() {
+            return Ok(TargetObservation::Absent);
+        }
+        if found.len() > 1 {
+            return Err(RootError::AmbiguousName);
+        }
+        let entry = found.remove(0);
+        let enumerated = entry_identity(target.parent_volume, &entry);
+        if target
+            .leaf_identity
+            .as_ref()
+            .is_some_and(|expected| *expected != enumerated)
+        {
+            return Err(RootError::TargetUnavailable);
+        }
+
+        let path = join(&current_path, &entry.name);
         let file = match open_path(Path::new(&path)) {
             Ok(file) => file,
             Err(code) if is_missing(code) => return Ok(TargetObservation::Absent),
@@ -356,6 +412,9 @@ mod root {
             }
             Err(_) => return Err(RootError::Io),
         };
+        if identity(&file).map_err(|_| RootError::Io)? != enumerated {
+            return Err(RootError::TargetUnavailable);
+        }
 
         let tag = attribute_tag(&file)?;
         if is_reparse(&tag) {
@@ -472,7 +531,7 @@ mod root {
             if is_missing(code) {
                 RootError::MissingParent
             } else if is_sharing(code) {
-                RootError::OutsideBoundary
+                RootError::UnsupportedTarget(UnsupportedReason::Sharing)
             } else {
                 RootError::Io
             }
@@ -656,10 +715,10 @@ mod root {
         }
     }
 
-    fn read_directory(directory: &File) -> Result<Vec<String>, RootError> {
+    fn read_directory(directory: &File) -> Result<Vec<DirectoryEntry>, RootError> {
         let mut buffer = vec![0u8; 256 * 1024];
         loop {
-            let mut names = Vec::new();
+            let mut entries = Vec::new();
             let mut restart = true;
             let mut failed = None;
             loop {
@@ -679,7 +738,7 @@ mod root {
                 if ok == 0 {
                     let code = unsafe { GetLastError() };
                     if code == ERROR_NO_MORE_FILES || code == ERROR_HANDLE_EOF {
-                        return Ok(names);
+                        return Ok(entries);
                     }
                     failed = Some(code);
                     break;
@@ -688,7 +747,12 @@ mod root {
 
                 let mut offset = 0usize;
                 loop {
-                    if offset + offset_of!(FILE_ID_EXTD_DIR_INFO, FileName) > buffer.len() {
+                    // The unaligned read below covers the whole fixed record,
+                    // not just the part before the variable-length name.
+                    if offset
+                        .checked_add(size_of::<FILE_ID_EXTD_DIR_INFO>())
+                        .is_none_or(|end| end > buffer.len())
+                    {
                         failed = Some(ERROR_INSUFFICIENT_BUFFER);
                         break;
                     }
@@ -699,7 +763,14 @@ mod root {
                     };
                     let name_offset = offset + offset_of!(FILE_ID_EXTD_DIR_INFO, FileName);
                     let units = info.FileNameLength as usize / 2;
-                    if name_offset + units * 2 > buffer.len() {
+                    let name_bytes = match units.checked_mul(2) {
+                        Some(bytes) => bytes,
+                        None => return Err(RootError::Io),
+                    };
+                    if name_offset
+                        .checked_add(name_bytes)
+                        .is_none_or(|end| end > buffer.len())
+                    {
                         failed = Some(ERROR_INSUFFICIENT_BUFFER);
                         break;
                     }
@@ -713,12 +784,21 @@ mod root {
                         && name != "."
                         && name != ".."
                     {
-                        names.push(name);
+                        entries.push(DirectoryEntry {
+                            name,
+                            attributes: info.FileAttributes,
+                            reparse_tag: info.ReparsePointTag,
+                            file_id: info.FileId.Identifier,
+                            creation_100ns: info.CreationTime,
+                        });
                     }
                     if info.NextEntryOffset == 0 {
                         break;
                     }
-                    offset += info.NextEntryOffset as usize;
+                    offset = match offset.checked_add(info.NextEntryOffset as usize) {
+                        Some(next) => next,
+                        None => return Err(RootError::Io),
+                    };
                 }
                 if failed.is_some() {
                     break;
@@ -737,12 +817,12 @@ mod root {
         let mut found = matches(directory, component)?;
         match found.len() {
             0 => Err(RootError::MissingParent),
-            1 => Ok(found.remove(0)),
+            1 => Ok(found.remove(0).name),
             _ => Err(RootError::AmbiguousName),
         }
     }
 
-    fn leaf_match(directory: &File, component: &str) -> Result<Option<String>, RootError> {
+    fn leaf_match(directory: &File, component: &str) -> Result<Option<DirectoryEntry>, RootError> {
         let mut found = matches(directory, component)?;
         match found.len() {
             0 => Ok(None),
@@ -751,30 +831,35 @@ mod root {
         }
     }
 
-    fn matches(directory: &File, component: &str) -> Result<Vec<String>, RootError> {
+    fn matches(directory: &File, component: &str) -> Result<Vec<DirectoryEntry>, RootError> {
         Ok(read_directory(directory)?
             .into_iter()
-            .filter(|name| name.eq_ignore_ascii_case(component))
+            .filter(|entry| entry.name.eq_ignore_ascii_case(component))
             .collect())
     }
 
+    fn entry_identity(volume: u64, entry: &DirectoryEntry) -> NativeIdentity {
+        NativeIdentity::Windows {
+            volume_serial: volume,
+            file_id: entry.file_id,
+            creation_100ns: entry.creation_100ns,
+        }
+    }
+
     fn has_marker(installation: &RootDir, layout: &GameLayout) -> Result<bool, RootError> {
+        // Name, attributes and reparse state come from the pinned installation
+        // directory enumeration; no game binary is opened.
+        let entries = read_directory(&installation.file)?;
         for marker in layout.markers {
             if !ordinary_component(marker) {
                 continue;
             }
-            let path = join(&installation.final_path, marker);
-            let file = match open_path(Path::new(&path)) {
-                Ok(file) => file,
-                Err(code) if is_missing(code) || is_sharing(code) => continue,
-                Err(_) => return Err(RootError::Io),
-            };
-            let tag = attribute_tag(&file)?;
-            if is_reparse(&tag) {
-                continue;
-            }
-            let standard = standard_info(&file)?;
-            if !standard.Directory {
+            if entries.iter().any(|entry| {
+                entry.name.eq_ignore_ascii_case(marker)
+                    && entry.attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
+                        == 0
+                    && entry.reparse_tag == 0
+            }) {
                 return Ok(true);
             }
         }
@@ -820,7 +905,10 @@ mod root {
 
             let mut offset = 0usize;
             loop {
-                if offset + offset_of!(FILE_STREAM_INFO, StreamName) > buffer.len() {
+                if offset
+                    .checked_add(size_of::<FILE_STREAM_INFO>())
+                    .is_none_or(|end| end > buffer.len())
+                {
                     return Err(RootError::Io);
                 }
                 let info = unsafe {
@@ -828,7 +916,14 @@ mod root {
                 };
                 let name_offset = offset + offset_of!(FILE_STREAM_INFO, StreamName);
                 let units = info.StreamNameLength as usize / 2;
-                if name_offset + units * 2 > buffer.len() {
+                let name_bytes = match units.checked_mul(2) {
+                    Some(bytes) => bytes,
+                    None => return Err(RootError::Io),
+                };
+                if name_offset
+                    .checked_add(name_bytes)
+                    .is_none_or(|end| end > buffer.len())
+                {
                     return Err(RootError::Io);
                 }
                 let name = unsafe {
@@ -843,7 +938,10 @@ mod root {
                 if info.NextEntryOffset == 0 {
                     return Ok(false);
                 }
-                offset += info.NextEntryOffset as usize;
+                offset = match offset.checked_add(info.NextEntryOffset as usize) {
+                    Some(next) => next,
+                    None => return Err(RootError::Io),
+                };
             }
         }
     }

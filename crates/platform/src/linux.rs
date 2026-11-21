@@ -116,10 +116,27 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::os::fd::RawFd;
 
+const EXT4_SUPER_MAGIC: u64 = 0xef53;
 const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
 const BTRFS_FIRST_FREE_OBJECTID: u64 = 256;
 /// `_IOR('f', 1, long)` from `linux/fs.h`.
 const FS_IOC_GETFLAGS: libc::c_ulong = 0x8008_6601;
+// `linux/fs.h`: the only ordinary file flags accepted for an original.
+const FS_IMMUTABLE_FL: libc::c_long = 0x0000_0010;
+const FS_APPEND_FL: libc::c_long = 0x0000_0020;
+const FS_ENCRYPT_FL: libc::c_long = 0x0000_0800;
+const FS_VERITY_FL: libc::c_long = 0x0010_0000;
+const FS_NOCOW_FL: libc::c_long = 0x0080_0000;
+const FS_DAX_FL: libc::c_long = 0x0200_0000;
+const FS_FL_USER_MODIFIABLE: libc::c_long = 0x0003_80ff;
+const UNSUPPORTED_FILE_FLAGS: libc::c_long =
+    FS_APPEND_FL | FS_IMMUTABLE_FL | FS_NOCOW_FL | FS_DAX_FL | FS_ENCRYPT_FL | FS_VERITY_FL;
+
+/// A file is eligible only when it carries no flag we cannot preserve. Ordinary
+/// extent-mapped ext4 files carry `FS_EXTENT_FL`; that is not unsupported.
+fn flags_are_supported(flags: libc::c_long) -> bool {
+    flags & (UNSUPPORTED_FILE_FLAGS | FS_FL_USER_MODIFIABLE) == 0
+}
 /// `_IOR(0x94, 31, struct btrfs_ioctl_fs_info_args)`; the struct is 1 KiB.
 const BTRFS_IOC_FS_INFO: libc::c_ulong = 0x8400_941f;
 /// `_IOWR(0x94, 18, struct btrfs_ioctl_ino_lookup_args)`; the struct is 4 KiB.
@@ -311,7 +328,7 @@ pub(crate) fn observe_target(target: &ResolvedTarget<'_>) -> Result<TargetObserv
     }
     if stx.stx_nlink > 1
         || stx.stx_uid != unsafe { libc::geteuid() } as u32
-        || stx.stx_gid != unsafe { libc::getegid() } as u32
+        || !group_is_current(stx.stx_gid)
         || stx.stx_mode as u32 & 0o7000 != 0
     {
         return Ok(TargetObservation::Unsupported {
@@ -522,15 +539,23 @@ fn identity_from(file: &File, stx: &libc::statx) -> Result<NativeIdentity, RootE
         ));
     }
     let (magic, fsid_words) = statfs_of(file)?;
-    let (fs_id, tree_id) = if magic == BTRFS_SUPER_MAGIC {
-        (btrfs_fsid(file)?, Some(btrfs_tree_id(file)?))
-    } else {
-        if fsid_words == [0, 0] {
+    let (fs_id, tree_id) = match magic {
+        BTRFS_SUPER_MAGIC => (btrfs_fsid(file)?, Some(btrfs_tree_id(file)?)),
+        EXT4_SUPER_MAGIC => {
+            if fsid_words == [0, 0] {
+                return Err(RootError::UnsupportedTarget(
+                    UnsupportedReason::Configuration,
+                ));
+            }
+            (encode_words(fsid_words), None)
+        }
+        // Only the qualified Linux filesystems are accepted; a btime and a
+        // nonzero fsid alone do not widen the supported scope.
+        _ => {
             return Err(RootError::UnsupportedTarget(
                 UnsupportedReason::Configuration,
             ));
         }
-        (encode_words(fsid_words), None)
     };
     Ok(NativeIdentity::Linux {
         fs_magic: magic,
@@ -643,7 +668,7 @@ fn supported_metadata(file: &File) -> Result<bool, RootError> {
             Some(libc::ENOTTY) | Some(libc::EOPNOTSUPP) => {}
             _ => return Err(RootError::Io),
         }
-    } else if flags != 0 {
+    } else if !flags_are_supported(flags) {
         return Ok(false);
     }
 
@@ -658,6 +683,24 @@ fn supported_metadata(file: &File) -> Result<bool, RootError> {
         }
     }
     Ok(true)
+}
+
+/// The effective group and every supplementary group can be restored without
+/// changing ownership.
+fn group_is_current(gid: u32) -> bool {
+    if gid == unsafe { libc::getegid() } as u32 {
+        return true;
+    }
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if count <= 0 {
+        return false;
+    }
+    let mut groups = vec![0 as libc::gid_t; count as usize];
+    let read = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+    read >= 0
+        && groups[..read as usize]
+            .iter()
+            .any(|group| *group as u32 == gid)
 }
 
 fn has_marker(directory: &File, layout: &GameLayout) -> Result<bool, RootError> {
@@ -760,6 +803,10 @@ fn reject_link(parent: &File, name: &str) -> Result<(), RootError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "linux_root_tests.rs"]
+mod linux_root_tests;
 
 #[cfg(test)]
 mod tests {
