@@ -1,3 +1,4 @@
 .logs/
 .superpowers/
 harness.env
+/target/
