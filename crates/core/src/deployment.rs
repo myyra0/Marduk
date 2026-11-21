@@ -391,6 +391,7 @@ pub fn commit_deployment<J: Journal, P: DeploymentInputs>(
             StepPhase::Attempting,
             None,
         )?;
+        crate::recovery::inspect_checked(journal, port, step)?;
         let outcome = execute(port, step)?;
         settle_forward(journal, port, op, step, outcome)?;
     }
@@ -398,7 +399,7 @@ pub fn commit_deployment<J: Journal, P: DeploymentInputs>(
     // Recheck every visible target, consumed stage and retained pre-image
     // without pretending later external edits are excluded.
     for step in &steps {
-        let evidence = port.inspect_step(step);
+        let evidence = crate::recovery::inspect_checked(journal, port, step)?;
         if let Err(error) = crate::recovery::check_post(port, step, &evidence) {
             journal.block(op, Some(error))?;
             return Err(error);
@@ -510,12 +511,13 @@ pub fn restore<J: Journal, P: DeploymentInputs>(
             StepPhase::Attempting,
             None,
         )?;
+        crate::recovery::inspect_checked(journal, port, step)?;
         let outcome = execute(port, step)?;
         settle_forward(journal, port, op, step, outcome)?;
     }
 
     for step in &steps {
-        let evidence = port.inspect_step(step);
+        let evidence = crate::recovery::inspect_checked(journal, port, step)?;
         if let Err(error) = crate::recovery::check_post(port, step, &evidence) {
             journal.block(op, Some(error))?;
             return Err(error);
@@ -532,7 +534,7 @@ fn validate_prepared<J: Journal, P: CopyEffects>(
     steps: &[PreparedStep],
 ) -> Result<(), DeployError> {
     for step in steps {
-        let evidence = port.inspect_step(step);
+        let evidence = crate::recovery::inspect_checked(journal, port, step)?;
         if let Err(error) = crate::recovery::check_pre(port, step, &evidence) {
             journal.block(op, Some(error))?;
             return Err(error);
@@ -636,9 +638,10 @@ pub(crate) fn settle_forward<J: Journal, P: CopyEffects>(
     step: &PreparedStep,
     outcome: EffectOutcome,
 ) -> Result<(), DeployError> {
-    let evidence = effect_evidence(journal, op, step, outcome)?;
+    let evidence = effect_evidence(journal, port, op, step, outcome)?;
     match port.durability_barrier(step, &evidence) {
         BarrierOutcome::Durable(evidence) => {
+            crate::recovery::check_displacements(journal, port, step, &evidence)?;
             if let Err(error) = validate_settled(step, &evidence) {
                 journal.block(op, Some(error))?;
                 return Err(error);
@@ -656,21 +659,35 @@ pub(crate) fn settle_forward<J: Journal, P: CopyEffects>(
             journal.block(op, Some(error))?;
             Err(error)
         }
-        BarrierOutcome::Ambiguous(_) => {
+        BarrierOutcome::Ambiguous(evidence) => {
+            crate::recovery::check_displacements(journal, port, step, &evidence)?;
             journal.block(op, Some(DeployError::Io))?;
             Err(DeployError::Io)
         }
     }
 }
 
-pub(crate) fn effect_evidence<J: Journal>(
+pub(crate) fn effect_evidence<J: Journal, P: CopyEffects>(
     journal: &mut J,
+    port: &mut P,
     op: OperationId,
     step: &PreparedStep,
     outcome: EffectOutcome,
 ) -> Result<Evidence, DeployError> {
+    // A success/ambiguity/conflict receipt is not an inventory of private
+    // slots. Observe those independently, including the reserved alternate.
+    let inspected = crate::recovery::inspect_checked(journal, port, step);
+    if let EffectOutcome::Observed(evidence)
+    | EffectOutcome::Conflict(evidence)
+    | EffectOutcome::Ambiguous(evidence) = &outcome
+    {
+        if crate::recovery::preserve_canonical_displacement(journal, step, evidence)? {
+            return Err(DeployError::RecoveryConflict);
+        }
+    }
     match outcome {
         EffectOutcome::Observed(evidence) => {
+            inspected?;
             if let Err(error) = validate_settled(step, &evidence) {
                 journal.block(op, Some(error))?;
                 return Err(error);
@@ -680,20 +697,25 @@ pub(crate) fn effect_evidence<J: Journal>(
         EffectOutcome::Displaced { evidence, at } => {
             if at != step.retain || validate_settled(step, &evidence).is_err() {
                 journal.block_displacement(op, step, at, &evidence)?;
+                inspected?;
                 return Err(DeployError::RecoveryConflict);
             }
+            inspected?;
             Ok(evidence)
         }
         EffectOutcome::Conflict(_) => {
+            inspected?;
             journal.block(op, Some(DeployError::RecoveryConflict))?;
             Err(DeployError::RecoveryConflict)
         }
         EffectOutcome::Unavailable(error) => {
+            inspected?;
             let error = map_root_error(error);
             journal.block(op, Some(error))?;
             Err(error)
         }
         EffectOutcome::Ambiguous(_) => {
+            inspected?;
             journal.block(op, Some(DeployError::Io))?;
             Err(DeployError::Io)
         }

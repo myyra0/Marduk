@@ -19,3 +19,16 @@ CREATE TABLE IF NOT EXISTS unexpected_displacements (
     evidence BLOB NOT NULL,
     FOREIGN KEY (operation_id, ordinal) REFERENCES operation_steps (operation_id, ordinal)
 ) STRICT;
+
+CREATE TABLE IF NOT EXISTS displacement_evidence (
+    operation_id INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    direction INTEGER NOT NULL CHECK (direction IN (0, 1)),
+    reported_ref BLOB NOT NULL,
+    evidence BLOB NOT NULL,
+    PRIMARY KEY (operation_id, ordinal, direction, reported_ref),
+    FOREIGN KEY (operation_id, ordinal) REFERENCES operation_steps (operation_id, ordinal)
+) STRICT;
+
+INSERT OR IGNORE INTO displacement_evidence SELECT * FROM unexpected_displacements;
+DELETE FROM unexpected_displacements;

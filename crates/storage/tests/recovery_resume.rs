@@ -1,6 +1,4 @@
-//! Review-fix recovery witnesses against the real journal with a synthetic
-//! in-memory effect port: undo-row reuse, restore continuation, evidence
-//! validation and blocker reporting.
+// Recovery witnesses against the real journal with a synthetic effect port.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -427,6 +425,10 @@ impl CopyEffects for MemEffects {
 
     fn inspect_step(&mut self, step: &PreparedStep) -> Evidence {
         self.inspect(step)
+    }
+
+    fn inspect_alternate_displacement(&mut self, step: &PreparedStep) -> Artifact {
+        self.artifact(self.backups.get(&step.alternate_displacement()))
     }
 
     fn durability_barrier(&mut self, step: &PreparedStep, _: &Evidence) -> BarrierOutcome {

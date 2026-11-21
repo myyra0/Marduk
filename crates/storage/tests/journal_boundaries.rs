@@ -1,5 +1,63 @@
 include!("operation_journal.rs");
 
+#[test]
+fn editing_only_the_revision_does_not_refresh_an_approved_plan() {
+    let dir = fixture_v1();
+    let mut journal = open_fixture(&dir);
+    let mut reviewed = plan(&mut journal);
+    let db = Connection::open(dir.path().join(DB)).unwrap();
+    db.execute("UPDATE profiles SET revision = 8", []).unwrap();
+    db.execute("UPDATE deployment_plans SET revision = 8", [])
+        .unwrap();
+    assert!(journal.plan(reviewed.id).is_err());
+    reviewed.revision = ProfileRevision::new(8);
+    assert!(journal.claim(Claim::Deploy(reviewed)).is_err());
+    root_state(&mut journal, None, None);
+}
+
+#[test]
+fn seal_rejects_header_changed_after_claim() {
+    let (dir, mut journal, op) = claimed_fixture();
+    Connection::open(dir.path().join(DB))
+        .unwrap()
+        .execute("UPDATE deployment_plans SET revision = 8", [])
+        .unwrap();
+    assert!(journal.seal(op, vec![prepared(op)]).is_err());
+    root_state(&mut journal, Some(op), None);
+}
+
+#[test]
+fn swapping_the_plan_root_pair_invalidates_approval() {
+    let dir = fixture_v1();
+    let mut journal = open_fixture(&dir);
+    let mut reviewed = plan(&mut journal);
+    reviewed.installation = root(5);
+    reviewed.data = root(6);
+    journal
+        .select_verified_installation(Path::new("other"), &reviewed.installation, &reviewed.data)
+        .unwrap();
+    Connection::open(dir.path().join(DB))
+        .unwrap()
+        .execute(
+            "UPDATE deployment_plans SET (installation_id, installation, data) =
+         (SELECT id, installation, data FROM installations WHERE selected = 1)",
+            [],
+        )
+        .unwrap();
+    assert_eq!(journal.plan(reviewed.id), Err(DeployError::StalePlan));
+    assert_eq!(
+        journal.claim(Claim::Deploy(reviewed.clone())),
+        Err(DeployError::StalePlan)
+    );
+    assert_eq!(
+        journal.root_state(&reviewed.data).unwrap(),
+        RootState {
+            pending: None,
+            active: None
+        }
+    );
+}
+
 fn claimed_fixture() -> (TempDir, OperationJournal, OperationId) {
     let dir = fixture_v1();
     let mut journal = open_fixture(&dir);

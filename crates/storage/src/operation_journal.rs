@@ -157,31 +157,14 @@ impl OperationJournal {
             .map_err(|_| DeployError::Io)
     }
 
-    fn read_plan(&self, id: PlanId) -> Result<Option<DeploymentPlan>, DeployError> {
-        let plan_value = sql_id(id.get())?;
-        let row: Option<(i64, i64, Vec<u8>, Vec<u8>)> = self
-            .connection
-            .query_row(
-                "SELECT profile_id, revision, installation, data \
-                 FROM deployment_plans WHERE id = ?1",
-                [plan_value],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()
-            .map_err(|_| DeployError::Io)?;
-        let Some((profile, revision, installation, data)) = row else {
-            return Ok(None);
-        };
-
-        let intents = read_intents(&self.connection, plan_value)?;
-        Ok(Some(DeploymentPlan {
-            id,
-            profile: ProfileId::new(nonnegative(profile)?),
-            revision: ProfileRevision::new(nonnegative(revision)?),
-            installation: decode_root(&installation)?,
-            data: decode_root(&data)?,
-            intents,
-        }))
+    /// The observations behind the retained refs reported by operation status.
+    pub fn unexpected_displacements(
+        &mut self,
+        op: OperationId,
+    ) -> Result<Vec<(BackupRef, Evidence)>, DeployError> {
+        let read = self.connection.transaction().map_err(|_| DeployError::Io)?;
+        let steps = read_steps(&read, op)?;
+        owned_displacements(&read, op, &steps)
     }
 }
 
@@ -223,31 +206,33 @@ impl Journal for OperationJournal {
             .map_err(|_| DeployError::Io)?;
         let plan_value = transaction.last_insert_rowid();
         let id = PlanId::try_from_u64(row_id(plan_value)?)?;
-
-        for (ordinal, intent) in intents.iter().enumerate() {
-            let ordinal = i64::try_from(ordinal).map_err(|_| DeployError::Io)?;
-            write_intent(&transaction, plan_value, ordinal, intent)?;
-        }
-        transaction
-            .execute(
-                "INSERT INTO plan_proofs (plan_id, intents_sha) VALUES (?1, ?2)",
-                params![plan_value, plan_digest(&intents).as_slice()],
-            )
-            .map_err(|_| DeployError::Io)?;
-        transaction.commit().map_err(|_| DeployError::Io)?;
-
-        Ok(DeploymentPlan {
+        let plan = DeploymentPlan {
             id,
             profile,
             revision,
             installation,
             data,
             intents,
-        })
+        };
+
+        for (ordinal, intent) in plan.intents.iter().enumerate() {
+            let ordinal = i64::try_from(ordinal).map_err(|_| DeployError::Io)?;
+            write_intent(&transaction, plan_value, ordinal, intent)?;
+        }
+        transaction
+            .execute(
+                "INSERT INTO plan_proofs (plan_id, intents_sha) VALUES (?1, ?2)",
+                params![plan_value, plan_digest(&plan).as_slice()],
+            )
+            .map_err(|_| DeployError::Io)?;
+        transaction.commit().map_err(|_| DeployError::Io)?;
+
+        Ok(plan)
     }
 
     fn plan(&mut self, id: PlanId) -> Result<Option<DeploymentPlan>, DeployError> {
-        self.read_plan(id)
+        let read = self.connection.transaction().map_err(|_| DeployError::Io)?;
+        read_plan(&read, id)
     }
 
     fn claimed(&mut self, id: PlanId) -> Result<Option<OperationStatus>, DeployError> {
@@ -318,26 +303,11 @@ impl Journal for OperationJournal {
             match &claim {
                 Claim::Deploy(plan) => {
                     let plan_value = sql_id(plan.id.get())?;
-                    let stored: Option<(Vec<u8>, Vec<u8>)> = transaction
-                        .query_row(
-                            "SELECT installation, data FROM deployment_plans WHERE id = ?1",
-                            [plan_value],
-                            |row| Ok((row.get(0)?, row.get(1)?)),
-                        )
-                        .optional()
-                        .map_err(|_| DeployError::Io)?;
-                    let Some((stored_installation, stored_data)) = stored else {
-                        return Err(DeployError::StalePlan);
-                    };
-                    if stored_installation != encode_root(&plan.installation)
-                        || stored_data != encode_root(&plan.data)
-                    {
-                        return Err(DeployError::StalePlan);
-                    }
                     if let Some(op) = operation_for_plan(&transaction, plan_value)? {
+                        read_status(&transaction, op)?;
                         return Ok(op);
                     }
-                    if read_intents(&transaction, plan_value)? != plan.intents {
+                    if read_plan(&transaction, plan.id)?.as_ref() != Some(plan) {
                         return Err(DeployError::StalePlan);
                     }
                     (
@@ -660,22 +630,17 @@ impl Journal for OperationJournal {
             .into_iter()
             .find(|row| row.prepared.ordinal == step.ordinal)
             .ok_or(DeployError::Io)?;
-        let attempting = match (step.direction, operation.phase, row.phase) {
-            (StepDirection::Forward, Phase::Applying | Phase::Restoring, StepPhase::Attempting) => {
-                step == &row.prepared
-            }
-            (StepDirection::Undo, Phase::RollingBack, StepPhase::UndoAttempting) => {
-                row.undo.as_ref() == Some(step)
-            }
-            _ => false,
+        let sealed = match step.direction {
+            StepDirection::Forward => step == &row.prepared,
+            StepDirection::Undo => row.undo.as_ref() == Some(step),
         };
-        if !attempting {
+        if !sealed || operation.phase.is_terminal() {
             return Err(DeployError::Io);
         }
         let op_value = sql_id(op.get())?;
         transaction.execute(
-            "INSERT INTO unexpected_displacements (operation_id, ordinal, direction, reported_ref, evidence)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO displacement_evidence (operation_id, ordinal, direction, reported_ref, evidence)
+             VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT DO NOTHING",
             params![op_value, i64::from(step.ordinal), direction_tag(step.direction), encode_backup(at), encode_evidence(evidence)],
         ).map_err(|_| DeployError::Io)?;
         transaction
@@ -1091,22 +1056,11 @@ fn read_status(
         }
     }
     let displacement = read_displacement(connection, op)?;
-    if let Some((ordinal, direction, at)) = displacement {
-        let row = steps
-            .iter()
-            .find(|row| row.prepared.ordinal == ordinal)
-            .ok_or(DeployError::Io)?;
-        if !(matches!(
-            (direction, row.phase),
-            (StepDirection::Forward, StepPhase::Attempting)
-                | (StepDirection::Undo, StepPhase::UndoAttempting)
-        )) {
-            return Err(DeployError::Io);
-        }
-        if at.operation() == op && at.ordinal() == ordinal && at.direction() == direction {
-            retained.insert(at);
-        }
-    }
+    retained.extend(
+        owned_displacements(connection, op, &steps)?
+            .into_iter()
+            .map(|(at, _)| at),
+    );
     let generation = match (row.kind, row.phase) {
         (OperationKind::Deploy, Phase::Completed) => row.result_generation,
         (OperationKind::Restore, Phase::Completed) => None,
@@ -1142,7 +1096,16 @@ fn read_steps(connection: &Connection, op: OperationId) -> Result<Vec<StepRecord
         .map_err(|_| DeployError::Io)?;
     let approved = operation
         .plan_id
-        .map(|plan| read_intents(connection, plan))
+        .map(|plan| {
+            let plan = read_plan(connection, PlanId::try_from_u64(row_id(plan)?)?)?
+                .ok_or(DeployError::Io)?;
+            if encode_root(&plan.installation) != operation.installation
+                || encode_root(&plan.data) != operation.data
+            {
+                return Err(DeployError::Io);
+            }
+            Ok(plan.intents)
+        })
         .transpose()?;
     let bindings = deploy
         .map(|deploy| deploy_bindings(connection, deploy))
@@ -1441,10 +1404,14 @@ fn stage_matches_output(step: &PreparedStep, original: &PreState) -> bool {
     }
 }
 
-fn plan_digest(intents: &[FileIntent]) -> [u8; 32] {
+fn plan_digest(plan: &DeploymentPlan) -> [u8; 32] {
     let mut digest = Sha256::new();
-    digest.update(b"marduk-plan-v1");
-    for intent in intents {
+    digest.update(b"marduk-plan-v2");
+    digest.update(plan.profile.get().to_le_bytes());
+    digest.update(plan.revision.get().to_le_bytes());
+    hash_record(&mut digest, &encode_root(&plan.installation));
+    hash_record(&mut digest, &encode_root(&plan.data));
+    for intent in &plan.intents {
         hash_record(&mut digest, &encode_bound(&intent.target));
         hash_record(&mut digest, &encode_source(&intent.source));
         hash_record(&mut digest, &encode_pre_state(&intent.original));
@@ -1454,9 +1421,10 @@ fn plan_digest(intents: &[FileIntent]) -> [u8; 32] {
 
 fn steps_digest<'a>(steps: impl IntoIterator<Item = &'a PreparedStep>) -> [u8; 32] {
     let mut digest = Sha256::new();
-    digest.update(b"marduk-seal-v1");
+    digest.update(b"marduk-seal-v2");
     for step in steps {
         hash_record(&mut digest, &encode_prepared(step));
+        hash_record(&mut digest, &encode_backup(step.alternate_displacement()));
     }
     digest.finalize().into()
 }
@@ -1473,29 +1441,58 @@ fn direction_tag(direction: StepDirection) -> i64 {
     }
 }
 
-fn read_displacement(
+fn read_displacement(connection: &Connection, op: OperationId) -> Result<Option<()>, DeployError> {
+    connection
+        .query_row(
+            "SELECT 1 FROM displacement_evidence WHERE operation_id = ?1 LIMIT 1",
+            [sql_id(op.get())?],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|_| DeployError::Io)
+}
+
+fn owned_displacements(
     connection: &Connection,
     op: OperationId,
-) -> Result<Option<(u32, StepDirection, BackupRef)>, DeployError> {
-    let row: Option<(i64, i64, Vec<u8>, Vec<u8>)> = connection.query_row(
-        "SELECT ordinal, direction, reported_ref, evidence FROM unexpected_displacements WHERE operation_id = ?1",
-        [sql_id(op.get())?],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-    ).optional().map_err(|_| DeployError::Io)?;
-    row.map(|(ordinal, direction, at, evidence)| {
-        decode_evidence(&evidence)?;
-        let direction = match direction {
-            0 => StepDirection::Forward,
-            1 => StepDirection::Undo,
+    steps: &[StepRecord],
+) -> Result<Vec<(BackupRef, Evidence)>, DeployError> {
+    let mut query = connection
+        .prepare(
+            "SELECT ordinal, direction, reported_ref, evidence FROM displacement_evidence
+         WHERE operation_id = ?1 ORDER BY ordinal, direction, reported_ref",
+        )
+        .map_err(|_| DeployError::Io)?;
+    let rows = query
+        .query_map([sql_id(op.get())?], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })
+        .map_err(|_| DeployError::Io)?;
+    let mut owned = Vec::new();
+    for row in rows {
+        let (ordinal, direction, at, evidence) = row.map_err(|_| DeployError::Io)?;
+        let ordinal = u32::try_from(ordinal).map_err(|_| DeployError::Io)?;
+        let row = steps
+            .iter()
+            .find(|row| row.prepared.ordinal == ordinal)
+            .ok_or(DeployError::Io)?;
+        let step = match direction {
+            0 => &row.prepared,
+            1 => row.undo.as_ref().ok_or(DeployError::Io)?,
             _ => return Err(DeployError::Io),
         };
-        Ok((
-            u32::try_from(ordinal).map_err(|_| DeployError::Io)?,
-            direction,
-            decode_backup(&at)?,
-        ))
-    })
-    .transpose()
+        let at = decode_backup(&at)?;
+        let evidence = decode_evidence(&evidence)?;
+        if at.operation() == op && at.ordinal() == ordinal && at.direction() == step.direction {
+            owned.push((at, evidence));
+        }
+    }
+    Ok(owned)
 }
 
 fn validate_undo(forward: &PreparedStep, undo: &PreparedStep) -> Result<(), DeployError> {
@@ -1545,6 +1542,40 @@ fn validate_undo(forward: &PreparedStep, undo: &PreparedStep) -> Result<(), Depl
         _ => return Err(DeployError::Io),
     }
     Ok(())
+}
+
+fn read_plan(connection: &Connection, id: PlanId) -> Result<Option<DeploymentPlan>, DeployError> {
+    let key = sql_id(id.get())?;
+    let row: Option<(i64, i64, Vec<u8>, Vec<u8>)> = connection
+        .query_row(
+            "SELECT profile_id, revision, installation, data FROM deployment_plans WHERE id = ?1",
+            [key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|_| DeployError::Io)?;
+    let Some((profile, revision, installation, data)) = row else {
+        return Ok(None);
+    };
+    let plan = DeploymentPlan {
+        id,
+        profile: ProfileId::new(nonnegative(profile)?),
+        revision: ProfileRevision::new(nonnegative(revision)?),
+        installation: decode_root(&installation)?,
+        data: decode_root(&data)?,
+        intents: read_intents(connection, key)?,
+    };
+    let digest: Vec<u8> = connection
+        .query_row(
+            "SELECT intents_sha FROM plan_proofs WHERE plan_id = ?1",
+            [key],
+            |row| row.get(0),
+        )
+        .map_err(|_| DeployError::Io)?;
+    if digest != plan_digest(&plan) {
+        return Err(DeployError::StalePlan);
+    }
+    Ok(Some(plan))
 }
 
 fn read_intents(connection: &Connection, plan: i64) -> Result<Vec<FileIntent>, DeployError> {
@@ -1609,16 +1640,6 @@ fn read_intents(connection: &Connection, plan: i64) -> Result<Vec<FileIntent>, D
             },
             original: decode_pre_state(&original)?,
         });
-    }
-    let digest: Vec<u8> = connection
-        .query_row(
-            "SELECT intents_sha FROM plan_proofs WHERE plan_id = ?1",
-            [plan],
-            |row| row.get(0),
-        )
-        .map_err(|_| DeployError::Io)?;
-    if digest != plan_digest(&intents) {
-        return Err(DeployError::Io);
     }
     Ok(intents)
 }
@@ -2100,6 +2121,7 @@ fn encode_backup(at: BackupRef) -> Vec<u8> {
         BackupSlot::Original => 0,
         BackupSlot::Step => 1,
         BackupSlot::Displaced => 2,
+        BackupSlot::AlternateDisplaced => 3,
     });
     out
 }
@@ -2117,6 +2139,7 @@ fn decode_backup(blob: &[u8]) -> Result<BackupRef, DeployError> {
         0 => BackupSlot::Original,
         1 => BackupSlot::Step,
         2 => BackupSlot::Displaced,
+        3 => BackupSlot::AlternateDisplaced,
         _ => return Err(DeployError::Io),
     };
     reader.finish()?;

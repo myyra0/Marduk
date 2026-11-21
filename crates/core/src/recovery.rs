@@ -22,6 +22,7 @@ pub enum BackupSlot {
     Original,
     Step,
     Displaced,
+    AlternateDisplaced,
 }
 
 /// Opaque operation-owned backup reference. It never resolves a caller string.
@@ -127,6 +128,19 @@ pub struct PreparedStep {
     pub retain: BackupRef,
 }
 
+impl PreparedStep {
+    /// The only other permitted displacement destination. Its identity is
+    /// derived from the sealed step, not from the effect result.
+    pub fn alternate_displacement(&self) -> BackupRef {
+        BackupRef::from_record(
+            self.op,
+            self.ordinal,
+            self.direction,
+            BackupSlot::AlternateDisplaced,
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepPhase {
     Ready,
@@ -200,6 +214,11 @@ pub trait CopyEffects {
         retain: BackupRef,
     ) -> EffectOutcome;
     fn inspect_step(&mut self, step: &PreparedStep) -> Evidence;
+    /// Inspect the second reserved slot. The default is only for ports that
+    /// never write to an alternate slot.
+    fn inspect_alternate_displacement(&mut self, _step: &PreparedStep) -> Artifact {
+        Artifact::Absent
+    }
     fn durability_barrier(&mut self, step: &PreparedStep, observed: &Evidence) -> BarrierOutcome;
     /// Verify a durable pre-image without creating a stage or touching a target.
     fn validate_backup(&mut self, at: BackupRef, expected: &Fingerprint)
@@ -352,13 +371,94 @@ pub fn recover_pending<J: Journal, P: crate::deployment::DeploymentInputs>(
     }
 
     let status = journal.status(op)?.ok_or(DeployError::UnknownOperation)?;
-    if journal.has_unresolved_displacement(op)? {
-        return Ok(Some(status));
+    // Collect evidence across the operation even after a previous report or
+    // a cut during reporting. Never run another effect past a found artifact.
+    let mut found = false;
+    let mut unavailable = false;
+    for row in journal.steps(op)? {
+        for step in std::iter::once(&row.prepared).chain(row.undo.as_ref()) {
+            let evidence = port.inspect_step(step);
+            match preserve_displacements(journal, port, step, &evidence) {
+                Ok(preserved) => found |= preserved,
+                Err(DeployError::TargetUnavailable) => unavailable = true,
+                Err(error) => return blocked(journal, op, error),
+            }
+        }
+    }
+    if found || journal.has_unresolved_displacement(op)? {
+        return journal.status(op);
+    }
+    if unavailable {
+        return blocked(journal, op, DeployError::TargetUnavailable);
     }
     match status.kind {
         OperationKind::Deploy => recover_deploy(journal, port, op, status),
         OperationKind::Restore => recover_restore(journal, port, op, status),
     }
+}
+
+fn preserve_displacements<J: Journal, P: CopyEffects>(
+    journal: &mut J,
+    port: &mut P,
+    step: &PreparedStep,
+    evidence: &Evidence,
+) -> Result<bool, DeployError> {
+    let mut found = preserve_canonical_displacement(journal, step, evidence)?;
+    match port.inspect_alternate_displacement(step) {
+        Artifact::Absent => {}
+        Artifact::Unavailable if !found => return Err(DeployError::TargetUnavailable),
+        Artifact::Unavailable => {}
+        retained => {
+            let mut evidence = evidence.clone();
+            evidence.retained = retained;
+            journal.block_displacement(step.op, step, step.alternate_displacement(), &evidence)?;
+            found = true;
+        }
+    }
+    Ok(found)
+}
+
+pub(crate) fn preserve_canonical_displacement<J: Journal>(
+    journal: &mut J,
+    step: &PreparedStep,
+    evidence: &Evidence,
+) -> Result<bool, DeployError> {
+    if matches!(
+        evidence.retained,
+        Artifact::Regular(_) | Artifact::Unsupported(_)
+    ) && evidence.retained != crate::deployment::expected_retained(step)
+    {
+        journal.block_displacement(step.op, step, step.retain, evidence)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+pub(crate) fn check_displacements<J: Journal, P: CopyEffects>(
+    journal: &mut J,
+    port: &mut P,
+    step: &PreparedStep,
+    evidence: &Evidence,
+) -> Result<(), DeployError> {
+    match preserve_displacements(journal, port, step, evidence) {
+        Ok(true) => Err(DeployError::RecoveryConflict),
+        Ok(false) => Ok(()),
+        Err(DeployError::TargetUnavailable) => {
+            journal.block(step.op, Some(DeployError::TargetUnavailable))?;
+            Err(DeployError::TargetUnavailable)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn inspect_checked<J: Journal, P: CopyEffects>(
+    journal: &mut J,
+    port: &mut P,
+    step: &PreparedStep,
+) -> Result<Evidence, DeployError> {
+    let evidence = port.inspect_step(step);
+    check_displacements(journal, port, step, &evidence)?;
+    Ok(evidence)
 }
 
 fn recover_deploy<J: Journal, P: CopyEffects>(
@@ -388,7 +488,10 @@ fn recover_deploy<J: Journal, P: CopyEffects>(
         let result = if let Some(undo) = &row.undo {
             resume_undo(journal, port, row, undo)
         } else {
-            let evidence = port.inspect_step(forward);
+            let evidence = match inspect_checked(journal, port, forward) {
+                Ok(evidence) => evidence,
+                Err(error) => return blocked(journal, op, error),
+            };
             if evidence.target == as_observation(&forward.spec.pre) {
                 let result = check_pre(port, forward, &evidence);
                 result.and_then(|()| {
@@ -398,7 +501,7 @@ fn recover_deploy<J: Journal, P: CopyEffects>(
                     if !matches!(row.phase, StepPhase::Ready | StepPhase::Attempting) {
                         return Err(DeployError::RecoveryConflict);
                     }
-                    let durable = barrier(port, forward, &evidence)?;
+                    let durable = barrier(journal, port, forward, &evidence)?;
                     check_pre(port, forward, &durable)?;
                     journal.record_step(
                         op,
@@ -432,15 +535,12 @@ fn recover_deploy<J: Journal, P: CopyEffects>(
     // Recheck earlier resolutions after later effects, before releasing the lease.
     for row in journal.steps(op)? {
         let result = match &row.undo {
-            Some(undo) => {
-                let evidence = port.inspect_step(undo);
-                check_forward_slots(port, &row.prepared)
-                    .and_then(|()| check_post(port, undo, &evidence))
-            }
-            None => {
-                let evidence = port.inspect_step(&row.prepared);
-                check_pre(port, &row.prepared, &evidence)
-            }
+            Some(undo) => check_forward_slots(journal, port, &row.prepared).and_then(|()| {
+                let evidence = inspect_checked(journal, port, undo)?;
+                check_post(port, undo, &evidence)
+            }),
+            None => inspect_checked(journal, port, &row.prepared)
+                .and_then(|evidence| check_pre(port, &row.prepared, &evidence)),
         };
         if let Err(error) = result {
             return blocked(journal, op, error);
@@ -459,8 +559,8 @@ fn resume_undo<J: Journal, P: CopyEffects>(
     undo: &PreparedStep,
 ) -> Result<(), DeployError> {
     let forward = &row.prepared;
-    check_forward_slots(port, forward)?;
-    let evidence = port.inspect_step(undo);
+    check_forward_slots(journal, port, forward)?;
+    let evidence = inspect_checked(journal, port, undo)?;
     if matches!(row.phase, StepPhase::UndoAttempting | StepPhase::Undone)
         && evidence.target == crate::deployment::expected_post(undo)
     {
@@ -468,7 +568,7 @@ fn resume_undo<J: Journal, P: CopyEffects>(
         if row.phase == StepPhase::Undone {
             return Ok(());
         }
-        let durable = barrier(port, undo, &evidence)?;
+        let durable = barrier(journal, port, undo, &evidence)?;
         check_post(port, undo, &durable)?;
         return journal.record_step(
             undo.op,
@@ -495,9 +595,9 @@ fn resume_undo<J: Journal, P: CopyEffects>(
         )?;
     }
     let outcome = crate::deployment::execute_undo(port, undo)?;
-    let evidence = crate::deployment::effect_evidence(journal, undo.op, undo, outcome)?;
+    let evidence = crate::deployment::effect_evidence(journal, port, undo.op, undo, outcome)?;
     check_post(port, undo, &evidence)?;
-    let durable = barrier(port, undo, &evidence)?;
+    let durable = barrier(journal, port, undo, &evidence)?;
     check_post(port, undo, &durable)?;
     journal.record_step(
         undo.op,
@@ -532,7 +632,7 @@ fn recover_restore<J: Journal, P: CopyEffects>(
     for row in rows.iter().rev() {
         let step = &row.prepared;
         let result = (|| {
-            let evidence = port.inspect_step(step);
+            let evidence = inspect_checked(journal, port, step)?;
             let from = row.phase;
             if !matches!(
                 from,
@@ -545,7 +645,7 @@ fn recover_restore<J: Journal, P: CopyEffects>(
                     return Err(DeployError::RecoveryConflict);
                 }
                 check_post(port, step, &evidence)?;
-                let durable = barrier(port, step, &evidence)?;
+                let durable = barrier(journal, port, step, &evidence)?;
                 check_post(port, step, &durable)?;
                 if from == StepPhase::Attempting {
                     journal.record_step(
@@ -578,8 +678,9 @@ fn recover_restore<J: Journal, P: CopyEffects>(
     }
 
     for row in &rows {
-        let evidence = port.inspect_step(&row.prepared);
-        if let Err(error) = check_post(port, &row.prepared, &evidence) {
+        if let Err(error) = inspect_checked(journal, port, &row.prepared)
+            .and_then(|evidence| check_post(port, &row.prepared, &evidence))
+        {
             return blocked(journal, op, error);
         }
     }
@@ -682,11 +783,12 @@ pub(crate) fn check_post<P: CopyEffects>(
     check_backup(port, &step.step_pre)
 }
 
-fn check_forward_slots<P: CopyEffects>(
+fn check_forward_slots<J: Journal, P: CopyEffects>(
+    journal: &mut J,
     port: &mut P,
     forward: &PreparedStep,
 ) -> Result<(), DeployError> {
-    let evidence = port.inspect_step(forward);
+    let evidence = inspect_checked(journal, port, forward)?;
     if matches!(evidence.target, Observation::Unavailable(_))
         || evidence.stage != Artifact::Absent
         || evidence.retained != crate::deployment::expected_retained(forward)
@@ -697,15 +799,22 @@ fn check_forward_slots<P: CopyEffects>(
     check_backup(port, &forward.step_pre)
 }
 
-fn barrier<P: CopyEffects>(
+fn barrier<J: Journal, P: CopyEffects>(
+    journal: &mut J,
     port: &mut P,
     step: &PreparedStep,
     evidence: &Evidence,
 ) -> Result<Evidence, DeployError> {
     match port.durability_barrier(step, evidence) {
-        BarrierOutcome::Durable(evidence) => Ok(evidence),
+        BarrierOutcome::Durable(evidence) => {
+            check_displacements(journal, port, step, &evidence)?;
+            Ok(evidence)
+        }
         BarrierOutcome::Unavailable(error) => Err(crate::deployment::map_root_error(error)),
-        BarrierOutcome::Ambiguous(_) => Err(DeployError::Io),
+        BarrierOutcome::Ambiguous(evidence) => {
+            check_displacements(journal, port, step, &evidence)?;
+            Err(DeployError::Io)
+        }
     }
 }
 
