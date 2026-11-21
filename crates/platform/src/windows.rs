@@ -175,9 +175,10 @@ mod root {
         ERROR_SHARING_VIOLATION, GENERIC_READ, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Security::{
-        ACL, DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetKernelObjectSecurity,
-        GetSecurityDescriptorDacl, GetSecurityDescriptorGroup, GetSecurityDescriptorOwner,
-        IsValidAcl, IsValidSid, OWNER_SECURITY_INFORMATION,
+        ACL, ATTRIBUTE_SECURITY_INFORMATION, DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION,
+        GetKernelObjectSecurity, GetSecurityDescriptorDacl, GetSecurityDescriptorGroup,
+        GetSecurityDescriptorOwner, GetSecurityDescriptorSacl, IsValidAcl, IsValidSid,
+        LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, SCOPE_SECURITY_INFORMATION,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
@@ -1019,6 +1020,7 @@ mod root {
             || basic.FileAttributes & !ORDINARY_ATTRIBUTES != 0
             || !no_extended_attributes(file)
             || !matches!(has_unknown_streams(file), Ok(false))
+            || !no_explicit_security_classes(file)
         {
             return None;
         }
@@ -1114,6 +1116,60 @@ mod root {
         // Observation uses READ_CONTROL, not privileged SACL access.
         let requested =
             OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+        let (descriptor, used) = query_security(file, requested)?;
+        if !complete_security(descriptor.as_ptr().cast_mut().cast()) {
+            return Err(RootError::Io);
+        }
+        let mut sha256 = [0u8; 32];
+        let mut hasher = Sha256::new();
+        let bytes =
+            unsafe { std::slice::from_raw_parts(descriptor.as_ptr().cast::<u8>(), used as usize) };
+        hasher.update(bytes);
+        sha256.copy_from_slice(&hasher.finalize());
+        Ok(sha256)
+    }
+
+    /// Mandatory-label, resource-attribute and scoped-policy ACEs are readable
+    /// with `READ_CONTROL` even though they live in the SACL. Refuse an explicit
+    /// ACE for any of those classes; an empty or absent selected result is the
+    /// only ordinary case. Never request full `SACL_SECURITY_INFORMATION`.
+    fn no_explicit_security_classes(file: &File) -> bool {
+        [
+            LABEL_SECURITY_INFORMATION,
+            ATTRIBUTE_SECURITY_INFORMATION,
+            SCOPE_SECURITY_INFORMATION,
+        ]
+        .into_iter()
+        .all(|information| explicit_security_class_is_absent(file, information))
+    }
+
+    fn explicit_security_class_is_absent(file: &File, information: u32) -> bool {
+        let Ok((descriptor, _)) = query_security(file, information) else {
+            return false;
+        };
+        let mut present = 0;
+        let mut sacl: *mut ACL = ptr::null_mut();
+        let mut defaulted = 0;
+        if unsafe {
+            GetSecurityDescriptorSacl(
+                descriptor.as_ptr().cast_mut().cast(),
+                &mut present,
+                &mut sacl,
+                &mut defaulted,
+            )
+        } == 0
+        {
+            return false;
+        }
+        if present == 0 {
+            return true;
+        }
+        // A present SACL must be a valid, explicitly empty ACL. A null or
+        // malformed ACL is not proof that the selected class is absent.
+        !sacl.is_null() && unsafe { IsValidAcl(sacl) != 0 } && unsafe { (*sacl).AceCount == 0 }
+    }
+
+    fn query_security(file: &File, requested: u32) -> Result<(Vec<u32>, u32), RootError> {
         let mut needed = 0u32;
         let ok = unsafe {
             GetKernelObjectSecurity(
@@ -1142,17 +1198,10 @@ mod root {
                 &mut needed,
             )
         };
-        if ok == 0 || needed > capacity || !complete_security(descriptor.as_mut_ptr().cast()) {
+        if ok == 0 || needed > capacity {
             return Err(RootError::Io);
         }
-        let mut sha256 = [0u8; 32];
-        let mut hasher = Sha256::new();
-        let bytes = unsafe {
-            std::slice::from_raw_parts(descriptor.as_ptr().cast::<u8>(), needed as usize)
-        };
-        hasher.update(bytes);
-        sha256.copy_from_slice(&hasher.finalize());
-        Ok(sha256)
+        Ok((descriptor, needed))
     }
 
     fn complete_security(descriptor: *mut std::ffi::c_void) -> bool {
