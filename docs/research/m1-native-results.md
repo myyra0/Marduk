@@ -98,6 +98,37 @@ Windows product availability stays closed: the record's NTFS proofs reach only t
 
 Deploy-level NTFS rows remain `not run`; only the private staging adapter is evidenced here.
 
+### Deploy round trip
+
+`crates/workspace/tests/deploy_evidence.rs` drives the real `Catalog`, `OperationJournal`
+and `NativeEffects` adapter through setup, ZIP import, member order, preview,
+apply and restore. On a volume where both production availability checks already
+pass it uses the production constructors; elsewhere it uses the feature-gated
+`open_for_evidence` entry, which skips only availability. Boundary, ownership,
+mount and gate checks are unchanged. The client `dispatch` routes stay closed.
+
+| Deploy witness | Linux Btrfs | Linux tmpfs | Linux ext4 | Windows NTFS | Power |
+|---|---|---|---|---|---|
+| `deploy_round_trip_retains_and_restores_on_linux_tmpfs_or_btrfs` | ran 2026-11-22 at `59733a3`, passed | ran 2026-11-22 at `59733a3`, passed | not run | not run | — |
+| `deploy_round_trip_retains_and_restores_on_ntfs` | not run | not run | not run | not run (blocked at the durability barrier, `UnsupportedTarget`) | — |
+
+Linux runs: `TMPDIR=/tmp` and `TMPDIR=/var/tmp cargo test -p marduk-workspace
+--features evidence --test deploy_evidence -- --ignored` → `running 1 test`,
+`test result: ok. 1 passed; 0 failed` on both volumes. Each run asserted exact
+target bytes (`b\n`, `only-a\n`), the untouched `keep\n` and outside-plan `user\n`
+sentinels, the sealed `original` slot containing `base\n` for the replaced file
+and no original slot for the created file, the recorded generation and a clean
+operation status, two `recover_pending` no-ops, then a byte-for-byte original
+tree and cleared generation after restore.
+
+Windows: the same harness compiled and ran on `C:` (NTFS, serial `0x88be19a`,
+Windows 10 `DESKTOP-4NP2KM5`, `rustc 1.100.0`) at `59733a3`, and
+`cargo check -p marduk-platform --all-targets` passed. Apply reached the
+adapter and was refused by `NativeEffects::durability_barrier` with
+`UnsupportedTarget`/`Configuration`, because no non-admin Windows namespace
+barrier is qualified. That is a contract refusal, not a test failure to route
+around: no Windows deploy row is claimed.
+
 ### Detach and classification witnesses
 
 `MARDUK_R03_SCRATCH` on Btrfs and tmpfs, `--test-threads=1`: `cargo test --locked -p marduk-platform --test native_proof_evidence` → 7 passed on each volume.

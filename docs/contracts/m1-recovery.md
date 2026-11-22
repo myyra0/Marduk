@@ -36,7 +36,7 @@ The operation owner validates a new plan under the root lease before the first w
 
 ## Availability is a recorded fact
 
-Which `(capability, operating system, volume class)` configurations may run is decided in one place: the qualification record in `crates/core/src/qualification.rs`. Each proof names the witness tests, the date and the revision that produced it. `crates/core/tests/availability_guard.rs` parses the evidence matrices in `docs/research/m1-native-results.md` and fails when the record and the document disagree in either direction, so availability cannot move without a run behind it. Gates query the record; platform code reports only the observed volume class and whether its code exists for that operating system. Deploy- and restore-level rows are unproven on every configuration today.
+Which `(capability, operating system, volume class)` configurations may run is decided in one place: the qualification record in `crates/core/src/qualification.rs`. Each proof names the witness tests, the date and the revision that produced it. `crates/core/tests/availability_guard.rs` parses the evidence matrices in `docs/research/m1-native-results.md` and fails when the record and the document disagree in either direction, so availability cannot move without a run behind it. Gates query the record; platform code reports only the observed volume class and whether its code exists for that operating system. Deploy- and restore-level rows are proven only where the deploy harness ran; every other configuration stays unproven.
 
 ## Phases and effect boundaries
 

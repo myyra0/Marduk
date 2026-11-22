@@ -256,6 +256,24 @@ pub const PROOFS: &[Proof] = &[
         date: "2026-11-22",
         revision: "101b4f7",
     },
+    Proof {
+        capability: Capability::NativeEffects,
+        os: Os::Linux,
+        volume: VolumeClass::Btrfs,
+        layer: Layer::Deploy,
+        witnesses: &["deploy_round_trip_retains_and_restores_on_linux_tmpfs_or_btrfs"],
+        date: "2026-11-22",
+        revision: "59733a3",
+    },
+    Proof {
+        capability: Capability::NativeEffects,
+        os: Os::Linux,
+        volume: VolumeClass::Tmpfs,
+        layer: Layer::Deploy,
+        witnesses: &["deploy_round_trip_retains_and_restores_on_linux_tmpfs_or_btrfs"],
+        date: "2026-11-22",
+        revision: "59733a3",
+    },
 ];
 
 /// The evidence rung a route requires for a capability.
@@ -395,7 +413,11 @@ mod tests {
     }
 
     #[test]
-    fn deploy_and_restore_are_unproven_on_every_configuration() {
+    fn deploy_and_restore_follow_the_witnessed_deploy_evidence() {
+        let witnessed = [
+            (Os::Linux, VolumeClass::Btrfs),
+            (Os::Linux, VolumeClass::Tmpfs),
+        ];
         for capability in [
             Capability::LibraryStaging,
             Capability::EffectPrimitives,
@@ -409,10 +431,13 @@ mod tests {
                     VolumeClass::Ntfs,
                     VolumeClass::Other,
                 ] {
+                    let expected = capability == Capability::NativeEffects
+                        && witnessed.contains(&(os, volume));
                     for route in [Route::Deploy, Route::Restore] {
-                        assert!(
-                            !is_available(capability, route, os, volume),
-                            "{capability} {route:?} on {os}/{volume} must stay closed"
+                        assert_eq!(
+                            is_available(capability, route, os, volume),
+                            expected,
+                            "{capability} {route:?} on {os}/{volume}"
                         );
                     }
                 }
@@ -462,8 +487,13 @@ mod tests {
     fn every_proof_names_at_least_one_witness_at_its_layer() {
         for proof in PROOFS {
             assert!(!proof.witnesses.is_empty(), "{proof:?}");
+            let route = if proof.layer == Layer::Deploy {
+                Route::Deploy
+            } else {
+                Route::Adapter
+            };
             assert_eq!(
-                qualification(proof.capability, Route::Adapter, proof.os, proof.volume)
+                qualification(proof.capability, route, proof.os, proof.volume)
                     .proof
                     .map(|proven| proven.layer),
                 Some(proof.layer)
