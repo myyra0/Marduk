@@ -111,3 +111,59 @@ jobs:
       # Links the real shell: this is the first gate that proves the desktop
       # binary builds, not just that the crate type-checks.
       - run: cargo build --manifest-path app/src-tauri/Cargo.toml --locked
+
+  desktop-smoke:
+    # Advisory, not a required check: this is the first run that starts the
+    # shell under a real WebKit webview, so it stays a separate job until it
+    # has been green a few times. It never gates the Rust or frontend jobs.
+    #
+    # Ubuntu only for now. The environment, not the test, is the variable:
+    # xvfb supplies the display, WebKitWebDriver supplies the automation
+    # session, and libwebkit2gtk-4.1-dev supplies the build headers and the
+    # runtime. A driver that cannot attach fails the job; nothing skips.
+    name: Desktop shell smoke (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - name: Install WebKitGTK build and WebDriver dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            webkit2gtk-driver xvfb
+      - run: npm ci
+        working-directory: app
+      - run: npm run build
+        working-directory: app
+      # The frontend must be embedded. A plain debug build leaves Tauri in dev
+      # mode and points the webview at `devUrl`, where no Vite server is
+      # running; `tauri build --debug` enables this same custom-protocol feature.
+      - name: Build the desktop shell with the frontend embedded
+        run: cargo build --manifest-path app/src-tauri/Cargo.toml --locked --features tauri/custom-protocol
+      - name: Install tauri-driver
+        run: cargo install tauri-driver --locked
+      - name: Drive the shell under a virtual display
+        run: |
+          set -euo pipefail
+          # A fresh catalog root per run: the smoke asserts the real empty state.
+          export XDG_DATA_HOME="$(mktemp -d)"
+          # WebKitGTK on a virtual display has no GPU. These are runtime hints
+          # for the app process, not test skips.
+          export WEBKIT_DISABLE_DMABUF_RENDERER=1
+          export WEBKIT_DISABLE_COMPOSITING_MODE=1
+          xvfb-run --auto-servernum --server-args="-screen 0 1280x900x24" \
+            tauri-driver --native-driver /usr/bin/WebKitWebDriver &
+          driver=$!
+          trap 'kill "$driver" 2>/dev/null || true' EXIT
+          npm --prefix app run smoke:desktop

@@ -8,6 +8,7 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "test": "vitest run",
+    "smoke:desktop": "node smoke/desktop.ts",
     "tauri": "tauri"
   },
   "dependencies": {
