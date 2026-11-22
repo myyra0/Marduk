@@ -1,8 +1,17 @@
 # Marduk
 
 Cross-platform mod manager. Rust-first, Tauri 2 desktop shell, MO2-inspired UI.
-A fresh implementation that replaces a legacy app. The legacy source is a **read-only behavioural reference** at
+A fresh implementation that replaces a legacy app. The legacy source is a **behavioural reference** at
 `$LEGACY_PATH` (env var). Call it "legacy" everywhere; the old product name must not appear in code, UI, strings, config or docs.
+
+## License and reuse
+
+Marduk is GPL-3.0-only (`LICENSE`). Reusing GPL-3-compatible code is allowed, including adapting legacy, MO2 or Vortex
+logic, on these terms: adapt to this architecture rather than transplanting files; preserve the capability's behaviour and
+safety rules; do not add per-file provenance banners or "copied from" comments (the `LICENSE` file carries the license for
+the combined work); record what was adapted and why in the owning packet's report. Do not copy code that implements a
+weaker guarantee than this project's contracts — that includes delete-then-rename replacement, which destroys displaced
+bytes. Trivial logic is still written fresh.
 
 ## Scope (current phase)
 
@@ -41,7 +50,7 @@ Provisional layout (finalised by the Phase 0 audit): `crates/{core, platform, ga
 
 Rust by default: filesystem, deploy/restore, conflicts, dependencies, archives, anything performance-sensitive.
 Python only where Rust gives no real advantage and Python is clearly simpler; keep that boundary narrow and explicit.
-Reuse legacy code only for complex or error-prone logic, adapted to this architecture. Trivial logic is written fresh.
+Reuse legacy code for complex or error-prone logic, adapted to this architecture. Trivial logic is written fresh.
 Reuse sound existing Rust components from legacy instead of rewriting them.
 Rust is the default, including for hard problems; difficulty is never a reason to reach for Python. Python only where it is genuinely the better tool (dev tooling, glue, a Python-only dependency). Python in the shipped app needs an ADR: why Rust is a poor fit, and how it is bundled per OS.
 Tauri 2 only: capabilities/permissions model, no v1 APIs (`allowlist`, `tauri::api`).
