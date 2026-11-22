@@ -147,6 +147,18 @@ describe('desktop capability surface', () => {
     expect(dev).toContain('ws://localhost:1420');
   });
 
+  it('carries ordered progress only through per-write typed channels', () => {
+    expect(commandsSource.match(/on_progress:\s*Channel<Progress>/g)).toHaveLength(2);
+    expect(commandsSource).toMatch(/pub fn deploy_apply/);
+    expect(commandsSource).toMatch(/pub fn restore/);
+    for (const readOnly of ['deploy_preview', 'status']) {
+      const signature = commandsSource.match(new RegExp(`pub fn ${readOnly}\\(([\\s\\S]*?)\\)`));
+      expect(signature?.[1] ?? '').not.toMatch(/Channel/);
+    }
+    expect(clientSource).toMatch(/progressChannel/);
+    expect(clientSource).toMatch(/Channel<Progress>/);
+  });
+
   it('keeps Rust commands free of generic write or process authority', () => {
     expect(commandsSource).not.toMatch(/std::fs::|std::process|Command::new|OpenOptions/);
     // The desktop commands carry opaque handles only; paths stay in Rust.

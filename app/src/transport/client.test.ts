@@ -1,13 +1,21 @@
+import type { Channel } from '@tauri-apps/api/core';
 import { describe, expect, it, vi } from 'vitest';
 
 import errorStalePlan from './fixtures/error-stale-plan.json';
 import operationFixture from './fixtures/operation.json';
 import preparedFixture from './fixtures/prepared.json';
 import previewFixture from './fixtures/preview.json';
+import progressFixture from './fixtures/progress.json';
 import restoreFixture from './fixtures/restore-no-active.json';
 import snapshotFixture from './fixtures/snapshot.json';
 import statusFixture from './fixtures/status.json';
-import { createTauriTransport, type InvokeFn, TransportFault } from './client';
+import {
+  createTauriTransport,
+  type ChannelFactory,
+  type InvokeFn,
+  TransportFault,
+} from './client';
+import type { Progress } from './wire';
 
 const selectionFixture = {
   ok: true,
@@ -16,6 +24,14 @@ const selectionFixture = {
 
 function invokeReturning(value: unknown) {
   return vi.fn<InvokeFn>(async () => value);
+}
+
+class FakeChannel<T> {
+  onmessage?: (message: T) => void;
+}
+
+function fakeChannel<T>(): Channel<T> {
+  return new FakeChannel<T>() as unknown as Channel<T>;
 }
 
 describe('Tauri transport', () => {
@@ -93,7 +109,11 @@ describe('Tauri transport', () => {
           return statusFixture;
       }
     });
-    const transport = createTauriTransport(invoke);
+    const channel = fakeChannel();
+    const transport = createTauriTransport(
+      invoke,
+      (() => channel) as unknown as ChannelFactory,
+    );
 
     await transport.importApply('9223372036854775702');
     await transport.deployPreview('9223372036854775807');
@@ -107,13 +127,43 @@ describe('Tauri transport', () => {
     expect(invoke).toHaveBeenNthCalledWith(2, 'deploy_preview', {
       atRevision: '9223372036854775807',
     });
-    expect(invoke).toHaveBeenNthCalledWith(3, 'deploy_apply', {
-      planId: '9223372036854775700',
-    });
+    const deployArgs = invoke.mock.calls[2][1] as Record<string, unknown>;
+    expect(deployArgs.planId).toBe('9223372036854775700');
+    expect(deployArgs.onProgress).toBe(channel);
+    expect(Object.keys(deployArgs)).toEqual(['planId', 'onProgress']);
     expect(invoke).toHaveBeenNthCalledWith(4, 'operation', {
       operationId: '9223372036854775801',
     });
-    expect(invoke).toHaveBeenNthCalledWith(5, 'restore');
+    const restoreArgs = invoke.mock.calls[4][1] as Record<string, unknown>;
+    expect(restoreArgs.onProgress).toBe(channel);
+    expect(Object.keys(restoreArgs)).toEqual(['onProgress']);
+  });
+
+  it('validates progress channel messages and reports undecodable ones', async () => {
+    const channel = new FakeChannel<Progress>();
+    const invoke: InvokeFn = async (command) => {
+      if (command === 'deploy_apply') {
+        return operationFixture;
+      }
+      throw new Error(`unexpected ${command}`);
+    };
+    const transport = createTauriTransport(invoke, (() => channel) as unknown as ChannelFactory);
+    const received: Progress[] = [];
+    const faults = vi.fn();
+
+    await transport.deployApply('9007199254740997', (event) => received.push(event), faults);
+
+    channel.onmessage?.((progressFixture as any).result);
+    channel.onmessage?.({ ...(progressFixture as any).result, phase: 'sideways' });
+
+    expect(received).toEqual([
+      {
+        operationId: '9223372036854775801',
+        sequence: '9007199254741009',
+        phase: 'applying',
+      },
+    ]);
+    expect(faults).toHaveBeenCalledTimes(1);
   });
 
   it('returns a typed error envelope without throwing', async () => {
@@ -151,7 +201,10 @@ describe('Tauri transport', () => {
     const invoke = vi.fn<InvokeFn>(async () => {
       throw new Error('sensitive native detail: /home/user/game');
     });
-    const transport = createTauriTransport(invoke);
+    const transport = createTauriTransport(
+      invoke,
+      (() => fakeChannel()) as unknown as ChannelFactory,
+    );
 
     const failure = await transport.restore().catch((error: unknown) => error);
 

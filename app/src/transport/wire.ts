@@ -175,6 +175,16 @@ export type RestoreResult =
 
 export type Selection = { selectionId: Id; label: string };
 
+/**
+ * Ordered progress hint on the per-operation channel. It is keyed by operation
+ * and monotonic sequence, and is never authoritative state.
+ */
+export type Progress = {
+  operationId: Id;
+  sequence: Id;
+  phase: Phase;
+};
+
 export class WireFormatError extends Error {
   constructor(message: string) {
     super(message);
@@ -505,6 +515,15 @@ export function parseRestoreResult(value: unknown, field = 'restore'): RestoreRe
     return { outcome, code: 'NoActiveDeployment' };
   }
   throw new WireFormatError(`${field}.outcome: unknown value`);
+}
+
+export function parseProgress(value: unknown, field = 'progress'): Progress {
+  const progress = record(value, field);
+  return {
+    operationId: parseId(progress.operationId, `${field}.operationId`),
+    sequence: parseId(progress.sequence, `${field}.sequence`),
+    phase: oneOf(progress.phase, PHASES, `${field}.phase`),
+  };
 }
 
 export function parseSelection(value: unknown, field = 'selection'): Selection | null {

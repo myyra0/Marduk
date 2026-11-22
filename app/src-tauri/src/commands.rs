@@ -3,12 +3,13 @@ use std::sync::Mutex;
 use std::sync::mpsc;
 
 use marduk_workspace::{
-    Code, Envelope, Op, Operation, Prepared, Preview, Purpose, Request, RestoreResult, SelectionId,
-    Snapshot, WireError, Workspace, WorkspaceStatus,
+    Code, Envelope, Op, Operation, Prepared, Preview, Progress, Purpose, Request, RestoreResult,
+    SelectionId, Snapshot, WireError, Workspace, WorkspaceStatus,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
+use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
@@ -145,13 +146,25 @@ pub fn deploy_preview(at_revision: String, state: State<'_, DesktopState>) -> En
     ))
 }
 
+// Ordered progress is delivered only on deploy/restore channels, keyed by
+// operation and sequence. The effect port is not connected yet, so the channel
+// stays unused; clients still reload `status`/`operation` on gaps or reconnect.
 #[tauri::command(async)]
-pub fn deploy_apply(plan_id: String, state: State<'_, DesktopState>) -> Envelope<Operation> {
+pub fn deploy_apply(
+    plan_id: String,
+    on_progress: Channel<Progress>,
+    state: State<'_, DesktopState>,
+) -> Envelope<Operation> {
+    let _ = on_progress;
     state.dispatch(Request::new(Op::DeployApply, json!({ "planId": plan_id })))
 }
 
 #[tauri::command(async)]
-pub fn restore(state: State<'_, DesktopState>) -> Envelope<RestoreResult> {
+pub fn restore(
+    on_progress: Channel<Progress>,
+    state: State<'_, DesktopState>,
+) -> Envelope<RestoreResult> {
+    let _ = on_progress;
     state.dispatch(Request::new(Op::Restore, json!({})))
 }
 

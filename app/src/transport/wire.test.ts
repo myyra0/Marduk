@@ -6,6 +6,7 @@ import errorStalePlan from './fixtures/error-stale-plan.json';
 import operationFixture from './fixtures/operation.json';
 import preparedFixture from './fixtures/prepared.json';
 import previewFixture from './fixtures/preview.json';
+import progressFixture from './fixtures/progress.json';
 import restoreFixture from './fixtures/restore-no-active.json';
 import snapshotFixture from './fixtures/snapshot.json';
 import statusFixture from './fixtures/status.json';
@@ -14,6 +15,7 @@ import {
   parseOperation,
   parsePrepared,
   parsePreview,
+  parseProgress,
   parseRestoreResult,
   parseSnapshot,
   parseWorkspaceStatus,
@@ -64,6 +66,16 @@ describe('Rust-generated wire fixtures', () => {
     expect(restore).toEqual({
       ok: true,
       result: { outcome: 'noActiveDeployment', code: 'NoActiveDeployment' },
+    });
+
+    const progress = parseEnvelope(progressFixture, parseProgress);
+    expect(progress).toEqual({
+      ok: true,
+      result: {
+        operationId: '9223372036854775801',
+        sequence: '9007199254741009',
+        phase: 'applying',
+      },
     });
   });
 

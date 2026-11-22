@@ -6,6 +6,7 @@
 import operationFixture from '../transport/fixtures/operation.json';
 import preparedFixture from '../transport/fixtures/prepared.json';
 import previewFixture from '../transport/fixtures/preview.json';
+import progressFixture from '../transport/fixtures/progress.json';
 import restoreFixture from '../transport/fixtures/restore-no-active.json';
 import snapshotFixture from '../transport/fixtures/snapshot.json';
 import statusFixture from '../transport/fixtures/status.json';
@@ -15,6 +16,7 @@ import {
   parseOperation,
   parsePrepared,
   parsePreview,
+  parseProgress,
   parseRestoreResult,
   parseSnapshot,
   parseWorkspaceStatus,
@@ -22,6 +24,7 @@ import {
   type Operation,
   type Prepared,
   type Preview,
+  type Progress,
   type RestoreResult,
   type Snapshot,
   type WorkspaceStatus,
@@ -48,6 +51,7 @@ export const fixturePreview = (): Preview => fixtureResult(previewFixture, parse
 export const fixtureOperation = (): Operation => fixtureResult(operationFixture, parseOperation);
 export const fixtureRestore = (): RestoreResult =>
   fixtureResult(restoreFixture, parseRestoreResult);
+export const fixtureProgress = (): Progress => fixtureResult(progressFixture, parseProgress);
 
 function reordered(members: Member[], memberIds: readonly string[]): Member[] {
   const byId = new Map(members.map((member) => [member.id, member]));

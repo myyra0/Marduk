@@ -425,6 +425,18 @@ pub enum RestoreResult {
     NoActiveDeployment { code: Code },
 }
 
+/// Ordered progress hint sent on the per-operation Tauri channel.
+///
+/// It is never authoritative: clients refresh `status`/`operation` on a gap,
+/// duplicate or disconnect and never claim completion from this value.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Progress {
+    pub operation_id: String,
+    pub sequence: String,
+    pub phase: String,
+}
+
 /// One shared client service over the authoritative catalog and journal.
 pub struct Workspace {
     catalog: Catalog,
@@ -1155,6 +1167,7 @@ mod wire_fixture {
             ("operation.json", ok(operation_fixture())),
             ("prepared.json", ok(prepared_fixture())),
             ("preview.json", ok(preview_fixture())),
+            ("progress.json", ok(progress_fixture())),
             (
                 "restore-no-active.json",
                 ok(RestoreResult::NoActiveDeployment {
@@ -1302,6 +1315,14 @@ mod wire_fixture {
         }
     }
 
+    fn progress_fixture() -> Progress {
+        Progress {
+            operation_id: "9223372036854775801".to_owned(),
+            sequence: "9007199254741009".to_owned(),
+            phase: "applying".to_owned(),
+        }
+    }
+
     fn preview_fixture() -> Preview {
         Preview {
             id: Some("9223372036854775703".to_owned()),
@@ -1372,6 +1393,8 @@ mod wire_fixture {
         let _: Operation = serde_json::from_value(result(ok(operation_fixture()))).unwrap();
         let _: Prepared = serde_json::from_value(result(ok(prepared_fixture()))).unwrap();
         let _: Preview = serde_json::from_value(result(ok(preview_fixture()))).unwrap();
+        let progress: Progress = serde_json::from_value(result(ok(progress_fixture()))).unwrap();
+        assert_eq!(progress.sequence, "9007199254741009");
         let restore: RestoreResult =
             serde_json::from_value(result(ok(RestoreResult::NoActiveDeployment {
                 code: Code::NoActiveDeployment,

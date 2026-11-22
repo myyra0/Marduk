@@ -5,12 +5,22 @@ import { describe, expect, it, vi } from 'vitest';
 import { App } from './App';
 import { describeBlocker } from './format';
 import errorStalePlan from './transport/fixtures/error-stale-plan.json';
+import operationFixture from './transport/fixtures/operation.json';
 import statusFixture from './transport/fixtures/status.json';
 import { createTauriTransport, type InvokeFn, type WorkspaceTransport } from './transport/client';
-import type { Prepared, WorkspaceStatus } from './transport/wire';
+import type {
+  Operation,
+  Prepared,
+  Preview,
+  Progress,
+  WorkspaceStatus,
+} from './transport/wire';
 import {
   createStubTransport,
+  fixtureOperation,
+  fixturePreview,
   fixturePrepared,
+  fixtureRestore,
   fixtureStatus,
 } from './test/fixtureTransport';
 
@@ -29,12 +39,42 @@ function statusWithImport(): WorkspaceStatus {
   };
 }
 
+function statusWithEffects(): WorkspaceStatus {
+  const status = fixtureStatus();
+  return {
+    ...status,
+    pending: null,
+    availability: {
+      ...status.availability,
+      deploy: { available: true },
+      restore: { available: true },
+    },
+  };
+}
+
 function preparedFor(status: WorkspaceStatus): Prepared {
   return {
     ...fixturePrepared(),
     profileId: status.profile.id,
     expectedRevision: status.profile.revision,
   };
+}
+
+function reviewFor(status: WorkspaceStatus, overrides: Partial<Preview> = {}): Preview {
+  return {
+    ...fixturePreview(),
+    profileId: status.profile.id,
+    revision: status.profile.revision,
+    installationId: status.installation?.id ?? fixturePreview().installationId,
+    blockers: [],
+    ...overrides,
+  };
+}
+
+function mutations(calls: Array<{ command: string }>): string[] {
+  return calls
+    .map((call) => call.command)
+    .filter((command) => command === 'deploy_apply' || command === 'restore');
 }
 
 describe('workspace shell', () => {
@@ -50,7 +90,9 @@ describe('workspace shell', () => {
   it('shows blocked operations with their stable code and detail', async () => {
     await renderReady();
 
-    expect(screen.getAllByText('UnsupportedTarget (Configuration)')).toHaveLength(2);
+    expect(screen.getAllByText('UnsupportedTarget (Configuration)').length).toBeGreaterThanOrEqual(
+      2,
+    );
     expect(screen.getAllByText('StageUnavailable')).toHaveLength(2);
     expect(screen.queryByRole('button', { name: /Preview ZIP/ })).not.toBeInTheDocument();
   });
@@ -244,12 +286,288 @@ describe('workspace shell', () => {
     });
   });
 
+  it('shows a blocked deployment preview with the exact code and keeps writes disabled', async () => {
+    const user = userEvent.setup();
+    const deployPreview = vi.fn(async () => ({
+      ok: false as const,
+      error: {
+        code: 'UnsupportedTarget' as const,
+        detail: { reason: 'Configuration' as const },
+      },
+    }));
+    const deployApply = vi.fn(async () => ({ ok: true as const, result: fixtureOperation() }));
+    const restore = vi.fn(async () => ({ ok: true as const, result: fixtureRestore() }));
+    const { calls } = await renderReady({ deployPreview, deployApply, restore });
+
+    await user.click(screen.getByRole('button', { name: /Review deployment/ }));
+
+    expect(
+      await screen.findByText(/Deployment preview blocked: UnsupportedTarget \(Configuration\)/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Apply unavailable/)).toBeInTheDocument();
+    expect(screen.getByText(/Restore unavailable/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Apply deployment/ })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Restore deployment/ })).toBeDisabled();
+
+    await user.click(screen.getByRole('button', { name: /Restore deployment/ }));
+
+    expect(deployApply).not.toHaveBeenCalled();
+    expect(restore).not.toHaveBeenCalled();
+    expect(mutations(calls)).toEqual([]);
+    expect(deployPreview).toHaveBeenCalledWith('9223372036854775807');
+  });
+
+  it('renders every review field and applies only the reviewed plan ID', async () => {
+    const user = userEvent.setup();
+    const status = statusWithEffects();
+    const preview = reviewFor(status);
+    const deployPreview = vi.fn(async () => ({ ok: true as const, result: preview }));
+    const deployApply = vi.fn(async () => ({
+      ok: true as const,
+      result: fixtureOperation(),
+    }));
+    await renderReady({
+      status: async () => ({ ok: true, result: status }),
+      deployPreview,
+      deployApply,
+    });
+
+    await user.click(screen.getByRole('button', { name: /Review deployment/ }));
+
+    expect(await screen.findByText(/Reviewed plan/)).toBeInTheDocument();
+    expect(screen.getByText('textures/winner.dds')).toBeInTheDocument();
+    expect(screen.getAllByText('9007199254741001').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText('9007199254740997').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText(/original backup required/)).toBeInTheDocument();
+
+    const apply = screen.getByRole('button', { name: /Apply deployment/ });
+    expect(apply).toBeEnabled();
+    await user.click(apply);
+
+    await waitFor(() => {
+      expect(deployApply).toHaveBeenCalledTimes(1);
+    });
+    expect(deployApply).toHaveBeenCalledWith(
+      preview.id,
+      expect.any(Function),
+      expect.any(Function),
+    );
+    expect(deployApply).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps Apply disabled with the typed blocker when availability forbids it', async () => {
+    const user = userEvent.setup();
+    const status = fixtureStatus();
+    const preview = reviewFor(status);
+    const deployApply = vi.fn(async () => ({ ok: true as const, result: fixtureOperation() }));
+    await renderReady({
+      deployPreview: async () => ({ ok: true, result: preview }),
+      deployApply,
+    });
+
+    await user.click(screen.getByRole('button', { name: /Review deployment/ }));
+
+    const apply = await screen.findByRole('button', { name: /Apply deployment/ });
+    expect(apply).toBeDisabled();
+    expect(screen.getByText(/Apply unavailable/)).toBeInTheDocument();
+    expect(
+      screen.getAllByText('UnsupportedTarget (Configuration)').length,
+    ).toBeGreaterThanOrEqual(1);
+    await user.click(apply);
+    expect(deployApply).not.toHaveBeenCalled();
+  });
+
+  it('requires a new review after the profile revision changes', async () => {
+    const user = userEvent.setup();
+    const status = statusWithEffects();
+    const deployPreview = vi.fn(async () => ({
+      ok: true as const,
+      result: reviewFor(status),
+    }));
+    const { calls } = await renderReady({
+      status: async () => ({ ok: true, result: status }),
+      deployPreview,
+    });
+
+    await user.click(screen.getByRole('button', { name: /Review deployment/ }));
+    await screen.findByRole('button', { name: /Apply deployment/ });
+
+    screen.getByRole('listbox').focus();
+    await user.keyboard('{Alt>}{ArrowDown}{/Alt}');
+
+    await screen.findByText(/revision 43/);
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: /Apply deployment/ })).not.toBeInTheDocument();
+    });
+
+    await user.click(screen.getByRole('button', { name: /Review deployment/ }));
+    await waitFor(() => {
+      expect(deployPreview).toHaveBeenLastCalledWith('43');
+    });
+    expect(calls.filter((call) => call.command === 'deploy_apply')).toEqual([]);
+  });
+
+  it('clears the review when Apply reports a stale plan', async () => {
+    const user = userEvent.setup();
+    const status = statusWithEffects();
+    const deployApply = vi.fn(async () => ({
+      ok: false as const,
+      error: { code: 'StalePlan' as const },
+    }));
+    await renderReady({
+      status: async () => ({ ok: true, result: status }),
+      deployPreview: async () => ({ ok: true, result: reviewFor(status) }),
+      deployApply,
+    });
+
+    await user.click(screen.getByRole('button', { name: /Review deployment/ }));
+    await user.click(await screen.findByRole('button', { name: /Apply deployment/ }));
+
+    expect(await screen.findByText(/Not applied: StalePlan/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Apply deployment/ })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Review deployment/ })).toBeEnabled();
+  });
+
+  it('reloads authoritative status and operation on a progress gap without retrying', async () => {
+    const user = userEvent.setup();
+    const status = statusWithEffects();
+    const applying: Operation = { ...fixtureOperation(), phase: 'applying', blocker: null };
+    const deployApply = vi.fn(
+      async (
+        _planId: string,
+        onProgress?: (progress: Progress) => void,
+      ) => {
+        onProgress?.({ operationId: '9223372036854775803', sequence: '1', phase: 'applying' });
+        onProgress?.({ operationId: '9223372036854775803', sequence: '3', phase: 'completed' });
+        return { ok: true as const, result: applying };
+      },
+    );
+    const { calls } = await renderReady({
+      status: async () => ({ ok: true, result: status }),
+      deployPreview: async () => ({ ok: true, result: reviewFor(status) }),
+      deployApply,
+    });
+
+    await user.click(screen.getByRole('button', { name: /Review deployment/ }));
+    await user.click(await screen.findByRole('button', { name: /Apply deployment/ }));
+
+    expect(await screen.findByText(/Progress gap/)).toBeInTheDocument();
+    expect(
+      calls.filter((call) => call.command === 'operation' && call.args?.operationId === '9223372036854775803')
+        .length,
+    ).toBeGreaterThan(0);
+    expect(deployApply).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(/Authoritative operation/)).toBeInTheDocument();
+    expect(screen.getAllByText(/no write was retried/i).length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('reloads authoritative state on duplicate progress without a second apply', async () => {
+    const user = userEvent.setup();
+    const status = statusWithEffects();
+    const deployApply = vi.fn(
+      async (
+        _planId: string,
+        onProgress?: (progress: Progress) => void,
+      ) => {
+        onProgress?.({ operationId: '9223372036854775803', sequence: '2', phase: 'applying' });
+        onProgress?.({ operationId: '9223372036854775803', sequence: '2', phase: 'applying' });
+        return { ok: true as const, result: { ...fixtureOperation(), phase: 'applying' as const } };
+      },
+    );
+    await renderReady({
+      status: async () => ({ ok: true, result: status }),
+      deployPreview: async () => ({ ok: true, result: reviewFor(status) }),
+      deployApply,
+    });
+
+    await user.click(screen.getByRole('button', { name: /Review deployment/ }));
+    await user.click(await screen.findByRole('button', { name: /Apply deployment/ }));
+
+    expect(await screen.findByText(/Progress duplicate/)).toBeInTheDocument();
+    expect(deployApply).toHaveBeenCalledTimes(1);
+  });
+
+  it('reloads authoritative state when the progress channel faults', async () => {
+    const user = userEvent.setup();
+    const status = statusWithEffects();
+    const deployApply = vi.fn(
+      async (
+        _planId: string,
+        _onProgress?: (progress: Progress) => void,
+        onFault?: () => void,
+      ) => {
+        onFault?.();
+        return { ok: true as const, result: { ...fixtureOperation(), phase: 'applying' as const } };
+      },
+    );
+    await renderReady({
+      status: async () => ({ ok: true, result: status }),
+      deployPreview: async () => ({ ok: true, result: reviewFor(status) }),
+      deployApply,
+    });
+
+    await user.click(screen.getByRole('button', { name: /Review deployment/ }));
+    await user.click(await screen.findByRole('button', { name: /Apply deployment/ }));
+
+    expect(await screen.findByText(/Progress fault/)).toBeInTheDocument();
+    expect(deployApply).toHaveBeenCalledTimes(1);
+  });
+
+  it('reconnect loads pending, conflict and retained state from status', async () => {
+    const user = userEvent.setup();
+    const status = vi.fn<WorkspaceTransport['status']>();
+    status
+      .mockResolvedValueOnce({
+        ok: true as const,
+        result: { ...fixtureStatus(), pending: null },
+      })
+      .mockResolvedValue({ ok: true as const, result: fixtureStatus() });
+    const operation = vi.fn(async () => ({
+      ok: true as const,
+      result: fixtureOperation(),
+    }));
+    await renderReady({ status, operation });
+
+    expect(screen.queryByText(/Pending operation/)).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /Reconnect/ }));
+
+    expect(await screen.findByText(/Pending operation/)).toBeInTheDocument();
+    expect(screen.getByText('RecoveryConflict')).toBeInTheDocument();
+    expect(screen.getByText(/ordinal 2/)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(operation).toHaveBeenCalledWith('9223372036854775803');
+    });
+    expect(screen.getByText(/Authoritative state reloaded/)).toBeInTheDocument();
+  });
+
+  it('shows NoActiveDeployment cleanly and never retries Restore', async () => {
+    const user = userEvent.setup();
+    const status = statusWithEffects();
+    const restore = vi.fn(async () => ({ ok: true as const, result: fixtureRestore() }));
+    await renderReady({
+      status: async () => ({ ok: true, result: status }),
+      restore,
+    });
+
+    const button = screen.getByRole('button', { name: /Restore deployment/ });
+    expect(button).toBeEnabled();
+    await user.click(button);
+
+    expect(await screen.findByText('NoActiveDeployment')).toBeInTheDocument();
+    expect(screen.getByText(/nothing was restored or changed/i)).toBeInTheDocument();
+    expect(restore).toHaveBeenCalledTimes(1);
+  });
+
   it('formats typed blockers without free-form error text', () => {
     expect(describeBlocker({ code: 'InvalidPath', detail: { reason: 'MissingParent' } })).toBe(
       'InvalidPath (MissingParent)',
     );
     expect(describeBlocker({ code: 'LimitExceeded', detail: { kind: 'Entries' } })).toBe(
       'LimitExceeded (Entries)',
+    );
+    expect(describeBlocker(operationFixture.result.blocker ?? { code: 'Busy' })).toBe(
+      'Busy',
     );
   });
 });

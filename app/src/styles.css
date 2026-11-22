@@ -65,6 +65,11 @@ code {
   letter-spacing: 0.02em;
 }
 
+.shell__actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
 .panel {
   border: 1px solid #2e2e36;
   border-radius: 10px;
@@ -238,4 +243,53 @@ code {
 .prepared ul {
   margin: 0.5rem 0;
   padding-left: 1.1rem;
+}
+
+.review {
+  border-top: 1px solid #26262d;
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+}
+
+.review__files {
+  list-style: none;
+  margin: 0.5rem 0;
+  padding: 0;
+  border: 1px solid #2e2e36;
+  border-radius: 8px;
+}
+
+.review__files li {
+  padding: 0.5rem 0.7rem;
+  border-bottom: 1px solid #26262d;
+}
+
+.review__files li:last-child {
+  border-bottom: 0;
+}
+
+.review__detail {
+  margin-top: 0.25rem;
+  color: #b9b6b0;
+}
+
+.review__candidate + .review__candidate::before {
+  content: ', ';
+}
+
+.review__blockers ul {
+  margin: 0.4rem 0;
+  padding-left: 1.1rem;
+}
+
+.operation h3 {
+  margin: 0 0 0.4rem;
+  font-size: 0.9rem;
+  color: #b9b6b0;
+}
+
+.restore-note {
+  border-top: 1px solid #26262d;
+  margin: 0.75rem 0 0;
+  padding-top: 0.75rem;
 }

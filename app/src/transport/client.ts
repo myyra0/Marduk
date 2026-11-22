@@ -6,13 +6,14 @@
  * in this API. Selections are opaque IDs minted by the Rust process.
  */
 
-import { invoke as tauriInvoke } from '@tauri-apps/api/core';
+import { Channel, invoke as tauriInvoke } from '@tauri-apps/api/core';
 
 import {
   parseEnvelope,
   parseOperation,
   parsePrepared,
   parsePreview,
+  parseProgress,
   parseRestoreResult,
   parseSelection,
   parseSnapshot,
@@ -22,6 +23,7 @@ import {
   type Operation,
   type Prepared,
   type Preview,
+  type Progress,
   type RestoreResult,
   type Revision,
   type Selection,
@@ -60,6 +62,15 @@ export class TransportFault extends Error {
   }
 }
 
+/** Progress is a hint keyed by operation and sequence, never a result. */
+export type ProgressHandler = (progress: Progress) => void;
+
+/**
+ * Called when a progress message cannot be decoded, or the channel itself
+ * fails. The caller must reload authoritative state, not retry the write.
+ */
+export type ProgressFaultHandler = () => void;
+
 export interface WorkspaceTransport {
   pickInstallation(): Promise<Envelope<Selection | null>>;
   pickZip(): Promise<Envelope<Selection | null>>;
@@ -73,12 +84,44 @@ export interface WorkspaceTransport {
   importApply(importId: Id): Promise<Envelope<Snapshot>>;
   order(atRevision: Revision, memberIds: readonly Id[]): Promise<Envelope<Snapshot>>;
   deployPreview(atRevision: Revision): Promise<Envelope<Preview>>;
-  deployApply(planId: Id): Promise<Envelope<Operation>>;
-  restore(): Promise<Envelope<RestoreResult>>;
+  deployApply(
+    planId: Id,
+    onProgress?: ProgressHandler,
+    onProgressFault?: ProgressFaultHandler,
+  ): Promise<Envelope<Operation>>;
+  restore(
+    onProgress?: ProgressHandler,
+    onProgressFault?: ProgressFaultHandler,
+  ): Promise<Envelope<RestoreResult>>;
   operation(operationId: Id): Promise<Envelope<Operation>>;
 }
 
-export function createTauriTransport(invoke: InvokeFn = tauriInvoke): WorkspaceTransport {
+export type ChannelFactory = <T>() => Channel<T>;
+
+const defaultChannel: ChannelFactory = <T>() => new Channel<T>();
+
+/** Only deploy/restore carry a channel; reads and previews never do. */
+function progressChannel(
+  makeChannel: ChannelFactory,
+  onProgress?: ProgressHandler,
+  onFault?: ProgressFaultHandler,
+): Channel<Progress> {
+  const channel = makeChannel<Progress>();
+  channel.onmessage = (raw: unknown) => {
+    try {
+      const progress = parseProgress(raw);
+      onProgress?.(progress);
+    } catch {
+      onFault?.();
+    }
+  };
+  return channel;
+}
+
+export function createTauriTransport(
+  invoke: InvokeFn = tauriInvoke,
+  makeChannel: ChannelFactory = defaultChannel,
+): WorkspaceTransport {
   async function request<T>(
     command: Command,
     args: Record<string, unknown> | undefined,
@@ -108,8 +151,18 @@ export function createTauriTransport(invoke: InvokeFn = tauriInvoke): WorkspaceT
     order: (atRevision, memberIds) =>
       request('order', { atRevision, memberIds: [...memberIds] }, parseSnapshot),
     deployPreview: (atRevision) => request('deploy_preview', { atRevision }, parsePreview),
-    deployApply: (planId) => request('deploy_apply', { planId }, parseOperation),
-    restore: () => request('restore', undefined, parseRestoreResult),
+    deployApply: (planId, onProgress, onProgressFault) =>
+      request(
+        'deploy_apply',
+        { planId, onProgress: progressChannel(makeChannel, onProgress, onProgressFault) },
+        parseOperation,
+      ),
+    restore: (onProgress, onProgressFault) =>
+      request(
+        'restore',
+        { onProgress: progressChannel(makeChannel, onProgress, onProgressFault) },
+        parseRestoreResult,
+      ),
     operation: (operationId) => request('operation', { operationId }, parseOperation),
   };
 }
