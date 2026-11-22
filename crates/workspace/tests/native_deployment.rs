@@ -18,7 +18,7 @@ use marduk_core::ids::ProfileRevision;
 use marduk_core::recovery::{Claim, Journal};
 use marduk_storage::operation_journal::OperationJournal;
 use marduk_workspace::{
-    Code, Envelope, Kind, Operation, RestoreResult, Workspace, WorkspaceStatus,
+    Code, Direction, Envelope, Kind, Operation, RestoreResult, Slot, Workspace, WorkspaceStatus,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -27,6 +27,7 @@ use zip_fixture::{ClassicZip, Record};
 const BASE: &[u8] = b"base\n";
 const POST: &[u8] = b"b\n";
 const ONLY: &[u8] = b"only-a\n";
+const OUTSIDE: &[u8] = b"user\n";
 
 fn expect_ok(envelope: Envelope<Value>) -> Value {
     match envelope {
@@ -83,6 +84,7 @@ impl Fixture {
         fs::write(game.join("SkyrimSE.exe"), b"").unwrap();
         fs::write(game.join("Data/textures/winner.dds"), BASE).unwrap();
         fs::write(game.join("Data/textures/untouched.txt"), b"keep\n").unwrap();
+        fs::write(game.join("Data/outside-plan.txt"), OUTSIDE).unwrap();
         let initial = tree(&game);
         let workspace = Workspace::open(&app).unwrap();
         Self {
@@ -204,6 +206,11 @@ fn qualified_native_round_trip_retains_backups_and_restores_the_original_tree() 
     let plan = PlanId::try_from_u64(preview.id.as_ref().unwrap().parse().unwrap()).unwrap();
     let operation = fixture.workspace.proof_apply_deployment(plan).unwrap();
     assert_eq!(operation.phase, "completed");
+    assert!(
+        operation.blocker.is_none(),
+        "apply blocker: {:?}",
+        operation.blocker
+    );
     let operation_id: u64 = operation.id.parse().unwrap();
     let generation = operation.generation_id.clone().expect("generation");
 
@@ -211,6 +218,42 @@ fn qualified_native_round_trip_retains_backups_and_restores_the_original_tree() 
     assert_eq!(after["Data/textures/winner.dds"], POST);
     assert_eq!(after["Data/textures/a-only.dds"], ONLY);
     assert_eq!(after["Data/textures/untouched.txt"], b"keep\n");
+    assert_eq!(after["Data/outside-plan.txt"], OUTSIDE);
+
+    // The status ref for the replaced ordinal must name the actually displaced
+    // object, not only the pre-image copy. The sealed retain location is the
+    // canonical `displaced` slot, or the exchange alias in `stage` on Linux.
+    let replaced = preview
+        .files
+        .iter()
+        .position(|file| file.needs_backup)
+        .expect("a replaced file");
+    let displaced = operation
+        .retained
+        .iter()
+        .find(|retained| {
+            retained.ordinal == replaced as u32
+                && matches!(retained.direction, Direction::Forward)
+                && matches!(retained.slot, Slot::Displaced)
+        })
+        .expect("status names the actually displaced object");
+    assert_eq!(displaced.operation_id, operation.id);
+    let forward = fixture
+        .app
+        .join("effects/ops")
+        .join(operation_id.to_string())
+        .join(replaced.to_string())
+        .join("forward");
+    let sealed = if forward.join("displaced").exists() {
+        forward.join("displaced")
+    } else {
+        forward.join("stage")
+    };
+    assert_eq!(
+        fs::read(&sealed).unwrap(),
+        BASE,
+        "the actually displaced object is retained with its original bytes"
+    );
 
     // Each intent's original backup is the exact pre-deploy artifact; a new
     // file has no original slot.
@@ -244,6 +287,7 @@ fn qualified_native_round_trip_retains_backups_and_restores_the_original_tree() 
     assert!(status.pending.is_none());
     assert_eq!(status.active_generation_id, Some(generation.clone()));
     assert!(fixture.workspace.proof_recover_pending().unwrap().is_none());
+    assert!(fixture.workspace.proof_recover_pending().unwrap().is_none());
     assert_eq!(tree(&fixture.game)["Data/textures/winner.dds"], POST);
 
     // A replay of the claimed plan reports the recorded terminal status and
@@ -257,9 +301,44 @@ fn qualified_native_round_trip_retains_backups_and_restores_the_original_tree() 
         panic!("expected a tracked restore, got {restore:?}");
     };
     assert_eq!(operation.phase, "completed");
+    assert!(
+        operation.blocker.is_none(),
+        "restore blocker: {:?}",
+        operation.blocker
+    );
     assert_eq!(operation.generation_id, None);
 
     assert_eq!(tree(&fixture.game), fixture.initial);
+
+    // Restore consumes the object it displaced into its own sealed retain
+    // location; its status ref must resolve to the deployed bytes.
+    let restore_id: u64 = operation.id.parse().unwrap();
+    let restored = operation
+        .retained
+        .iter()
+        .find(|retained| {
+            retained.ordinal == replaced as u32
+                && matches!(retained.direction, Direction::Forward)
+                && matches!(retained.slot, Slot::Displaced)
+        })
+        .expect("restore status names its displaced object");
+    assert_eq!(restored.operation_id, operation.id);
+    let restore_forward = fixture
+        .app
+        .join("effects/ops")
+        .join(restore_id.to_string())
+        .join(replaced.to_string())
+        .join("forward");
+    let restore_sealed = if restore_forward.join("displaced").exists() {
+        restore_forward.join("displaced")
+    } else {
+        restore_forward.join("stage")
+    };
+    assert_eq!(
+        fs::read(&restore_sealed).unwrap(),
+        POST,
+        "restore retains the deployed object it consumed"
+    );
 
     // A second restore is a typed no-op and changes nothing.
     let second = fixture.workspace.proof_restore().unwrap();

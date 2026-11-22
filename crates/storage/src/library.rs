@@ -70,54 +70,13 @@ impl Catalog {
     /// Configuration and migration run under the library writer gate. PRAGMAs
     /// are read back from the live connection and a mismatch is an error.
     pub fn open(root: &Path) -> Result<Self, ImportError> {
-        Self::open_with_stage(root, None)
-    }
-
-    /// Evidence-run entry: skips only the library-availability check, so a
-    /// volume whose staging *adapter* is witnessed but whose product import
-    /// gate is closed can run the deploy harness. Root binding, ownership,
-    /// SQLite proof and the stage bind below are unchanged.
-    #[cfg(feature = "evidence")]
-    pub fn open_for_evidence(root: &Path) -> Result<Self, ImportError> {
-        Self::open_with_stage(root, Some(true))
-    }
-
-    /// `stage_qualified` is decided after the root exists; `None` asks the
-    /// availability record, `Some(true)` is the evidence override.
-    fn open_with_stage(root: &Path, stage_qualified: Option<bool>) -> Result<Self, ImportError> {
-        // Windows cannot hold a pinned read-only root handle and the staging
-        // adapter's write handle at the same time. An evidence run creates the
-        // private tree, releases that handle, binds the stage, and then keeps a
-        // clone of the stage's pinned root handle. Boundary checks are the same
-        // and no handle permits delete sharing, so the root stays pinned.
-        let evidence_stage = if stage_qualified == Some(true) {
-            let temporary =
-                marduk_platform::open_private_directory(root).map_err(|_| ImportError::Storage)?;
-            marduk_platform::open_private_child_directory(&temporary, REVISIONS_DIR)
-                .map_err(|_| ImportError::Storage)?;
-            drop(temporary);
-            let stage = Self::select_stage(true, root);
-            Some(stage)
-        } else {
-            None
-        };
         // Prove the app-owned root before creating anything beneath it. The
         // handle refuses a final symlink/junction, so a redirect cannot turn a
         // later `revisions/`, lock or SQLite write into a game-tree write.
-        #[cfg(feature = "evidence")]
-        let root_handle = match evidence_stage.as_ref().and_then(StageAdapter::root_file) {
-            Some(handle) => handle,
-            None => {
-                marduk_platform::open_private_directory(root).map_err(|_| ImportError::Storage)?
-            }
-        };
-        #[cfg(not(feature = "evidence"))]
         let root_handle =
             marduk_platform::open_private_directory(root).map_err(|_| ImportError::Storage)?;
-        if evidence_stage.is_none() {
-            marduk_platform::open_private_child_directory(&root_handle, REVISIONS_DIR)
-                .map_err(|_| ImportError::Storage)?;
-        }
+        marduk_platform::open_private_child_directory(&root_handle, REVISIONS_DIR)
+            .map_err(|_| ImportError::Storage)?;
 
         let gate =
             WriterGate::open_at(&root_handle, crate::schema::LOCK_FILE).map_err(gate_error)?;
@@ -140,14 +99,12 @@ impl Catalog {
             .map_err(|_| ImportError::Storage)?;
         // The SQLite pathname cannot consume the descriptor, so re-prove that
         // it still names the pinned directory after the open.
-        verify_root_path(root, &root_handle, evidence_stage.is_some())
-            .map_err(|_| ImportError::Storage)?;
+        verify_root_path(root, &root_handle).map_err(|_| ImportError::Storage)?;
         crate::schema::prepare(&mut connection).map_err(|_| ImportError::Storage)?;
         catalog
             .verify(&root_handle)
             .map_err(|_| ImportError::Storage)?;
-        verify_root_path(root, &root_handle, evidence_stage.is_some())
-            .map_err(|_| ImportError::Storage)?;
+        verify_root_path(root, &root_handle).map_err(|_| ImportError::Storage)?;
 
         Ok(Self {
             root: root.to_path_buf(),
@@ -155,13 +112,7 @@ impl Catalog {
             _catalog: catalog,
             connection,
             gate,
-            stage: evidence_stage.unwrap_or_else(|| {
-                Self::select_stage(
-                    stage_qualified
-                        .unwrap_or_else(|| marduk_platform::library_volume_qualified(root)),
-                    root,
-                )
-            }),
+            stage: Self::select_stage(marduk_platform::library_volume_qualified(root), root),
         })
     }
 
@@ -752,18 +703,11 @@ impl Catalog {
     }
 }
 
-/// Re-prove the root by pathname and handle. The evidence composition holds a
-/// staging root with write access, so its path open must also share write.
+/// Re-prove the root by pathname and handle.
 pub(crate) fn verify_root_path(
     root: &Path,
     handle: &File,
-    evidence: bool,
 ) -> Result<(), marduk_core::root_identity::RootError> {
-    #[cfg(feature = "evidence")]
-    if evidence {
-        return marduk_platform::verify_private_directory_for_evidence(root, handle);
-    }
-    let _ = evidence;
     marduk_platform::verify_private_directory(root, handle)
 }
 
@@ -784,16 +728,6 @@ enum StageAdapter {
 }
 
 impl StageAdapter {
-    /// Evidence-only: the native stage's pinned root handle, cloned so the
-    /// catalog can hold containment without a second root open.
-    #[cfg(feature = "evidence")]
-    fn root_file(&self) -> Option<std::fs::File> {
-        match self {
-            Self::Native(adapter) => adapter.root_file().try_clone().ok(),
-            _ => None,
-        }
-    }
-
     fn available(&self) -> bool {
         match self {
             Self::Unavailable(_) => false,

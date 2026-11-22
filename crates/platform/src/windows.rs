@@ -508,20 +508,6 @@ mod root {
         open_selection_shared(path, create, FILE_SHARE_READ, FILE_SHARE_READ)
     }
 
-    /// The evidence composition opens the same root more than once (catalog
-    /// pin, journal and staging adapter), so every component also shares write
-    /// access. Delete sharing stays off, so the root cannot be renamed or
-    /// replaced.
-    #[cfg(feature = "evidence")]
-    fn open_selection_for_evidence(path: &Path) -> Result<Vec<RootDir>, RootError> {
-        open_selection_shared(
-            path,
-            true,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-        )
-    }
-
     fn open_selection_shared(
         path: &Path,
         create: bool,
@@ -1510,14 +1496,6 @@ mod root {
         open_selection(path, true).map(|mut chain| chain.pop().expect("pinned root").file)
     }
 
-    /// Evidence-only root open whose final handle also shares write access, so
-    /// the catalog pin and the staging adapter can coexist. Delete sharing is
-    /// still refused, so the root remains pinned against rename or replacement.
-    #[cfg(feature = "evidence")]
-    pub(crate) fn open_private_directory_for_evidence(path: &Path) -> Result<File, RootError> {
-        open_selection_for_evidence(path).map(|mut chain| chain.pop().expect("pinned root").file)
-    }
-
     pub(crate) fn open_private_child_directory(
         parent: &File,
         name: &str,
@@ -1526,17 +1504,6 @@ mod root {
             return Err(RootError::TargetUnavailable);
         }
         open_private_directory(Path::new(&join(&final_path(parent)?, name)))
-    }
-
-    #[cfg(feature = "evidence")]
-    pub(crate) fn open_private_child_directory_for_evidence(
-        parent: &File,
-        name: &str,
-    ) -> Result<File, RootError> {
-        if !ordinary_component(name) {
-            return Err(RootError::TargetUnavailable);
-        }
-        open_private_directory_for_evidence(Path::new(&join(&final_path(parent)?, name)))
     }
 
     pub(crate) fn private_child_path(parent: &File, name: &str) -> Result<PathBuf, RootError> {
@@ -1555,32 +1522,9 @@ mod root {
         Ok(())
     }
 
-    /// Evidence-only identity check whose path open shares write access, so it
-    /// can run while the staging adapter holds the same root with write access.
-    #[cfg(feature = "evidence")]
-    pub(crate) fn verify_private_directory_for_evidence(
-        path: &Path,
-        handle: &File,
-    ) -> Result<(), RootError> {
-        let expected = directory_identity_shared(path)?;
-        let actual = RootIdentity::from_adapter_evidence(identity(handle)?);
-        if expected != actual {
-            return Err(RootError::TargetUnavailable);
-        }
-        Ok(())
-    }
-
     pub(crate) fn directory_identity(path: &Path) -> Result<RootIdentity, RootError> {
         let text = path.to_str().ok_or(RootError::TargetUnavailable)?;
         let file = open_path(text, DIRECTORY_ACCESS).map_err(|_| RootError::TargetUnavailable)?;
-        Ok(verify_root(file)?.identity)
-    }
-
-    #[cfg(feature = "evidence")]
-    fn directory_identity_shared(path: &Path) -> Result<RootIdentity, RootError> {
-        let text = path.to_str().ok_or(RootError::TargetUnavailable)?;
-        let file = open_path_shared(text, DIRECTORY_ACCESS, FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .map_err(|_| RootError::TargetUnavailable)?;
         Ok(verify_root(file)?.identity)
     }
 
@@ -1855,13 +1799,6 @@ mod root {
     }
 
     impl StagingTree {
-        /// The pinned root handle, for the evidence-only catalog composition
-        /// that must not open the same root a second time.
-        #[cfg(feature = "evidence")]
-        pub(crate) fn root_file(&self) -> &std::fs::File {
-            &self.root.file
-        }
-
         pub(crate) fn open(root: &Path) -> Result<Self, RootError> {
             let text = root.to_str().ok_or(RootError::TargetUnavailable)?;
             // No delete sharing: while this handle is bound the root name cannot
@@ -2519,12 +2456,6 @@ pub(crate) use root::{
     open_private_child_directory, open_private_directory, private_child_path, reopen_installation,
     resolve_existing_parent, staged_entry_is_private, staging_volume_qualified,
     verify_private_directory, volume_class,
-};
-
-#[cfg(feature = "evidence")]
-pub(crate) use root::{
-    open_private_child_directory_for_evidence, open_private_directory_for_evidence,
-    verify_private_directory_for_evidence,
 };
 
 /// Product library import is closed on Windows: the record proves the staging

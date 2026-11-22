@@ -434,60 +434,18 @@ pub struct Workspace {
     catalog: Catalog,
     journal: OperationJournal,
     selections: SelectionStore,
-    /// Test-only evidence runs may open an adapter on a volume whose adapter
-    /// availability is unproven; product `open` always leaves this false.
-    #[cfg_attr(not(feature = "evidence"), allow(dead_code))]
-    evidence: bool,
 }
 
 impl Workspace {
     /// Open the shared state under the application data root.
     pub fn open(app_data: &Path) -> Result<Self, WireError> {
-        Self::open_with(app_data, false)
-    }
-
-    /// Evidence-run entry, enabled only by the `evidence` feature: opens the
-    /// catalog for staging where only its adapter is witnessed and lets the
-    /// proof lane use [`NativeEffects::open_for_evidence`]. It does not open
-    /// the client gate or any dispatch route.
-    #[cfg(feature = "evidence")]
-    pub fn open_for_evidence(app_data: &Path) -> Result<Self, WireError> {
-        Self::open_with(app_data, true)
-    }
-
-    fn open_with(app_data: &Path, evidence: bool) -> Result<Self, WireError> {
-        #[cfg(feature = "evidence")]
-        let catalog = if evidence {
-            Catalog::open_for_evidence(app_data)
-        } else {
-            Catalog::open(app_data)
-        }
-        .map_err(import_error)?;
-        #[cfg(not(feature = "evidence"))]
-        let catalog = {
-            let _ = evidence;
-            Catalog::open(app_data).map_err(import_error)?
-        };
-        let journal = {
-            #[cfg(feature = "evidence")]
-            if evidence {
-                OperationJournal::open_for_evidence(app_data)
-            } else {
-                OperationJournal::open(app_data)
-            }
-            #[cfg(not(feature = "evidence"))]
-            {
-                let _ = evidence;
-                OperationJournal::open(app_data)
-            }
-        }
-        .map_err(deploy_error)?;
+        let catalog = Catalog::open(app_data).map_err(import_error)?;
+        let journal = OperationJournal::open(app_data).map_err(deploy_error)?;
         Ok(Self {
             app_data: app_data.to_path_buf(),
             catalog,
             journal,
             selections: SelectionStore::new(),
-            evidence,
         })
     }
 
@@ -891,15 +849,6 @@ impl Workspace {
     }
 
     fn native_effects(&self, selected: &SelectedInstallation) -> Result<NativeEffects, WireError> {
-        #[cfg(feature = "evidence")]
-        if self.evidence {
-            return NativeEffects::open_for_evidence(
-                &self.app_data,
-                &selected.locator,
-                skyrim_se::LAYOUT,
-            )
-            .map_err(deploy_error);
-        }
         NativeEffects::open(&self.app_data, &selected.locator, skyrim_se::LAYOUT)
             .map_err(deploy_error)
     }
@@ -907,12 +856,12 @@ impl Workspace {
     /// Synthetic proof lane for the native copy adapter.
     ///
     /// Preview, Apply and Restore are deliberately unreachable from
-    /// [`Workspace::dispatch`] until the C1 proof lane records its rows in
-    /// `docs/research/m1-native-results.md`. Tests drive the same catalog,
-    /// journal and adapter composition here; the adapter itself refuses an
-    /// unqualified volume with a typed error. Reconciliation is the exception:
-    /// [`Op::Recover`] reaches the same route because recorded pending work
-    /// must be settled after a crash.
+    /// [`Workspace::dispatch`]: client deploy and restore stay closed by the C1
+    /// write-authority decision. Tests drive the same catalog, journal and
+    /// adapter composition here; the adapter itself refuses an unqualified
+    /// volume with a typed error. Reconciliation is the exception: [`Op::Recover`]
+    /// reaches the same route because recorded pending work must be settled
+    /// after a crash.
     #[doc(hidden)]
     pub fn proof_preview_deployment(
         &mut self,
@@ -1193,11 +1142,12 @@ fn phase(phase: Phase) -> &'static str {
 
 /// One decision point for client-visible deploy/restore availability.
 ///
-/// Real Apply and Restore stay closed until the availability record
-/// (`marduk_core::qualification`, deploy layer) proves them; every
-/// configuration is unproven there today. Synthetic runs reach the adapter only
-/// through the `proof_*` methods; the write-authority rule is owned by
-/// `docs/contracts/m1-clients.md`.
+/// Deploy and Restore stay closed on every configuration by the C1
+/// write-authority decision (`docs/contracts/m1-clients.md`); the availability
+/// record's deploy rows describe proof-lane composition runs only. When a
+/// client-visible rung exists, this gate queries `marduk_core::qualification`
+/// for it instead of returning a constant refusal. Synthetic runs reach the
+/// adapter only through the `proof_*` methods.
 fn native_effects_gate() -> Result<(), WireError> {
     Err(unsupported_effect())
 }

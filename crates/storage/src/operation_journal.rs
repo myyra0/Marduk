@@ -58,30 +58,8 @@ pub struct SelectedInstallation {
 impl OperationJournal {
     /// Open (and migrate) the shared catalog under the application data root.
     pub fn open(app_data: &Path) -> Result<Self, DeployError> {
-        Self::open_with(app_data, false)
-    }
-
-    /// Evidence-only open that uses a root handle sharing write access, so the
-    /// journal can run beside the staging adapter on Windows. Boundary checks
-    /// are unchanged.
-    #[cfg(feature = "evidence")]
-    pub fn open_for_evidence(app_data: &Path) -> Result<Self, DeployError> {
-        Self::open_with(app_data, true)
-    }
-
-    fn open_with(app_data: &Path, evidence: bool) -> Result<Self, DeployError> {
-        #[cfg(feature = "evidence")]
-        let root_handle = if evidence {
-            marduk_platform::open_private_directory_for_evidence(app_data)
-                .map_err(|_| DeployError::Io)?
-        } else {
-            marduk_platform::open_private_directory(app_data).map_err(|_| DeployError::Io)?
-        };
-        #[cfg(not(feature = "evidence"))]
-        let root_handle = {
-            let _ = evidence;
-            marduk_platform::open_private_directory(app_data).map_err(|_| DeployError::Io)?
-        };
+        let root_handle =
+            marduk_platform::open_private_directory(app_data).map_err(|_| DeployError::Io)?;
         let gate = WriterGate::open_at(&root_handle, crate::schema::JOURNAL_LOCK_FILE)
             .map_err(gate_error)?;
         let catalog =
@@ -95,14 +73,12 @@ impl OperationJournal {
         let mut connection = Connection::open_with_flags(&path, OpenFlags::default())
             .map_err(|_| DeployError::Io)?;
         catalog.verify(&root_handle).map_err(|_| DeployError::Io)?;
-        crate::library::verify_root_path(app_data, &root_handle, evidence)
-            .map_err(|_| DeployError::Io)?;
+        crate::library::verify_root_path(app_data, &root_handle).map_err(|_| DeployError::Io)?;
 
         let _guard = gate.try_lock().map_err(gate_error)?;
         crate::schema::prepare(&mut connection).map_err(|_| DeployError::Io)?;
         catalog.verify(&root_handle).map_err(|_| DeployError::Io)?;
-        crate::library::verify_root_path(app_data, &root_handle, evidence)
-            .map_err(|_| DeployError::Io)?;
+        crate::library::verify_root_path(app_data, &root_handle).map_err(|_| DeployError::Io)?;
 
         Ok(Self {
             root: app_data.to_path_buf(),

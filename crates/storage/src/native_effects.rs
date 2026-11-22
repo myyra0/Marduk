@@ -88,54 +88,16 @@ impl NativeEffects {
         if !effects::volume_qualified(app_data) || !effects::volume_qualified(locator) {
             return Err(DeployError::UnsupportedTarget);
         }
-        Self::bind(app_data, locator, layout, false)
+        Self::bind(app_data, locator, layout)
     }
 
-    /// Evidence-run entry: skips only the availability check, so a volume
-    /// whose primitives are witnessed but whose adapter gate is closed can run
-    /// the deploy harness. The binding, boundary, ownership, mount and gate
-    /// checks in [`Self::bind`] are the same as production.
-    #[cfg(feature = "evidence")]
-    pub fn open_for_evidence(
-        app_data: &Path,
-        locator: &Path,
-        layout: GameLayout,
-    ) -> Result<Self, DeployError> {
-        Self::bind(app_data, locator, layout, true)
-    }
-
-    fn bind(
-        app_data: &Path,
-        locator: &Path,
-        layout: GameLayout,
-        evidence: bool,
-    ) -> Result<Self, DeployError> {
+    fn bind(app_data: &Path, locator: &Path, layout: GameLayout) -> Result<Self, DeployError> {
         let binding = marduk_platform::bind_installation(locator, &layout).map_err(map_root)?;
-        #[cfg(feature = "evidence")]
-        let root_handle = if evidence {
-            marduk_platform::open_private_directory_for_evidence(app_data)
-                .map_err(|_| DeployError::Io)?
-        } else {
-            marduk_platform::open_private_directory(app_data).map_err(|_| DeployError::Io)?
-        };
-        #[cfg(not(feature = "evidence"))]
-        let root_handle = {
-            let _ = evidence;
-            marduk_platform::open_private_directory(app_data).map_err(|_| DeployError::Io)?
-        };
-        #[cfg(feature = "evidence")]
-        let effects_directory = if evidence {
-            marduk_platform::open_private_child_directory_for_evidence(&root_handle, "effects")
-        } else {
+        let root_handle =
+            marduk_platform::open_private_directory(app_data).map_err(|_| DeployError::Io)?;
+        let effects_directory =
             marduk_platform::open_private_child_directory(&root_handle, "effects")
-        }
-        .map_err(|_| DeployError::Io)?;
-        #[cfg(not(feature = "evidence"))]
-        let effects_directory = {
-            let _ = evidence;
-            marduk_platform::open_private_child_directory(&root_handle, "effects")
-                .map_err(|_| DeployError::Io)?
-        };
+                .map_err(|_| DeployError::Io)?;
         drop(effects_directory);
         let private = marduk_platform::private_child_path(&root_handle, "effects")
             .map_err(|_| DeployError::Io)?;
@@ -264,23 +226,32 @@ impl NativeEffects {
         Ok(resolved)
     }
 
-    /// Windows effects move by path, and a pinned parent opened with read-only
-    /// sharing makes `MoveFileExW` fail with `ERROR_SHARING_VIOLATION`. The
-    /// boundary check already ran against the pinned handle; swap it for the
-    /// standard-sharing handle the effect primitives use. Linux keeps the
-    /// descriptor because `renameat2` is descriptor-relative.
-    fn effect_directory(target_directory: File, target_path: &Path) -> Result<File, RootError> {
+    /// Hold the identity-proven parent handle across the public effect.
+    ///
+    /// Linux consumes the descriptor directly (`renameat2` is descriptor-
+    /// relative). The Win32 primitives move by pathname and do not use the
+    /// handle, so the parent identity is re-proved from the pathname
+    /// immediately before the call while the original handle stays open and
+    /// keeps denying delete sharing. Reopening the parent here would release
+    /// that pin and admit replacement. The re-proof-to-syscall window is the
+    /// accepted final-window substitution; Windows deploy cannot run yet
+    /// because the durability barrier refuses every configuration, so this
+    /// branch is not witnessed until Windows deploy is qualified.
+    fn effect_directory(
+        target_directory: File,
+        target_path: &Path,
+        target_parent_identity: &RootIdentity,
+    ) -> Result<File, RootError> {
         #[cfg(windows)]
         {
-            drop(target_directory);
             let parent = target_path.parent().ok_or(RootError::TargetUnavailable)?;
-            effects::open_directory(parent)
+            if &effects::directory_identity(parent)? != target_parent_identity {
+                return Err(RootError::OutsideBoundary);
+            }
         }
         #[cfg(not(windows))]
-        {
-            let _ = target_path;
-            Ok(target_directory)
-        }
+        let _ = (target_path, target_parent_identity);
+        Ok(target_directory)
     }
 
     fn observe_bound(&self, target: &BoundTarget) -> Observation {
@@ -473,10 +444,11 @@ impl NativeEffects {
             Ok(directory) => directory,
             Err(error) => return EffectOutcome::Unavailable(error),
         };
-        let target_dir = match Self::effect_directory(target_directory, &target_path) {
-            Ok(directory) => directory,
-            Err(error) => return EffectOutcome::Unavailable(error),
-        };
+        let target_dir =
+            match Self::effect_directory(target_directory, &target_path, &target_parent_identity) {
+                Ok(directory) => directory,
+                Err(error) => return EffectOutcome::Unavailable(error),
+            };
 
         self.trace(ProofEvent::PublicEffect);
         let result = effects::publish(
@@ -624,10 +596,11 @@ impl NativeEffects {
         // The displaced object is retained in the canonical `displaced` slot;
         // the stage slot is vacated onto the target.
         let retain_path = self.backup_path(retain);
-        let target_dir = match Self::effect_directory(target_directory, &target_path) {
-            Ok(directory) => directory,
-            Err(error) => return EffectOutcome::Unavailable(error),
-        };
+        let target_dir =
+            match Self::effect_directory(target_directory, &target_path, &target_parent_identity) {
+                Ok(directory) => directory,
+                Err(error) => return EffectOutcome::Unavailable(error),
+            };
         self.trace(ProofEvent::PublicEffect);
         let result = effects::replace(
             &stage_dir,
@@ -755,10 +728,11 @@ impl NativeEffects {
             Ok(directory) => directory,
             Err(error) => return EffectOutcome::Unavailable(error),
         };
-        let target_dir = match Self::effect_directory(target_directory, &target_path) {
-            Ok(directory) => directory,
-            Err(error) => return EffectOutcome::Unavailable(error),
-        };
+        let target_dir =
+            match Self::effect_directory(target_directory, &target_path, &target_parent_identity) {
+                Ok(directory) => directory,
+                Err(error) => return EffectOutcome::Unavailable(error),
+            };
 
         self.trace(ProofEvent::PublicEffect);
         let result = effects::detach(

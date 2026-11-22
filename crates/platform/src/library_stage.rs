@@ -57,13 +57,6 @@ pub struct NativeStage {
 }
 
 impl NativeStage {
-    /// Evidence-only access to the pinned root handle, so the catalog can keep
-    /// the same containment handle instead of reopening the root.
-    #[cfg(feature = "evidence")]
-    pub fn root_file(&self) -> &std::fs::File {
-        self.tree.root_file()
-    }
-
     /// Connect only volumes with recorded runtime evidence; everything else is
     /// `StageUnavailable` (`docs/research/m1-native-results.md`). The catalog
     /// root alone is not the staging boundary: `revisions/` is bound by a live

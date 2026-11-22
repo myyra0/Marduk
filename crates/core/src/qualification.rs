@@ -73,6 +73,10 @@ pub enum Layer {
     Adapter,
     /// Publication through the production catalog ran.
     Catalog,
+    /// The whole workspace service was composed (production catalog, journal
+    /// and native adapter) and preview/apply/restore ran through the proof
+    /// lane. No client route served the run.
+    Composition,
     /// A client-visible deploy or restore ran.
     Deploy,
 }
@@ -115,6 +119,7 @@ impl fmt::Display for Layer {
             Self::Staging => "staging",
             Self::Adapter => "adapter",
             Self::Catalog => "catalog",
+            Self::Composition => "composition",
             Self::Deploy => "deploy",
         })
     }
@@ -260,19 +265,19 @@ pub const PROOFS: &[Proof] = &[
         capability: Capability::NativeEffects,
         os: Os::Linux,
         volume: VolumeClass::Btrfs,
-        layer: Layer::Deploy,
-        witnesses: &["deploy_round_trip_retains_and_restores_on_linux_tmpfs_or_btrfs"],
+        layer: Layer::Composition,
+        witnesses: &["qualified_native_round_trip_retains_backups_and_restores_the_original_tree"],
         date: "2026-11-22",
-        revision: "59733a3",
+        revision: "2b6b51d",
     },
     Proof {
         capability: Capability::NativeEffects,
         os: Os::Linux,
         volume: VolumeClass::Tmpfs,
-        layer: Layer::Deploy,
-        witnesses: &["deploy_round_trip_retains_and_restores_on_linux_tmpfs_or_btrfs"],
+        layer: Layer::Composition,
+        witnesses: &["qualified_native_round_trip_retains_backups_and_restores_the_original_tree"],
         date: "2026-11-22",
-        revision: "59733a3",
+        revision: "2b6b51d",
     },
 ];
 
@@ -413,11 +418,26 @@ mod tests {
     }
 
     #[test]
-    fn deploy_and_restore_follow_the_witnessed_deploy_evidence() {
-        let witnessed = [
-            (Os::Linux, VolumeClass::Btrfs),
-            (Os::Linux, VolumeClass::Tmpfs),
-        ];
+    fn composition_is_proven_on_the_two_linux_volumes_but_client_routes_stay_closed() {
+        for volume in [VolumeClass::Btrfs, VolumeClass::Tmpfs] {
+            let proof = qualification(Capability::NativeEffects, Route::Adapter, Os::Linux, volume)
+                .proof
+                .expect("adapter proof");
+            assert_eq!(proof.layer, Layer::Adapter);
+            assert!(
+                PROOFS
+                    .iter()
+                    .any(|proof| proof.capability == Capability::NativeEffects
+                        && proof.os == Os::Linux
+                        && proof.volume == volume
+                        && proof.layer == Layer::Composition),
+                "the composition run is recorded for Linux {volume}"
+            );
+        }
+    }
+
+    #[test]
+    fn deploy_and_restore_routes_stay_closed_on_every_configuration() {
         for capability in [
             Capability::LibraryStaging,
             Capability::EffectPrimitives,
@@ -431,13 +451,10 @@ mod tests {
                     VolumeClass::Ntfs,
                     VolumeClass::Other,
                 ] {
-                    let expected = capability == Capability::NativeEffects
-                        && witnessed.contains(&(os, volume));
                     for route in [Route::Deploy, Route::Restore] {
-                        assert_eq!(
-                            is_available(capability, route, os, volume),
-                            expected,
-                            "{capability} {route:?} on {os}/{volume}"
+                        assert!(
+                            !is_available(capability, route, os, volume),
+                            "{capability} {route:?} on {os}/{volume} must stay closed"
                         );
                     }
                 }
@@ -492,12 +509,18 @@ mod tests {
             } else {
                 Route::Adapter
             };
-            assert_eq!(
-                qualification(proof.capability, route, proof.os, proof.volume)
-                    .proof
-                    .map(|proven| proven.layer),
-                Some(proof.layer)
+            assert!(
+                qualification(proof.capability, route, proof.os, proof.volume).available(),
+                "{proof:?} is not reached by {route:?}"
             );
+            if matches!(proof.layer, Layer::Adapter | Layer::Catalog) {
+                assert_eq!(
+                    qualification(proof.capability, route, proof.os, proof.volume)
+                        .proof
+                        .map(|proven| proven.layer),
+                    Some(proof.layer)
+                );
+            }
         }
     }
 }

@@ -68,15 +68,6 @@ pub fn open_private_directory(path: &Path) -> Result<std::fs::File, RootError> {
     native::open_private_directory(path)
 }
 
-/// Evidence-only root open. On Windows it also shares write access on the final
-/// handle so the catalog pin and staging adapter can hold the same root
-/// simultaneously; delete sharing is still refused. On Linux it is identical
-/// to [`open_private_directory`].
-#[cfg(feature = "evidence")]
-pub fn open_private_directory_for_evidence(path: &Path) -> Result<std::fs::File, RootError> {
-    native::open_private_directory_for_evidence(path)
-}
-
 /// Whether the availability record proves private-library staging on the volume
 /// holding `root`. `marduk_core::qualification` is the decision owner; this
 /// function only observes the volume and asks. Unqualified volumes must not
@@ -95,16 +86,6 @@ pub fn open_private_child_directory(
     native::open_private_child_directory(parent, name)
 }
 
-/// Evidence-only variant of [`open_private_child_directory`] whose Windows
-/// path open shares write access on every component.
-#[cfg(feature = "evidence")]
-pub fn open_private_child_directory_for_evidence(
-    parent: &std::fs::File,
-    name: &str,
-) -> Result<std::fs::File, RootError> {
-    native::open_private_child_directory_for_evidence(parent, name)
-}
-
 /// Resolve a child pathname that stays beneath the pinned parent handle.
 ///
 /// The parent must remain open for the returned path to keep its meaning.
@@ -119,16 +100,6 @@ pub fn private_child_path(
 /// use this around a pathname-based open that cannot consume the handle.
 pub fn verify_private_directory(path: &Path, handle: &std::fs::File) -> Result<(), RootError> {
     native::verify_private_directory(path, handle)
-}
-
-/// Evidence-only variant of [`verify_private_directory`] whose path open also
-/// shares write access on Windows, so it can run beside the staging adapter.
-#[cfg(feature = "evidence")]
-pub fn verify_private_directory_for_evidence(
-    path: &Path,
-    handle: &std::fs::File,
-) -> Result<(), RootError> {
-    native::verify_private_directory_for_evidence(path, handle)
 }
 
 /// A regular file opened or created directly beneath a pinned app-owned

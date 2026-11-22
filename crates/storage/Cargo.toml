@@ -4,11 +4,6 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
-[features]
-# Enables the test-only evidence entry points that skip the availability check
-# for a deploy-round-trip run. Off by default; product builds must not enable it.
-evidence = ["marduk-platform/evidence"]
-
 [dependencies]
 marduk-core = { path = "../core" }
 marduk-platform = { path = "../platform" }

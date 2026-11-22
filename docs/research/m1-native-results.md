@@ -1,6 +1,6 @@
 # M1-R03 native results
 
-Runtime evidence from 2026-11-22 (IST), code commit `29e587d`, base `ebd9e07`. Task 6 native-adapter rows were re-tested at `101b4f7` (recovery fix `7feb64b`). `not run` is never a pass. No power-cut or VM evidence exists.
+Runtime evidence from 2026-11-22 (IST), code commit `29e587d`, base `ebd9e07`. Task 6 native-adapter rows were re-tested at `101b4f7` (recovery fix `7feb64b`), and the composition round trip was re-run at `2b6b51d` with the evidence-lane review fix in the working tree. `not run` is never a pass. No power-cut or VM evidence exists.
 
 Close-out 2026-11-22: the Task 5 gate blocked native wiring; a later Task 5 continuation connected private-library staging on the two Linux volume classes with runtime evidence (Btrfs and tmpfs), and the Windows staging adapter is implemented and witnessed on NTFS while its product gate stays closed; see [Qualified library staging](#qualified-library-staging-connected-2026-11-22). Native game-directory preview, Apply and Restore are connected in the workspace proof lane on the two Linux volume classes (Task 6), but client `dispatch` still refuses them behind the closed C1 gate. `not run` rows stay `not run`.
 
@@ -98,36 +98,37 @@ Windows product availability stays closed: the record's NTFS proofs reach only t
 
 Deploy-level NTFS rows remain `not run`; only the private staging adapter is evidenced here.
 
-### Deploy round trip
+### Composition round trip
 
-`crates/workspace/tests/deploy_evidence.rs` drives the real `Catalog`, `OperationJournal`
-and `NativeEffects` adapter through setup, ZIP import, member order, preview,
-apply and restore. On a volume where both production availability checks already
-pass it uses the production constructors; elsewhere it uses the feature-gated
-`open_for_evidence` entry, which skips only availability. Boundary, ownership,
-mount and gate checks are unchanged. The client `dispatch` routes stay closed.
+`crates/workspace/tests/native_deployment.rs::qualified_native_round_trip_retains_backups_and_restores_the_original_tree`
+drives the production `Workspace` — the real `Catalog`, `OperationJournal` and
+`NativeEffects` — through setup, ZIP import, member order, preview, apply,
+restart, plan replay and restore on a qualified volume. Preview, Apply and
+Restore run through the `proof_*` methods; no client `dispatch` route serves
+them and the C1 gate still reports both unavailable. This is the composition
+rung: the whole service composed and ran, but no client-visible deploy or
+restore route did.
 
-| Deploy witness | Linux Btrfs | Linux tmpfs | Linux ext4 | Windows NTFS | Power |
-|---|---|---|---|---|---|
-| `deploy_round_trip_retains_and_restores_on_linux_tmpfs_or_btrfs` | ran 2026-11-22 at `59733a3`, passed | ran 2026-11-22 at `59733a3`, passed | not run | not run | — |
-| `deploy_round_trip_retains_and_restores_on_ntfs` | not run | not run | not run | not run (blocked at the durability barrier, `UnsupportedTarget`) | — |
+The separate `deploy_evidence` test and its `evidence` feature entry points were
+deleted. That build could force the stage open and serve a wire import while the
+product import gate was closed, opened the root in a different order from
+production, and duplicated this witness with a weaker plan-replay check.
 
-Linux runs: `TMPDIR=/tmp` and `TMPDIR=/var/tmp cargo test -p marduk-workspace
---features evidence --test deploy_evidence -- --ignored` → `running 1 test`,
-`test result: ok. 1 passed; 0 failed` on both volumes. Each run asserted exact
-target bytes (`b\n`, `only-a\n`), the untouched `keep\n` and outside-plan `user\n`
-sentinels, the sealed `original` slot containing `base\n` for the replaced file
-and no original slot for the created file, the recorded generation and a clean
-operation status, two `recover_pending` no-ops, then a byte-for-byte original
-tree and cleared generation after restore.
+The witness now also asserts the outside-plan sentinel (`user\n`) is unchanged,
+`blocker.is_none()` for apply and restore, the second `proof_recover_pending` is
+a no-op, and the restore clears the generation. For the actually displaced
+object it finds the status `Displaced` ref for the replaced ordinal and reads
+`base\n` from the sealed retain location (the canonical `displaced` slot, or the
+Linux exchange alias in `stage`), then confirms restore consumes the deployed
+object into its own sealed retain slot. The earlier harness only read the
+pre-image `original` copy, so a broken retain path could pass.
 
-Windows: the same harness compiled and ran on `C:` (NTFS, serial `0x88be19a`,
-Windows 10 `DESKTOP-4NP2KM5`, `rustc 1.100.0`) at `59733a3`, and
-`cargo check -p marduk-platform --all-targets` passed. Apply reached the
-adapter and was refused by `NativeEffects::durability_barrier` with
-`UnsupportedTarget`/`Configuration`, because no non-admin Windows namespace
-barrier is qualified. That is a contract refusal, not a test failure to route
-around: no Windows deploy row is claimed.
+`TMPDIR=/tmp` (tmpfs) and `TMPDIR=/var/tmp` (Btrfs) `cargo test -p
+marduk-workspace --locked --test native_deployment -- --ignored` → 4 passed.
+Windows deploy remains unproven: the adapter refuses at the durability barrier
+(`UnsupportedTarget`/`Configuration`) before any effect, so the pathname effect
+branch described in [R02](../contracts/m1-recovery.md#native-seam-that-r03-must-qualify)
+has no Windows runtime witness until Windows deploy is qualified.
 
 ### Detach and classification witnesses
 
@@ -176,7 +177,7 @@ classes.
 
 | Witness | Linux Btrfs | Linux tmpfs | Linux ext4 | Hosted `windows-2025` NTFS |
 |---|---|---|---|---|
-| `qualified_native_round_trip_retains_backups_and_restores_the_original_tree` (workspace: setup → import → order → preview → apply → restart → replay → restore) | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
+| `qualified_native_round_trip_retains_backups_and_restores_the_original_tree` (workspace: setup → import → order → preview → apply → restart → replay → restore) | ran 2026-11-22 at `2b6b51d`, passed | ran 2026-11-22 at `2b6b51d`, passed | not run | not run |
 | `restart_after_apply_before_ack_rolls_back_and_never_reapplies` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
 | `restart_after_record_undo_uses_the_sealed_stage_fingerprint` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
 | `restart_mid_restore_continues_in_reverse_order` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
