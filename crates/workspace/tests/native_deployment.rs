@@ -135,6 +135,19 @@ fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
     found
 }
 
+/// Sorted child names, or none when the directory was never created.
+fn entry_names(path: &Path) -> Vec<String> {
+    let mut names = match fs::read_dir(path) {
+        Ok(entries) => entries
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("{error}"),
+    };
+    names.sort();
+    names
+}
+
 struct Fixture {
     temp: TempDir,
     app: PathBuf,
@@ -570,6 +583,103 @@ fn visible_xattr_on_an_original_is_refused_before_any_write() {
     }
 }
 
+/// A completed plan is a journal-only answer. Losing the installation root
+/// must not turn a replay into `UnsupportedTarget` or touch the game tree.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn dispatch_replays_a_claimed_plan_after_the_installation_root_is_gone() {
+    let mut fixture = Fixture::new();
+    let (plan, applied) = fixture.apply_one();
+    assert_eq!(applied.phase, "completed");
+    let deployed = tree(&fixture.game);
+    let ops = fixture.app.join("effects/ops");
+    let ops_before = entry_names(&ops);
+
+    // Claim a Restore without running it, so the missing root must also answer
+    // the journal-only restore route.
+    let binding =
+        marduk_platform::bind_installation(&fixture.game, &marduk_games::skyrim_se::LAYOUT)
+            .unwrap();
+    let (installation, data) = binding.identities();
+    let (installation, data) = (installation.clone(), data.clone());
+    drop(binding);
+    let mut journal = OperationJournal::open(&fixture.app).unwrap();
+    let generation = journal
+        .root_state(&data)
+        .unwrap()
+        .active
+        .expect("apply leaves an active generation");
+    let pending = journal
+        .claim(Claim::Restore {
+            installation,
+            data,
+            generation,
+        })
+        .unwrap();
+
+    let moved = fixture.temp.path().join("game-gone");
+    fs::rename(&fixture.game, &moved).unwrap();
+
+    let replay = expect_ok(fixture.send(json!({
+        "op": "deploy_apply",
+        "args": { "planId": plan.get().to_string() },
+    })));
+    assert_eq!(replay["id"], json!(applied.id));
+    assert_eq!(replay["phase"], json!("completed"));
+    assert_eq!(replay["blocker"], Value::Null);
+    assert_eq!(tree(&moved), deployed);
+    assert_eq!(entry_names(&ops), ops_before);
+
+    let restore = expect_ok(fixture.send(json!({"op": "restore", "args": {}})));
+    assert_eq!(restore["outcome"], json!("operation"));
+    assert_eq!(restore["operation"]["id"], json!(pending.get().to_string()));
+    assert_eq!(restore["operation"]["kind"], json!("restore"));
+    assert_eq!(tree(&moved), deployed);
+    assert_eq!(entry_names(&ops), ops_before);
+}
+
+/// The volume is still qualified, but the recorded pair no longer reopens:
+/// availability must withdraw and the preview must refuse with a typed blocker
+/// instead of returning a plan the write would fail to apply.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn qualified_volume_with_a_replaced_root_advertises_no_effects() {
+    let mut fixture = Fixture::new();
+    let status = fixture.setup();
+    let revision = status["profile"]["revision"].clone();
+
+    // Same volume and the same supported layout spelling, different identity.
+    let moved = fixture.temp.path().join("game-moved");
+    fs::rename(&fixture.game, &moved).unwrap();
+    fs::create_dir_all(fixture.game.join("Data/textures")).unwrap();
+    fs::write(fixture.game.join("SkyrimSE.exe"), b"").unwrap();
+
+    let status = expect_ok(fixture.send(json!({"op": "status", "args": {}})));
+    assert_eq!(status["availability"]["deploy"]["available"], json!(false));
+    assert_eq!(status["availability"]["restore"]["available"], json!(false));
+    assert_eq!(
+        status["availability"]["deploy"]["blocker"]["code"],
+        json!("TargetUnavailable")
+    );
+    assert_eq!(
+        status["availability"]["restore"]["blocker"]["code"],
+        json!("TargetUnavailable")
+    );
+
+    let error = expect_error(fixture.send(json!({
+        "op": "deploy_preview",
+        "args": { "atRevision": revision },
+    })));
+    assert_eq!(error["code"], json!("TargetUnavailable"));
+    let ops = fixture.app.join("effects/ops");
+    assert!(
+        !ops.exists() || fs::read_dir(&ops).unwrap().next().is_none(),
+        "an unavailable root returns no preview and creates no operation-owned directory"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 #[ignore = "requires TMPDIR on tmpfs or Btrfs"]
@@ -775,12 +885,17 @@ fn unqualified_installation_root_keeps_client_deploy_and_restore_refused() {
     for request in [
         json!({"op": "deploy_preview", "args": {"atRevision": "0"}}),
         json!({"op": "deploy_apply", "args": {"planId": "1"}}),
-        json!({"op": "restore", "args": {}}),
     ] {
         let error = expect_error(fixture.send(request));
         assert_eq!(error["code"], json!("UnsupportedTarget"));
         assert_eq!(error["detail"]["reason"], json!("Configuration"));
     }
+
+    // A clean root has no recorded work, so Restore answers from the journal
+    // before the gate; the refusal applies to new writes only.
+    let restore = expect_ok(fixture.send(json!({"op": "restore", "args": {}})));
+    assert_eq!(restore["outcome"], json!("noActiveDeployment"));
+    assert_eq!(restore["code"], json!("NoActiveDeployment"));
 
     assert_eq!(tree(&real), fixture.initial);
     let ops = fixture.app.join("effects/ops");

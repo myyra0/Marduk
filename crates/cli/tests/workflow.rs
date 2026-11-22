@@ -346,8 +346,10 @@ fn blocked_routes_are_typed_unavailable() {
         let output = fixture.run(&arguments);
         assert_eq!(output.status.code(), Some(1));
         let value = envelope(&output);
-        assert_eq!(code(&value), "UnsupportedTarget");
-        assert_eq!(value["error"]["detail"]["reason"], json!("Configuration"));
+        // No installation is bound, so a new effect has no target to refuse by
+        // configuration; the typed answer is the missing pair.
+        assert_eq!(code(&value), "TargetUnavailable");
+        assert!(value["error"]["detail"].is_null());
     }
 
     let output = fixture.run(&["operation", "1", "--json"]);

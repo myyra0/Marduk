@@ -597,8 +597,12 @@ describe('workspace shell', () => {
       ok: false as const,
       error: { code: 'StalePlan' as const },
     }));
+    const statusCall = vi.fn<WorkspaceTransport['status']>(async () => ({
+      ok: true as const,
+      result: status,
+    }));
     await renderReady({
-      status: async () => ({ ok: true, result: status }),
+      status: statusCall,
       deployPreview: async () => ({ ok: true, result: reviewFor(status) }),
       deployApply,
     });
@@ -606,7 +610,10 @@ describe('workspace shell', () => {
     await user.click(screen.getByRole('button', { name: /Review deployment/ }));
     await user.click(await screen.findByRole('button', { name: /Apply deployment/ }));
 
-    expect(await screen.findByText(/Not applied: StalePlan/)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/Outcome unknown; refreshing authoritative state\./),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(statusCall).toHaveBeenCalledTimes(2));
     expect(screen.queryByRole('button', { name: /Apply deployment/ })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Review deployment/ })).toBeEnabled();
   });
@@ -658,7 +665,9 @@ describe('workspace shell', () => {
     await user.click(screen.getByRole('button', { name: /Review deployment/ }));
     await user.click(await screen.findByRole('button', { name: /Apply deployment/ }));
 
-    expect(await screen.findByText(/Not applied: RecoveryConflict/)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/Outcome unknown; refreshing authoritative state\./),
+    ).toBeInTheDocument();
     expect(screen.getByText(/review the deployment again before applying/)).toBeInTheDocument();
     await waitFor(() => expect(statusCall).toHaveBeenCalledTimes(2));
     expect(screen.queryByRole('button', { name: /Apply deployment/ })).not.toBeInTheDocument();
@@ -966,7 +975,9 @@ describe('workspace shell', () => {
     expect(button).toBeEnabled();
     await user.click(button);
 
-    expect(await screen.findByText(/Restore not started: RecoveryConflict/)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/Outcome unknown; refreshing authoritative state\./),
+    ).toBeInTheDocument();
     await waitFor(() => expect(statusCall).toHaveBeenCalledTimes(2));
     await waitFor(() => {
       expect(screen.getByRole('button', { name: /Restore deployment/ })).toBeDisabled();

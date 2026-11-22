@@ -313,12 +313,15 @@ fn unqualified_volume_keeps_deploy_preview_apply_and_restore_typed_unavailable()
             "op": "deploy_apply",
             "args": { "planId": "1" },
         })),
-        fixture.send(json!({ "op": "restore", "args": {} })),
     ] {
         let error = expect_error(envelope);
         assert_eq!(code(&error), "UnsupportedTarget");
         assert_eq!(error["detail"]["reason"], json!("Configuration"));
     }
+    // No work is recorded, so Restore answers from the journal before the gate.
+    let restore = expect_ok(fixture.send(json!({ "op": "restore", "args": {} })));
+    assert_eq!(restore["outcome"], json!("noActiveDeployment"));
+    assert_eq!(restore["code"], json!("NoActiveDeployment"));
 
     // The same typed unavailability is visible before the user tries.
     let status = fixture.status();

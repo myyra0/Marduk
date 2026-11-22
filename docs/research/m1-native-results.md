@@ -8,11 +8,11 @@ Environment: Linux 7.3.5-1-cachyos, x86-64, rustc 1.100.0, uid 1000 with `CapEff
 
 | Proof case | Linux Btrfs | Linux tmpfs | Linux ext4 | Hosted `windows-2025` NTFS | Power |
 |---|---|---|---|---|---|
-| `native_no_replace_honors_concurrent_create` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run | — |
-| `native_replace_records_actually_displaced_file` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run | — |
-| `native_rejects_root_and_parent_substitution` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run | — |
-| `native_detach_preserves_unknown_file` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run | — |
-| `native_error_does_not_prove_no_change` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run | — |
+| `native_no_replace_honors_concurrent_create` | ran 2026-11-22 at `29e587d`, passed | ran 2026-11-22 at `29e587d`, passed | not run | not run | — |
+| `native_replace_records_actually_displaced_file` | ran 2026-11-22 at `29e587d`, passed | ran 2026-11-22 at `29e587d`, passed | not run | not run | — |
+| `native_rejects_root_and_parent_substitution` | ran 2026-11-22 at `29e587d`, passed | ran 2026-11-22 at `29e587d`, passed | not run | not run | — |
+| `native_detach_preserves_unknown_file` | ran 2026-11-22 at `29e587d`, passed | ran 2026-11-22 at `29e587d`, passed | not run | not run | — |
+| `native_error_does_not_prove_no_change` | ran 2026-11-22 at `29e587d`, passed | ran 2026-11-22 at `29e587d`, passed | not run | not run | — |
 | `native_namespace_survives_claimed_barrier` | ran 2026-11-22, passed (process-only, new create only) | ran 2026-11-22, passed (process-only, new create only) | not run | narrowed (ADR 0004: standard flush, power cut not covered) | Task 8, not run |
 | `library_catalog_never_names_missing_payload` | not run (staging wired on this volume; catalog witness not run) | not run (staging wired on this volume; catalog witness not run) | not run (unqualified; `StageUnavailable`) | not run (catalog witness not run) | Task 8, not run |
 | `btrfs_cross_subvolume_copy_does_not_use_cross_subvolume_rename` | not run (subvolume teardown EPERM; two-subvolume `EXDEV`/substitution not run) | N/A | N/A | N/A | — |
@@ -78,7 +78,7 @@ Library-staging witnesses. The Linux row is the catalog witness the record prove
 
 | Staging witness | Linux Btrfs | Linux tmpfs | Windows NTFS |
 |---|---|---|---|
-| `qualified_volume_stages_the_payload_through_the_production_catalog` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run |
+| `qualified_volume_stages_the_payload_through_the_production_catalog` | ran 2026-11-22 at `a2250e9`, passed | ran 2026-11-22 at `a2250e9`, passed | not run |
 | `windows_catalog_stages_a_payload_beside_its_root_pin` | not run | not run | ran 2026-11-22 at `62b9b94b`, passed |
 | `staged_revision_keeps_real_bytes_private_and_reobserves_after_reopen` | not run | not run | ran 2026-11-22 at 367ca69, passed |
 | `redirected_revisions_is_refused_without_writes` | not run | not run | ran 2026-11-22 at 367ca69, passed |
@@ -323,7 +323,7 @@ classes.
 
 | Witness | Linux Btrfs | Linux tmpfs | Linux ext4 | Windows NTFS |
 |---|---|---|---|---|
-| `qualified_native_round_trip_retains_backups_and_restores_the_original_tree` (workspace: setup → import → order → preview → apply → restart → replay → restore) | ran 2026-11-22 at `af0fc6d`, passed | ran 2026-11-22 at `af0fc6d`, passed | not run | ran 2026-11-22 at `62b9b94b`, passed |
+| `qualified_native_round_trip_retains_backups_and_restores_the_original_tree` (workspace: setup → import → order → preview → apply → restart → replay → restore) | ran 2026-11-22 at `101b4f7`, passed; re-ran with scoped metadata at `af0fc6d`, passed | ran 2026-11-22 at `101b4f7`, passed; re-ran with scoped metadata at `af0fc6d`, passed | not run | ran 2026-11-22 at `62b9b94b`, passed |
 | `visible_xattr_on_an_original_is_refused_before_any_write` (workspace preview) | ran 2026-11-22 at `af0fc6d`, passed (`user.*`); `trusted.*` not run | ran 2026-11-22 at `af0fc6d`, passed (`user.*`); `trusted.*` not run | not run | not run |
 | `restart_after_apply_before_ack_rolls_back_and_never_reapplies` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
 | `restart_after_record_undo_uses_the_sealed_stage_fingerprint` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
@@ -416,12 +416,20 @@ restore through the production adapter. Power-cut evidence still does not exist;
 
 | Primitive | Contract implemented | Linux runtime | Hosted `windows-2025` NTFS runtime | Power |
 |---|---|---|---|---|
-| `effects::copy_file` | `CREATE_NEW` destination, data stream, attributes, creation/access/last-write times, owner/group/DACL, `FlushFileBuffers`; an occupied destination maps to `CopyError::DestinationExists` (conflict), a lock to `CopyError::Sharing` (retryable `Io`), and only unreproducible metadata to `Unsupported(Metadata)`; a source DACL that grants write (concrete bits, `GENERIC_WRITE`, `GENERIC_ALL`, or fail-closed `MAXIMUM_ALLOWED`) to a principal other than the current user or the SYSTEM/Administrators baseline is refused before it reaches the private area, including inherited grants, and every post-create failure removes the partial file | `effects_primitives::copy_preserves_bytes_and_last_write_time_and_refuses_existing`, `copy_refuses_concrete_file_write_data_in_source_dacl`, `copy_refuses_generic_write_in_source_dacl` and `copy_refuses_generic_all_in_source_dacl` passed 2026-11-22 (Linux) | ran 2026-11-22 at `eb39be0`, passed | — |
+| `effects::copy_file` | `CREATE_NEW` destination, data stream, attributes, creation/access/last-write times, owner/group/DACL, `FlushFileBuffers`; an occupied destination maps to `CopyError::DestinationExists` (conflict), a lock to `CopyError::Sharing` (retryable `Io`), and only unreproducible metadata to `Unsupported(Metadata)`; a source DACL that grants write (concrete bits, `GENERIC_WRITE`, `GENERIC_ALL`, or fail-closed `MAXIMUM_ALLOWED`) to a principal other than the current user or the SYSTEM/Administrators baseline is refused before it reaches the private area, including inherited grants, and every post-create failure removes the partial file | `effects_primitives::copy_preserves_bytes_and_last_write_time_and_refuses_existing` passed 2026-11-22 (Linux) | ran 2026-11-22 at `eb39be0`, passed | — |
 | `effects::publish` | one `MoveFileExW` with flags `0` (no `MOVEFILE_REPLACE_EXISTING`, no `MOVEFILE_COPY_ALLOWED`); an existing target fails and is left intact | `effects_primitives::publish_refuses_an_existing_target_and_leaves_it_intact` passed 2026-11-22 | ran 2026-11-22 at `eb39be0`, passed | — |
-| `effects::replace` | exchange by two no-replace renames in production (target → `<operation>/displaced`, stage → target); a caller that retains at a different path adds a third rename from that slot; a cut after the first rename leaves the canonical `displaced` slot plus the staged object and resumes from that shape, which `evidence_for`, `prepare` and `sync_effect` inspect; the staged object's file id, creation time, attributes and DACL are preserved, so the public target fingerprints as the sealed staged artifact; a failure returns an error, never `Ok` | `effects_primitives::replace_retains_the_displaced_file_and_keeps_the_staged_object` and `interrupted_replace_keeps_the_canonical_displaced_slot_and_resumes` passed 2026-11-22 | ran 2026-11-22 at `eb39be0`, passed | — |
+| `effects::replace` | exchange by two no-replace renames in production (target → `<operation>/displaced`, stage → target); a caller that retains at a different path adds a third rename from that slot; a cut after the first rename leaves the canonical `displaced` slot plus the staged object and resumes from that shape, which `evidence_for`, `prepare` and `sync_effect` inspect; the staged object's file id, creation time, attributes and DACL are preserved, so the public target fingerprints as the sealed staged artifact; a failure returns an error, never `Ok` | `effects_primitives::replace_retains_the_displaced_file_and_keeps_the_staged_object` passed 2026-11-22 | ran 2026-11-22 at `eb39be0`, passed | — |
 | `effects::detach` | one no-replace rename into the retain slot; an occupied slot fails, unknown bytes are never replaced | `effects_primitives::detach_preserves_an_unknown_file` passed 2026-11-22 | ran 2026-11-22 at `eb39be0`, passed | — |
 | `effects::sync_directory` | `FlushFileBuffers` on a directory handle opened with `FILE_FLAG_BACKUP_SEMANTICS`; not a namespace or power-cut barrier | `effects_primitives::sync_directory_succeeds_on_a_real_directory` passed 2026-11-22 | ran 2026-11-22 at `eb39be0`, passed | not claimed |
 | `effects::volume_qualified` | a record query: NTFS is true for the adapter and deploy routes where the composition proof exists; the NTFS probe (from `GetVolumeInformationByHandleW` on the opened root) supplies the class, not the decision | `effects_primitives::volume_qualification_reads_the_opened_root` passed 2026-11-22 (refusal branch) | not run | — |
+
+The source-DACL witnesses `copy_refuses_concrete_file_write_data_in_source_dacl`,
+`copy_refuses_generic_write_in_source_dacl` and
+`copy_refuses_generic_all_in_source_dacl` are Windows-only (`#[cfg(windows)]`), and
+`interrupted_replace_keeps_the_canonical_displaced_slot_and_resumes` was added
+after `eb39be0`. Neither group is part of the `eb39be0` Linux or NTFS runs above,
+and this record has no runtime result for them; they do not open an availability
+route.
 
 The NTFS adapter and deploy answer comes from the whole-composition row at
 `62b9b94b` (see [Windows composition run](#windows-composition-run-2026-11-22)),

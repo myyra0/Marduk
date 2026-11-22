@@ -481,8 +481,10 @@ export function App({ transport }: Props) {
           setReview(null);
           setReviewInvalidated(true);
         },
-        refreshOnReject: (error) =>
-          `Not applied: ${describeBlocker(error)}; authoritative state reloaded.`,
+        // The write may have reached the game folder before the error. Only the
+        // refreshed authoritative status may say what happened.
+        rejectNotice: () => 'Outcome unknown; refreshing authoritative state.',
+        refreshOnReject: () => 'Outcome unknown; refreshing authoritative state.',
       },
     );
   }
@@ -508,9 +510,10 @@ export function App({ transport }: Props) {
         reject: (error) => {
           if (error.code === 'NoActiveDeployment') setRestoreNoActive(true);
         },
-        rejectNotice: (error) => `Restore not started: ${describeBlocker(error)}`,
-        refreshOnReject: (error) =>
-          `Restore not started: ${describeBlocker(error)}; authoritative state reloaded.`,
+        // Restore can fail after moving public files. The refresh decides the
+        // outcome; the notice must not assert that nothing happened.
+        rejectNotice: () => 'Outcome unknown; refreshing authoritative state.',
+        refreshOnReject: () => 'Outcome unknown; refreshing authoritative state.',
       },
     );
   }

@@ -27,8 +27,9 @@ use marduk_core::import::{
     ArchiveError, BeginImport, ImportError, ImportId, ImportTarget, LimitKind, PreparedImport,
 };
 use marduk_core::recovery::{BackupRef, BackupSlot, Journal, StepDirection};
-use marduk_core::root_identity::{RootError, UnsupportedReason};
+use marduk_core::root_identity::{NativeIdentity, RootError, RootIdentity, UnsupportedReason};
 use marduk_games::skyrim_se;
+use marduk_platform::InstallationBinding;
 use marduk_storage::Catalog;
 use marduk_storage::native_effects::NativeEffects;
 use marduk_storage::operation_journal::OperationJournal;
@@ -513,19 +514,16 @@ impl Workspace {
             Op::DeployPreview => {
                 let args: DeployPreviewArgs = decode(request.args)?;
                 let revision = parse_revision(&args.at_revision)?;
-                self.require_native_effects()?;
                 Ok(json(self.deploy_preview(revision)?)?)
             }
             Op::DeployApply => {
                 let args: DeployApplyArgs = decode(request.args)?;
                 let plan = PlanId::try_from_u64(parse_id(&args.plan_id)?)
                     .map_err(|_| WireError::new(Code::InvalidRequest))?;
-                self.require_native_effects()?;
                 Ok(json(self.deploy_apply(plan)?)?)
             }
             Op::Restore => {
                 let _: NoArgs = decode(request.args)?;
-                self.require_native_effects()?;
                 Ok(json(self.restore_generation()?)?)
             }
             Op::Recover => {
@@ -590,14 +588,17 @@ impl Workspace {
         };
         let mut pending = None;
         let mut active_generation_id = None;
-        // Both routes share one decision point: the record must prove the
-        // composition on the installation root's volume class. No bound
-        // installation has no proven root.
-        let effects = effect_availability(native_effects_gate(
-            selected.as_ref().map(|selected| selected.locator.as_path()),
-        ));
+        // Client deploy/restore is available only where the recorded pair still
+        // reopens, both roots sit on a volume the record proves, and the app and
+        // game roots share a rename domain. The locator's volume class alone is
+        // not evidence. No bound installation has no proven pair.
+        let mut effects = Availability {
+            available: false,
+            blocker: Some(unsupported_effect()),
+        };
 
         if let Some(selected) = selected {
+            effects = effect_availability(self.require_native_effects(&selected));
             let SelectedInstallation {
                 id,
                 locator,
@@ -711,6 +712,10 @@ impl Workspace {
     }
 
     fn deploy_preview(&mut self, revision: ProfileRevision) -> Result<Preview, WireError> {
+        // A preview must not be applyable on a root that would refuse the
+        // write, so the native gate runs before the catalog is read.
+        let selected = self.selected_pair()?;
+        self.require_native_effects(&selected)?;
         let named = self
             .catalog
             .named_profile(profile())
@@ -722,7 +727,6 @@ impl Workspace {
             .catalog
             .resolved_inputs(profile())
             .map_err(import_error)?;
-        let selected = self.selected_pair()?;
         let mut port = self.native_effects(&selected)?;
         let plan = marduk_core::deployment::preview_deployment(
             &mut self.journal,
@@ -791,6 +795,7 @@ impl Workspace {
             return Ok(operation(status));
         }
         let selected = self.selected_pair()?;
+        self.require_native_effects(&selected)?;
         let mut port = self.native_effects(&selected)?;
         let status =
             marduk_core::deployment::commit_deployment(&mut self.journal, &mut port, plan, || {
@@ -830,6 +835,7 @@ impl Workspace {
                 code: Code::NoActiveDeployment,
             });
         }
+        self.require_native_effects(&selected)?;
         let mut port = self.native_effects(&selected)?;
         match marduk_core::deployment::restore(
             &mut self.journal,
@@ -854,15 +860,34 @@ impl Workspace {
             .ok_or_else(|| WireError::new(Code::TargetUnavailable))
     }
 
-    /// One decision point for client-visible deploy/restore availability. The
-    /// record decides for the bound installation root's volume class.
-    fn require_native_effects(&mut self) -> Result<(), WireError> {
-        let root = self
-            .journal
-            .selected_installation()
-            .map_err(deploy_error)?
-            .map(|selected| selected.locator);
-        native_effects_gate(root.as_deref())
+    /// One decision point for a new client-visible deploy or restore. A
+    /// locator's volume class alone is not evidence: the recorded pair must
+    /// reopen with its supported layout, both roots must sit on a proven
+    /// volume, and the app and game roots must share a rename domain or the
+    /// staged object cannot be renamed onto the target.
+    fn require_native_effects(&self, selected: &SelectedInstallation) -> Result<(), WireError> {
+        if !marduk_platform::deploy_volume_qualified(&self.app_data)
+            || !marduk_platform::deploy_volume_qualified(&selected.locator)
+        {
+            return Err(unsupported_effect());
+        }
+        let binding = self.reopen(selected)?;
+        let app =
+            marduk_platform::effects::directory_identity(&self.app_data).map_err(root_error)?;
+        if !same_rename_domain(&app, binding.identities().0) {
+            return Err(unsupported_effect());
+        }
+        Ok(())
+    }
+
+    fn reopen(&self, selected: &SelectedInstallation) -> Result<InstallationBinding, WireError> {
+        marduk_platform::reopen_installation(
+            &selected.locator,
+            &skyrim_se::LAYOUT,
+            &selected.installation,
+            &selected.data,
+        )
+        .map_err(root_error)
     }
 
     fn native_effects(&self, selected: &SelectedInstallation) -> Result<NativeEffects, WireError> {
@@ -1155,17 +1180,43 @@ fn phase(phase: Phase) -> &'static str {
     }
 }
 
-/// One decision point for client-visible deploy/restore availability.
-///
-/// The availability record answers for the installation root's volume class: a
-/// `NativeEffects`/`Deploy` proof at the composition rung or above. The
-/// client-visible rung is recorded after the first real run, so it cannot be a
-/// precondition here; crash evidence is deferred work. There is no runtime
-/// override.
-fn native_effects_gate(installation_root: Option<&Path>) -> Result<(), WireError> {
-    match installation_root {
-        Some(root) if marduk_platform::deploy_volume_qualified(root) => Ok(()),
-        _ => Err(unsupported_effect()),
+/// The same rename-domain comparison the effect adapter applies to its stage
+/// and target parents: matching filesystem magic, id and mount view, plus the
+/// Btrfs tree when present. Windows compares the volume serial.
+fn same_rename_domain(app: &RootIdentity, installation: &RootIdentity) -> bool {
+    match (app.evidence(), installation.evidence()) {
+        (
+            NativeIdentity::Linux {
+                fs_magic: app_magic,
+                fs_id: app_id,
+                view_id: app_view,
+                tree_id: app_tree,
+                ..
+            },
+            NativeIdentity::Linux {
+                fs_magic: installation_magic,
+                fs_id: installation_id,
+                view_id: installation_view,
+                tree_id: installation_tree,
+                ..
+            },
+        ) => {
+            app_magic == installation_magic
+                && app_id == installation_id
+                && app_view == installation_view
+                && app_tree == installation_tree
+        }
+        (
+            NativeIdentity::Windows {
+                volume_serial: app_volume,
+                ..
+            },
+            NativeIdentity::Windows {
+                volume_serial: installation_volume,
+                ..
+            },
+        ) => app_volume == installation_volume,
+        _ => false,
     }
 }
 

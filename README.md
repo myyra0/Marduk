@@ -10,9 +10,12 @@ deploy method plugs into the same core.
 
 ## Known limitations
 
-If a deploy is interrupted on Linux, Marduk recovers it when it next starts. On
-Windows, Marduk uses standard Windows flushing, so a power loss in the middle of
-a deploy can leave the game folder needing review. Marduk reports what it finds
-instead of claiming the deploy succeeded. Windows import and deploy are enabled
-on NTFS by the recorded whole-composition run; Windows power-loss recovery is
-not proven.
+If a deploy is interrupted on Linux, the next start tries to repair the recorded
+work and tells you what it found, including anything it could not finish. This
+has been tested by restarting the app; it has not been tested by crashing the
+app or cutting power. On Windows, Marduk uses standard Windows flushing, so a
+power loss in the middle of a deploy can leave the game folder needing review;
+Windows uses the narrower guarantee in
+[ADR 0004](docs/adr/0004-windows-writes-use-standard-flush.md). Marduk reports
+what it finds instead of claiming the deploy succeeded. Windows import and
+deploy are enabled on NTFS by the recorded whole-composition run.

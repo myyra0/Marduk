@@ -5,11 +5,11 @@
 //! gates were opened in the past without a run. This test parses the document's
 //! evidence matrices and fails on any disagreement:
 //!
-//! - a proof in Rust whose witness row is `not run` or `N/A`,
+//! - a proof in Rust whose matching witness/configuration cell is missing,
+//!   not run, N/A, or names a different revision than the proof,
 //! - a row that says `ran ... passed` for a witness the record names while the
-//!   record has no proof for that configuration,
-//! - a proof that names a witness no test defines,
-//! - a proof whose revision the document does not mention.
+//!   record has no proof for that configuration at that revision,
+//! - a proof that names a witness no test defines.
 //!
 //! A witness the record does not name is not governed by the record; the
 //! document may still record an unrelated observation of it.
@@ -34,6 +34,17 @@ enum Status {
     /// A recorded decision that narrows the guarantee. It is deliberately not
     /// a runtime pass, so it can never satisfy a proof or imply crash coverage.
     Narrowed,
+}
+
+/// One evidence cell: where it is, what it says, and the revisions it names.
+///
+/// A pass satisfies a proof only when the cell names the proof's revision; a
+/// revision in unrelated prose is not evidence for this configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Cell {
+    line: usize,
+    status: Status,
+    revisions: Vec<String>,
 }
 
 fn repo_root() -> PathBuf {
@@ -246,7 +257,31 @@ fn parse_status(line: usize, witness: &str, cell: &str) -> Status {
     panic!("{EVIDENCE}:{line}: unrecognised evidence cell {cell:?} for `{witness}`");
 }
 
-fn observed_cells(text: &str) -> BTreeMap<(String, Os, VolumeClass), Status> {
+/// Revisions named in a cell. Evidence writes them as a hex token, usually
+/// backticked (`eb39be0`), but some older rows omit the backticks, so the
+/// token shape is the contract, not the formatting.
+fn revisions(cell: &str) -> Vec<String> {
+    cell.split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| {
+            token.len() >= 7
+                && token.len() <= 12
+                && token.chars().all(|character| character.is_ascii_hexdigit())
+                && token.chars().any(|character| character.is_ascii_digit())
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+fn parse_cell(line: usize, witness: &str, cell: &str) -> Cell {
+    let status = parse_status(line, witness, cell);
+    Cell {
+        line,
+        status,
+        revisions: revisions(strip_note(cell)),
+    }
+}
+
+fn observed_cells(text: &str) -> BTreeMap<(String, Os, VolumeClass), Cell> {
     let mut observed = BTreeMap::new();
     for matrix in matrices(text) {
         for (line, row) in &matrix.rows {
@@ -273,8 +308,8 @@ fn observed_cells(text: &str) -> BTreeMap<(String, Os, VolumeClass), Status> {
                 let Some((os, volume)) = config else {
                     continue;
                 };
-                let status = parse_status(*line, &witness, &row[*column]);
-                let previous = observed.insert((witness.clone(), *os, *volume), status);
+                let cell = parse_cell(*line, &witness, &row[*column]);
+                let previous = observed.insert((witness.clone(), *os, *volume), cell);
                 assert!(
                     previous.is_none(),
                     "{EVIDENCE}:{line}: `{witness}` appears twice for {os} {volume}"
@@ -307,7 +342,7 @@ fn backticked_names(cell: &str) -> Vec<String> {
 /// Primitive tables list a test in the Linux runtime column and one status for
 /// the Windows NTFS column, so that cell is the Windows status of every test the
 /// row names. Only tables that are not evidence matrices are read here.
-fn primitive_cells(text: &str) -> BTreeMap<(String, Os, VolumeClass), Status> {
+fn primitive_cells(text: &str) -> BTreeMap<(String, Os, VolumeClass), Cell> {
     let lines: Vec<&str> = text.lines().collect();
     let mut observed = BTreeMap::new();
     let mut index = 0;
@@ -344,10 +379,12 @@ fn primitive_cells(text: &str) -> BTreeMap<(String, Os, VolumeClass), Status> {
                 headers.len()
             );
             let witnesses = backticked_names(&fields[runtime]);
-            let status = parse_status(index + 1, &witnesses.join(","), &fields[ntfs]);
+            let cell = parse_cell(index + 1, &witnesses.join(","), &fields[ntfs]);
             for witness in witnesses {
-                let previous =
-                    observed.insert((witness.clone(), Os::Windows, VolumeClass::Ntfs), status);
+                let previous = observed.insert(
+                    (witness.clone(), Os::Windows, VolumeClass::Ntfs),
+                    cell.clone(),
+                );
                 assert!(
                     previous.is_none(),
                     "{EVIDENCE}:{}: `{witness}` appears twice for Windows NTFS",
@@ -363,7 +400,7 @@ fn primitive_cells(text: &str) -> BTreeMap<(String, Os, VolumeClass), Status> {
 /// The `LibraryStaging` witness matrix. It is the only matrix whose first
 /// header is the staging-witness column, and it must carry a column for every
 /// configuration a staging proof names today.
-fn staging_cells(text: &str) -> BTreeMap<(String, Os, VolumeClass), (usize, Status)> {
+fn staging_cells(text: &str) -> BTreeMap<(String, Os, VolumeClass), Cell> {
     let mut selected: Vec<Matrix> = matrices(text)
         .into_iter()
         .filter(|matrix| matrix.first_header.eq_ignore_ascii_case("Staging witness"))
@@ -415,8 +452,8 @@ fn staging_cells(text: &str) -> BTreeMap<(String, Os, VolumeClass), (usize, Stat
             let Some((os, volume)) = config else {
                 continue;
             };
-            let status = parse_status(*line, &witness, &row[*column]);
-            let previous = observed.insert((witness.clone(), *os, *volume), (*line, status));
+            let status = parse_cell(*line, &witness, &row[*column]);
+            let previous = observed.insert((witness.clone(), *os, *volume), status);
             assert!(
                 previous.is_none(),
                 "{EVIDENCE}:{line}: `{witness}` appears twice in the staging matrix for {os} {volume}"
@@ -450,49 +487,104 @@ fn the_record_and_the_evidence_document_agree() {
                 proof.layer, proof.capability, proof.os, proof.volume
             );
         }
-        assert!(
-            text.contains(proof.revision),
-            "availability record claims {} {} on {}/{} at revision `{}`, which {EVIDENCE} \
-             does not mention",
-            proof.layer,
-            proof.capability,
-            proof.os,
-            proof.volume,
-            proof.revision
-        );
     }
 
     let mut observed = observed_cells(&text);
-    for (key, status) in primitive_cells(&text) {
-        let previous = observed.insert(key, status);
+    for (key, cell) in primitive_cells(&text) {
+        let previous = observed.insert(key, cell);
         assert!(previous.is_none(), "{EVIDENCE}: a witness appears twice");
     }
     assert!(
         !observed.is_empty(),
         "{EVIDENCE}: no evidence matrices parsed"
     );
-    for ((witness, os, volume), status) in &observed {
+
+    // Record -> document: each named witness needs its own passing cell on the
+    // proof's configuration at the proof's revision. A revision in unrelated
+    // prose is not evidence for this row.
+    for proof in PROOFS {
+        for witness in proof.witnesses {
+            let cell = observed
+                .get(&(witness.to_string(), proof.os, proof.volume))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "availability record claims {} {} on {}/{} but {EVIDENCE} has no cell \
+                         for `{witness}` there; add the row or withdraw the proof",
+                        proof.layer, proof.capability, proof.os, proof.volume
+                    )
+                });
+            assert!(
+                cell.status == Status::Ran,
+                "availability record claims {} {} on {}/{} but {EVIDENCE}:{} records \
+                 `{witness}` as {:?}, not a pass",
+                proof.layer,
+                proof.capability,
+                proof.os,
+                proof.volume,
+                cell.line,
+                cell.status
+            );
+            assert!(
+                cell.revisions
+                    .iter()
+                    .any(|revision| revision == proof.revision),
+                "availability record claims {} {} on {}/{} at revision `{}`, but {EVIDENCE}:{} \
+                 records `{witness}` at {:?}",
+                proof.layer,
+                proof.capability,
+                proof.os,
+                proof.volume,
+                proof.revision,
+                cell.line,
+                cell.revisions
+            );
+        }
+    }
+
+    // Document -> record: a pass is exact. Every revision the cell names must
+    // be proved for that witness and configuration, and a non-pass may not
+    // contradict a proof.
+    for ((witness, os, volume), cell) in &observed {
         let proofs = proofs_naming(witness);
         if proofs.is_empty() {
             // The record does not govern this witness; the row stands alone.
             continue;
         }
-        let recorded = PROOFS.iter().any(|proof| {
-            proof.os == *os
-                && proof.volume == *volume
-                && proof.witnesses.contains(&witness.as_str())
-        });
-        match status {
-            Status::Ran => assert!(
-                recorded,
-                "{EVIDENCE} records `{witness}` as ran and passed on {os} {volume}, but the \
-                 availability record has no proof for it; add the witness to the record or \
-                 correct the row"
-            ),
+        let here: Vec<&Proof> = proofs
+            .iter()
+            .copied()
+            .filter(|proof| proof.os == *os && proof.volume == *volume)
+            .collect();
+        match cell.status {
+            Status::Ran => {
+                assert!(
+                    !here.is_empty(),
+                    "{EVIDENCE}:{} records `{witness}` as ran and passed on {os} {volume}, but \
+                     the availability record has no proof for it; add the witness to the record \
+                     or correct the row",
+                    cell.line
+                );
+                assert!(
+                    !cell.revisions.is_empty(),
+                    "{EVIDENCE}:{} records `{witness}` as ran and passed on {os} {volume} \
+                     without naming a revision",
+                    cell.line
+                );
+                for revision in &cell.revisions {
+                    assert!(
+                        here.iter().any(|proof| proof.revision == revision),
+                        "{EVIDENCE}:{} records `{witness}` as passed on {os} {volume} at \
+                         revision `{revision}`, which the availability record does not prove; \
+                         add the proof or correct the row",
+                        cell.line
+                    );
+                }
+            }
             Status::Unrun | Status::NotApplicable | Status::Narrowed => assert!(
-                !recorded,
-                "the availability record proves `{witness}` on {os} {volume}, but {EVIDENCE} \
-                 does not record a pass for it; run the test or withdraw the proof"
+                here.is_empty(),
+                "the availability record proves `{witness}` on {os} {volume}, but {EVIDENCE}:{} \
+                 does not record a pass for it; run the test or withdraw the proof",
+                cell.line
             ),
         }
     }
@@ -552,7 +644,7 @@ fn narrowed_rows_match_the_document_and_never_stand_in_for_a_run() {
     let documented: BTreeSet<_> = observed_cells(&text)
         .into_iter()
         .chain(primitive_cells(&text))
-        .filter_map(|(key, status)| (status == Status::Narrowed).then_some(key))
+        .filter_map(|(key, cell)| (cell.status == Status::Narrowed).then_some(key))
         .collect();
     let recorded: BTreeSet<_> = NARROWED
         .iter()
@@ -618,7 +710,7 @@ fn staging_evidence_matches_the_library_staging_proofs() {
 
     for proof in &proofs {
         for witness in proof.witnesses {
-            let (line, status) = cells
+            let cell = cells
                 .get(&(witness.to_string(), proof.os, proof.volume))
                 .unwrap_or_else(|| {
                     panic!(
@@ -627,9 +719,11 @@ fn staging_evidence_matches_the_library_staging_proofs() {
                     )
                 });
             assert!(
-                *status != Status::Unrun,
-                "{EVIDENCE}:{line}: `{witness}` is `not run` on {} {}, but the availability \
-                 record proves {} there; run the test or withdraw the proof",
+                cell.status == Status::Ran,
+                "{EVIDENCE}:{}: `{witness}` is {:?} on {} {}, but the availability record \
+                 proves {} there; run the test or withdraw the proof",
+                cell.line,
+                cell.status,
                 proof.os,
                 proof.volume,
                 proof.capability
@@ -637,8 +731,8 @@ fn staging_evidence_matches_the_library_staging_proofs() {
         }
     }
 
-    for ((witness, os, volume), (line, status)) in &cells {
-        if *status != Status::Ran {
+    for ((witness, os, volume), cell) in &cells {
+        if cell.status != Status::Ran {
             continue;
         }
         let recorded = proofs
@@ -646,9 +740,10 @@ fn staging_evidence_matches_the_library_staging_proofs() {
             .any(|proof| proof.os == *os && proof.volume == *volume);
         assert!(
             recorded,
-            "{EVIDENCE}:{line}: the staging matrix records `{witness}` as ran and passed on \
+            "{EVIDENCE}:{}: the staging matrix records `{witness}` as ran and passed on \
              {os} {volume}, but the availability record has no {} proof for that configuration; \
              add the proof or correct the row",
+            cell.line,
             Capability::LibraryStaging
         );
     }
