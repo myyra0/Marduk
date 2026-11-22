@@ -185,16 +185,20 @@ impl NativeEffects {
         }
     }
 
-    fn source_path(&self, installed: InstalledRevisionId, relative: &RelativePath) -> PathBuf {
+    fn source_path(
+        &self,
+        installed: InstalledRevisionId,
+        relative: &RelativePath,
+    ) -> Result<PathBuf, DeployError> {
         let mut path = self
             .library
             .join("revisions")
             .join(installed.get().to_string())
             .join("payload");
         for component in relative.as_str().split('/') {
-            path.push(component);
+            path = resolve_spelling(&path, component)?;
         }
-        path
+        Ok(path)
     }
 
     fn resolved(
@@ -861,7 +865,7 @@ impl CopyEffects for NativeEffects {
         let staged = match &intent.output {
             StepOutput::Absent => None,
             StepOutput::Source(source) => {
-                let source_path = self.source_path(source.installed, &source.path);
+                let source_path = self.source_path(source.installed, &source.path)?;
                 let observed =
                     effects::fingerprint_path(&source_path).map_err(|_| DeployError::StalePlan)?;
                 if observed.len != source.len || observed.sha256 != source.sha256 {
@@ -1100,15 +1104,13 @@ impl DeploymentInputs for NativeEffects {
         installed: InstalledRevisionId,
         path: &RelativePath,
     ) -> Result<SourceRef, DeployError> {
-        let fingerprint =
-            effects::fingerprint_path(&self.source_path(installed, path)).map_err(|error| {
-                match error {
-                    RootError::TargetUnavailable => DeployError::StalePlan,
-                    RootError::UnsupportedTarget(_) => DeployError::UnsupportedTarget,
-                    RootError::Io => DeployError::Io,
-                    _ => DeployError::InvalidPath,
-                }
-            })?;
+        let source_path = self.source_path(installed, path)?;
+        let fingerprint = effects::fingerprint_path(&source_path).map_err(|error| match error {
+            RootError::TargetUnavailable => DeployError::StalePlan,
+            RootError::UnsupportedTarget(_) => DeployError::UnsupportedTarget,
+            RootError::Io => DeployError::Io,
+            _ => DeployError::InvalidPath,
+        })?;
         Ok(SourceRef {
             installed,
             path: path.clone(),
@@ -1149,6 +1151,38 @@ fn exchange_slots(
         let _ = staged;
         (stage, displaced)
     }
+}
+
+/// Resolve one installed-payload component by its exact spelling, or by the
+/// unique case-insensitive match when the stored spelling differs.
+///
+/// The plan names the merged target spelling, which is not necessarily the
+/// spelling the installed payload was stored under. One revision therefore
+/// serves every profile and archive spelling of the same canonical target.
+/// Two case aliases are refused rather than resolved by directory order.
+fn resolve_spelling(directory: &Path, component: &str) -> Result<PathBuf, DeployError> {
+    let exact = directory.join(component);
+    match fs::symlink_metadata(&exact) {
+        Ok(_) => return Ok(exact),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Err(DeployError::StalePlan),
+    }
+    let mut found = None;
+    for entry in fs::read_dir(directory).map_err(|_| DeployError::StalePlan)? {
+        let entry = entry.map_err(|_| DeployError::StalePlan)?;
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(component))
+        {
+            if found.is_some() {
+                return Err(DeployError::InvalidPath);
+            }
+            found = Some(name);
+        }
+    }
+    let name = found.ok_or(DeployError::StalePlan)?;
+    Ok(directory.join(name))
 }
 
 fn artifact(path: &Path) -> Artifact {
@@ -1291,5 +1325,40 @@ mod tests {
             assert_eq!(stage, Artifact::Regular(changed));
             assert_eq!(retained, Artifact::Absent);
         }
+    }
+
+    #[test]
+    fn source_component_resolves_the_stored_spelling() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("textures")).unwrap();
+        fs::write(temp.path().join("textures/winner.dds"), b"staged\n").unwrap();
+
+        let directory = resolve_spelling(temp.path(), "Textures").unwrap();
+        assert_eq!(directory, temp.path().join("textures"));
+        let source = resolve_spelling(&directory, "Winner.dds").unwrap();
+        assert_eq!(source, temp.path().join("textures/winner.dds"));
+        assert_eq!(fs::read(&source).unwrap(), b"staged\n");
+    }
+
+    #[test]
+    fn source_component_prefers_the_exact_spelling() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("Textures")).unwrap();
+        fs::create_dir(temp.path().join("textures")).unwrap();
+
+        let exact = resolve_spelling(temp.path(), "Textures").unwrap();
+        assert_eq!(exact, temp.path().join("Textures"));
+    }
+
+    #[test]
+    fn source_component_refuses_ambiguous_case_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("Textures")).unwrap();
+        fs::create_dir(temp.path().join("textures")).unwrap();
+
+        assert_eq!(
+            resolve_spelling(temp.path(), "TEXTURES").unwrap_err(),
+            DeployError::InvalidPath
+        );
     }
 }

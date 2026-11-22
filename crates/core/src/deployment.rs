@@ -265,7 +265,10 @@ pub fn preview_deployment<J: Journal, P: DeploymentInputs>(
     for entry in resolved.entries {
         let winner = entry.candidates.last().ok_or(DeployError::StalePlan)?;
         let bound = port.resolve_target(&entry.target).map_err(map_root_error)?;
-        let source = port.source(winner.installed, &winner.input.relative)?;
+        // The merged target spelling is authoritative for both the destination
+        // and the source lookup; the installed payload may store the same
+        // canonical entry under an archive-provided spelling.
+        let source = port.source(winner.installed, &entry.target.relative)?;
         let original = match port.observe(&bound) {
             Observation::Absent => PreState::Absent,
             Observation::Regular(fingerprint) => PreState::Regular(fingerprint),

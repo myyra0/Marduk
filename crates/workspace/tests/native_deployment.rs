@@ -1009,6 +1009,15 @@ fn mixed_case_archive_target_merges_with_the_existing_spelling() {
     };
     assert_eq!(operation.phase, "completed");
     assert_eq!(tree(&fixture.game), fixture.initial);
+    assert_eq!(
+        fs::read(fixture.game.join("Data/textures/winner.dds")).unwrap(),
+        BASE,
+        "restore brings back the pre-deploy bytes"
+    );
+    assert!(
+        !fixture.game.join("Data/Textures").exists(),
+        "restore must not leave the archive spelling on disk"
+    );
 }
 
 #[test]
