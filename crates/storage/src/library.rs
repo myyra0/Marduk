@@ -27,6 +27,7 @@ use marduk_core::import::{
 };
 use marduk_core::import::{ImportAllocation, PayloadFile, StageEvidence};
 use marduk_core::profiles::{ProfileMember, ProfileSnapshot};
+use marduk_core::resolve::ResolvedInputs;
 #[cfg(test)]
 use marduk_core::root_identity::{NativeIdentity, RootIdentity};
 use marduk_core::targets::RelativePath;
@@ -150,6 +151,48 @@ impl Catalog {
 
     pub fn snapshot(&mut self, profile: ProfileId) -> Result<ProfileSnapshot, ImportError> {
         Ok(self.named_profile(profile)?.snapshot)
+    }
+
+    /// Load the installed-revision manifests for one profile, in the shape the
+    /// deployment resolver consumes. Membership is read from the same
+    /// transaction as the files; a revision with no recorded files yields an
+    /// empty manifest rather than being silently omitted.
+    pub fn resolved_inputs(&mut self, profile: ProfileId) -> Result<ResolvedInputs, ImportError> {
+        let transaction = self.connection.transaction().map_err(storage_error)?;
+        let snapshot = read_snapshot(&transaction, profile)?;
+        let mut manifests = BTreeMap::new();
+        for member in snapshot.members {
+            if manifests.contains_key(&member.installed) {
+                continue;
+            }
+            let paths = {
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT path FROM revision_files \
+                         WHERE revision_id = ?1 AND role = 'data' ORDER BY ordinal ASC",
+                    )
+                    .map_err(storage_error)?;
+                let rows = statement
+                    .query_map(
+                        [i64::try_from(member.installed.get())
+                            .map_err(|_| ImportError::Storage)?],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(storage_error)?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(storage_error)?
+            };
+            let mut files = Vec::with_capacity(paths.len());
+            for path in paths {
+                let relative = RelativePath::parse(&path).map_err(|_| ImportError::Storage)?;
+                files.push(TargetFile {
+                    root: RootRole::Data,
+                    relative,
+                });
+            }
+            manifests.insert(member.installed, files);
+        }
+        transaction.commit().map_err(storage_error)?;
+        Ok(ResolvedInputs { manifests })
     }
 
     pub fn prepare_import(

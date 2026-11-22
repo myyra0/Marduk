@@ -9,6 +9,10 @@ use rusqlite::{Connection, TransactionBehavior};
 pub(crate) const CATALOG_FILE: &str = "catalog.sqlite3";
 pub(crate) const LOCK_FILE: &str = "library.lock";
 pub(crate) const JOURNAL_LOCK_FILE: &str = "journal.lock";
+/// Cross-client lease taken before the library gate for a deployment or
+/// recovery call. It is app-owned; the installation directory is never used as
+/// a lock location.
+pub(crate) const ROOT_LOCK_FILE: &str = "root.lock";
 pub(crate) const MIGRATION_VERSION: i64 = 2;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);

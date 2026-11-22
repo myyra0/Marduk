@@ -2077,7 +2077,7 @@ fn encode_locator(locator: &Path) -> Vec<u8> {
 }
 
 #[cfg(unix)]
-fn decode_locator(location: &[u8]) -> Option<PathBuf> {
+pub(crate) fn decode_locator(location: &[u8]) -> Option<PathBuf> {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
     match location {
@@ -2089,7 +2089,7 @@ fn decode_locator(location: &[u8]) -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-fn decode_locator(location: &[u8]) -> Option<PathBuf> {
+pub(crate) fn decode_locator(location: &[u8]) -> Option<PathBuf> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
     match location {

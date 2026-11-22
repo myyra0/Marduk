@@ -16,7 +16,9 @@ mod selection;
 pub use selection::{Purpose, Selection, SelectionId};
 use selection::{SelectionStore, Source};
 
-use marduk_core::deployment::{DeployError, OperationKind, OperationStatus, Phase};
+use marduk_core::deployment::{
+    DeployError, OperationKind, OperationStatus, Phase, PlanId, PreState,
+};
 use marduk_core::ids::{MemberId, ProfileId, ProfileRevision};
 use marduk_core::import::NamedProfile;
 use marduk_core::import::{
@@ -26,6 +28,7 @@ use marduk_core::recovery::{BackupRef, BackupSlot, Journal, StepDirection};
 use marduk_core::root_identity::{RootError, UnsupportedReason};
 use marduk_games::skyrim_se;
 use marduk_storage::Catalog;
+use marduk_storage::native_effects::NativeEffects;
 use marduk_storage::operation_journal::OperationJournal;
 use marduk_storage::operation_journal::SelectedInstallation;
 use serde::ser::SerializeMap;
@@ -424,6 +427,7 @@ pub struct Progress {
 
 /// One shared client service over the authoritative catalog and journal.
 pub struct Workspace {
+    app_data: PathBuf,
     catalog: Catalog,
     journal: OperationJournal,
     selections: SelectionStore,
@@ -435,6 +439,7 @@ impl Workspace {
         let catalog = Catalog::open(app_data).map_err(import_error)?;
         let journal = OperationJournal::open(app_data).map_err(deploy_error)?;
         Ok(Self {
+            app_data: app_data.to_path_buf(),
             catalog,
             journal,
             selections: SelectionStore::new(),
@@ -504,17 +509,21 @@ impl Workspace {
             }
             Op::DeployPreview => {
                 let args: DeployPreviewArgs = decode(request.args)?;
-                let _ = parse_revision(&args.at_revision)?;
-                Err(unsupported_effect())
+                let revision = parse_revision(&args.at_revision)?;
+                native_effects_gate()?;
+                Ok(json(self.deploy_preview(revision)?)?)
             }
             Op::DeployApply => {
                 let args: DeployApplyArgs = decode(request.args)?;
-                let _ = parse_id(&args.plan_id)?;
-                Err(unsupported_effect())
+                let plan = PlanId::try_from_u64(parse_id(&args.plan_id)?)
+                    .map_err(|_| WireError::new(Code::InvalidRequest))?;
+                native_effects_gate()?;
+                Ok(json(self.deploy_apply(plan)?)?)
             }
             Op::Restore => {
                 let _: NoArgs = decode(request.args)?;
-                Err(unsupported_effect())
+                native_effects_gate()?;
+                Ok(json(self.restore_generation()?)?)
             }
             Op::Operation => {
                 let args: OperationArgs = decode(request.args)?;
@@ -686,6 +695,136 @@ impl Workspace {
             .reorder_named(profile(), revision, &members)
             .map_err(edit_error)?;
         Ok(snapshot_dto(named))
+    }
+
+    fn deploy_preview(&mut self, revision: ProfileRevision) -> Result<Preview, WireError> {
+        let named = self
+            .catalog
+            .named_profile(profile())
+            .map_err(import_error)?;
+        if named.snapshot.revision != revision {
+            return Err(WireError::new(Code::StalePlan));
+        }
+        let inputs = self
+            .catalog
+            .resolved_inputs(profile())
+            .map_err(import_error)?;
+        let selected = self.selected_pair()?;
+        let mut port = self.native_effects(&selected)?;
+        let plan = marduk_core::deployment::preview_deployment(
+            &mut self.journal,
+            &mut port,
+            &named.snapshot,
+            &inputs,
+            &selected.installation,
+            &selected.data,
+        )
+        .map_err(deploy_error)?;
+        Ok(Preview {
+            id: Some(decimal(plan.id.get())),
+            profile_id: decimal(plan.profile.get()),
+            revision: decimal(plan.revision.get()),
+            installation_id: decimal(selected.id),
+            label: label(&selected.locator),
+            files: plan
+                .intents
+                .iter()
+                .map(|intent| PreviewFile {
+                    target: Target {
+                        role: Role::Data,
+                        path: intent.target.target.relative.as_str().to_owned(),
+                    },
+                    winner: decimal(intent.source.installed.get()),
+                    candidates: vec![decimal(intent.source.installed.get())],
+                    needs_backup: matches!(intent.original, PreState::Regular(_)),
+                })
+                .collect(),
+            blockers: Vec::new(),
+        })
+    }
+
+    fn deploy_apply(&mut self, plan: PlanId) -> Result<Operation, WireError> {
+        let selected = self.selected_pair()?;
+        let mut port = self.native_effects(&selected)?;
+        let status =
+            marduk_core::deployment::commit_deployment(&mut self.journal, &mut port, plan, || {
+                false
+            })
+            .map_err(deploy_error)?;
+        Ok(operation(status))
+    }
+
+    fn restore_generation(&mut self) -> Result<RestoreResult, WireError> {
+        let selected = self.selected_pair()?;
+        let mut port = self.native_effects(&selected)?;
+        match marduk_core::deployment::restore(
+            &mut self.journal,
+            &mut port,
+            &selected.installation,
+            &selected.data,
+        ) {
+            Ok(status) => Ok(RestoreResult::Operation {
+                operation: operation(status),
+            }),
+            Err(DeployError::NoActiveDeployment) => Ok(RestoreResult::NoActiveDeployment {
+                code: Code::NoActiveDeployment,
+            }),
+            Err(error) => Err(deploy_error(error)),
+        }
+    }
+
+    fn selected_pair(&mut self) -> Result<SelectedInstallation, WireError> {
+        self.journal
+            .selected_installation()
+            .map_err(deploy_error)?
+            .ok_or_else(|| WireError::new(Code::TargetUnavailable))
+    }
+
+    fn native_effects(&self, selected: &SelectedInstallation) -> Result<NativeEffects, WireError> {
+        NativeEffects::open(&self.app_data, &selected.locator, skyrim_se::LAYOUT)
+            .map_err(deploy_error)
+    }
+
+    /// Synthetic proof lane for the native copy adapter.
+    ///
+    /// These operations are deliberately unreachable from [`Workspace::dispatch`]
+    /// until the C1 proof lane records its rows in
+    /// `docs/research/m1-native-results.md`. Tests drive the same catalog,
+    /// journal and adapter composition here; the adapter itself refuses an
+    /// unqualified volume with a typed error.
+    #[doc(hidden)]
+    pub fn proof_preview_deployment(
+        &mut self,
+        revision: ProfileRevision,
+    ) -> Result<Preview, WireError> {
+        self.deploy_preview(revision)
+    }
+
+    /// Synthetic Apply, see [`Self::proof_preview_deployment`].
+    #[doc(hidden)]
+    pub fn proof_apply_deployment(&mut self, plan: PlanId) -> Result<Operation, WireError> {
+        self.deploy_apply(plan)
+    }
+
+    /// Synthetic Restore, see [`Self::proof_preview_deployment`].
+    #[doc(hidden)]
+    pub fn proof_restore(&mut self) -> Result<RestoreResult, WireError> {
+        self.restore_generation()
+    }
+
+    /// Synthetic restart reconciliation, see [`Self::proof_preview_deployment`].
+    #[doc(hidden)]
+    pub fn proof_recover_pending(&mut self) -> Result<Option<Operation>, WireError> {
+        let selected = self.selected_pair()?;
+        let mut port = self.native_effects(&selected)?;
+        marduk_core::recovery::recover_pending(
+            &mut self.journal,
+            &mut port,
+            &selected.installation,
+            &selected.data,
+        )
+        .map(|status| status.map(operation))
+        .map_err(deploy_error)
     }
 
     fn operation(&mut self, args: OperationArgs) -> Result<Operation, WireError> {
@@ -913,20 +1052,31 @@ fn phase(phase: Phase) -> &'static str {
     }
 }
 
+/// One decision point for client-visible deploy/restore availability.
+///
+/// The native copy adapter is wired, but real Apply and Restore stay closed
+/// until the C1 proof lane records its rows in
+/// `docs/research/m1-native-results.md`. Synthetic runs reach the adapter only
+/// through the `proof_*` methods; normal requests never bypass this gate.
+fn native_effects_gate() -> Result<(), WireError> {
+    Err(unsupported_effect())
+}
+
 fn effect_availability() -> Availability {
-    Availability {
-        available: false,
-        blocker: Some(WireError::with_detail(
-            Code::UnsupportedTarget,
-            Detail::Reason {
-                reason: ReasonDto::Configuration,
-            },
-        )),
+    match native_effects_gate() {
+        Ok(()) => Availability {
+            available: true,
+            blocker: None,
+        },
+        Err(blocker) => Availability {
+            available: false,
+            blocker: Some(blocker),
+        },
     }
 }
 
-/// No native effect port is connected, so no plan can be bound, no game file
-/// can be observed and no restore can run. The request is typed unavailable.
+/// No native effect port is exposed to clients, so no plan can be bound, no
+/// game file can be observed and no restore can run through `dispatch`.
 fn unsupported_effect() -> WireError {
     WireError::with_detail(
         Code::UnsupportedTarget,
