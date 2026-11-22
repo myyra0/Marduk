@@ -358,8 +358,7 @@ impl ProofSession {
             &target_path,
             &retain_path,
         );
-        let raw_error = result.as_ref().err().and_then(io::Error::raw_os_error);
-        let fault = self.fire(Checkpoint::AfterNativeEffect { raw_error });
+        let fault = self.fire(Checkpoint::AfterNativeEffect { raw_error: None });
         let evidence = self.evidence(target, key);
 
         if let Err(_error) = result {

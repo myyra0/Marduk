@@ -165,6 +165,22 @@ impl Catalog {
             if manifests.contains_key(&member.installed) {
                 continue;
             }
+            let revision =
+                i64::try_from(member.installed.get()).map_err(|_| ImportError::Storage)?;
+            let exists: Option<i64> = transaction
+                .query_row(
+                    "SELECT 1 FROM installed_revisions WHERE id = ?1",
+                    [revision],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(storage_error)?;
+            // An unknown revision has no manifest at all, which the resolver
+            // reports as `MissingManifest`. A published revision with no rows
+            // is an empty manifest, not a missing one.
+            if exists.is_none() {
+                continue;
+            }
             let paths = {
                 let mut statement = transaction
                     .prepare(
@@ -173,11 +189,7 @@ impl Catalog {
                     )
                     .map_err(storage_error)?;
                 let rows = statement
-                    .query_map(
-                        [i64::try_from(member.installed.get())
-                            .map_err(|_| ImportError::Storage)?],
-                        |row| row.get::<_, String>(0),
-                    )
+                    .query_map([revision], |row| row.get::<_, String>(0))
                     .map_err(storage_error)?;
                 rows.collect::<Result<Vec<_>, _>>().map_err(storage_error)?
             };
@@ -1190,7 +1202,7 @@ fn read_names(
     Ok(names)
 }
 
-fn read_profile_revision(
+pub(crate) fn read_profile_revision(
     connection: &Connection,
     profile: ProfileId,
 ) -> Result<ProfileRevision, ImportError> {

@@ -9,8 +9,9 @@
 //!
 //! Diagnostic path arguments are used only where the Win32 API needs a
 //! pathname. The Linux candidates act on directory handles and relative names.
-//! Neither `publish`, `replace` nor `detach` reads or deletes an arbitrary
-//! caller path: their destinations are operation-owned artifacts.
+//! `publish`, `replace` and `detach` move files between a caller-named target
+//! and operation-owned stage or retain slots; they never read or delete an
+//! arbitrary caller path.
 
 use std::fs::File;
 use std::io;
@@ -115,7 +116,7 @@ pub fn replace(
     stage_path: &std::path::Path,
     target_path: &std::path::Path,
     retain_path: &std::path::Path,
-) -> io::Result<()> {
+) -> Result<(), RootError> {
     #[cfg(target_os = "linux")]
     {
         crate::native::renameat2(
@@ -125,10 +126,16 @@ pub fn replace(
             leaf,
             libc::RENAME_EXCHANGE,
         )
+        .map_err(|_| RootError::Io)
     }
     #[cfg(windows)]
     {
-        replace_file(target_path, stage_path, retain_path)
+        // No distinct displaced slot is proven on Windows, so an exchange
+        // cannot retain the bytes it displaces. Refuse the configuration
+        // instead of passing the stage path as both replacement and backup.
+        Err(RootError::UnsupportedTarget(
+            marduk_core::root_identity::UnsupportedReason::Configuration,
+        ))
     }
 }
 
@@ -276,37 +283,6 @@ fn move_path(from: &std::path::Path, to: &std::path::Path) -> io::Result<()> {
     let from = wide(from)?;
     let to = wide(to)?;
     if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) } != 0 {
-        Ok(())
-    } else {
-        Err(io::Error::from_raw_os_error(
-            unsafe { GetLastError() } as i32
-        ))
-    }
-}
-
-#[cfg(windows)]
-fn replace_file(
-    target: &std::path::Path,
-    replacement: &std::path::Path,
-    backup: &std::path::Path,
-) -> io::Result<()> {
-    use windows_sys::Win32::Foundation::GetLastError;
-    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
-
-    let target = wide(target)?;
-    let replacement = wide(replacement)?;
-    let backup = wide(backup)?;
-    if unsafe {
-        ReplaceFileW(
-            target.as_ptr(),
-            replacement.as_ptr(),
-            backup.as_ptr(),
-            0,
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    } != 0
-    {
         Ok(())
     } else {
         Err(io::Error::from_raw_os_error(

@@ -32,7 +32,7 @@ use marduk_core::root_identity::{
 use marduk_core::targets::{RelativePath, TargetFile};
 use marduk_platform::effects;
 use marduk_platform::{GateError, InstallationBinding, WriterGate, WriterGuard};
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags};
 
 /// Live native effect session for one deployment or recovery call.
 pub struct NativeEffects {
@@ -44,9 +44,10 @@ pub struct NativeEffects {
     library: PathBuf,
     root_gate: WriterGate,
     library_gate: WriterGate,
-    /// The staged fingerprint for each prepared step. Effects need it to
-    /// distinguish "stage untouched" from "stage displaced the target", and it
-    /// exists only for the call that prepared the step.
+    /// The staged fingerprint for each inspected step. Effects need it to
+    /// distinguish "stage untouched" from "stage displaced the target". The
+    /// value is copied from the sealed step whenever recovery or apply inspects
+    /// it, so a restart does not depend on the map that `prepare` built.
     staged: BTreeMap<(u64, u32, StepDirection), Fingerprint>,
 }
 
@@ -493,7 +494,10 @@ impl NativeEffects {
             Some(&staged_fingerprint),
         );
 
-        if result.is_err() {
+        if let Err(error) = result {
+            if matches!(error, RootError::UnsupportedTarget(_)) {
+                return EffectOutcome::Unavailable(error);
+            }
             return match evidence.target {
                 Observation::Unavailable(error) => EffectOutcome::Unavailable(error),
                 _ if evidence.target == Observation::Regular(expected.clone())
@@ -638,6 +642,21 @@ impl NativeEffects {
         }
     }
 
+    /// Flush an operation directory and every ancestor up to the app data root.
+    /// A new entry is only durable once its parent directory is.
+    fn sync_directory_chain(&self, directory: &Path) -> Result<(), RootError> {
+        effects::sync_directory(directory)?;
+        let mut current = directory.parent();
+        while let Some(path) = current {
+            effects::sync_directory(path)?;
+            if path == self.library {
+                break;
+            }
+            current = path.parent();
+        }
+        Ok(())
+    }
+
     fn sync_effect(&self, step: &PreparedStep) -> Result<(), RootError> {
         let directory = self.op_dir(step.op.get(), step.ordinal, step.direction);
         for name in ["stage", "displaced", "original", "step"] {
@@ -651,15 +670,7 @@ impl NativeEffects {
             let file = effects::open_file(&self.target_path(&step.spec.target))?;
             file.sync_all().map_err(|_| RootError::Io)?;
         }
-        effects::sync_directory(&directory)?;
-        let mut current = directory.parent();
-        while let Some(path) = current {
-            effects::sync_directory(path)?;
-            if path == self.private {
-                break;
-            }
-            current = path.parent();
-        }
+        self.sync_directory_chain(&directory)?;
         // The changed target parent is part of the barrier. A failed
         // re-resolution or open must not leave the effect reported durable.
         let resolved = self.resolved(&step.spec.target)?;
@@ -804,6 +815,13 @@ impl CopyEffects for NativeEffects {
             self.staged
                 .insert((op.get(), ordinal, direction), fingerprint.clone());
         }
+        // The stage and backups must be durable before the caller may publish.
+        // The operation chain is synced here, not only after the public rename.
+        self.sync_directory_chain(&self.op_dir(op.get(), ordinal, direction))
+            .map_err(|error| match error {
+                RootError::UnsupportedTarget(_) => DeployError::UnsupportedTarget,
+                _ => DeployError::Io,
+            })?;
         Ok(prepared)
     }
 
@@ -831,6 +849,21 @@ impl CopyEffects for NativeEffects {
     }
 
     fn inspect_step(&mut self, step: &PreparedStep) -> Evidence {
+        // Cache the sealed fingerprint on every inspection. Recovery calls this
+        // immediately before execute/execute_undo, so a reopened adapter can
+        // still classify an exchange without having prepared the step itself.
+        match &step.staged {
+            Some((at, fingerprint)) => {
+                self.staged.insert(
+                    (at.operation().get(), at.ordinal(), at.direction()),
+                    fingerprint.clone(),
+                );
+            }
+            None => {
+                self.staged
+                    .remove(&(step.op.get(), step.ordinal, step.direction));
+            }
+        }
         self.evidence_for_step(step)
     }
 
@@ -939,17 +972,7 @@ impl DeploymentInputs for NativeEffects {
         connection
             .busy_timeout(Duration::from_secs(5))
             .map_err(|_| DeployError::Io)?;
-        let id = i64::try_from(profile.get()).map_err(|_| DeployError::Io)?;
-        let revision: Option<i64> = connection
-            .query_row("SELECT revision FROM profiles WHERE id = ?1", [id], |row| {
-                row.get(0)
-            })
-            .optional()
-            .map_err(|_| DeployError::Io)?;
-        match revision {
-            Some(revision) if revision >= 0 => Ok(ProfileRevision::new(revision as u64)),
-            _ => Err(DeployError::Io),
-        }
+        crate::library::read_profile_revision(&connection, profile).map_err(|_| DeployError::Io)
     }
 
     fn source(
@@ -982,8 +1005,9 @@ fn artifact(path: &Path) -> Artifact {
         }
         Ok(_) => match effects::fingerprint_path(path) {
             Ok(fingerprint) => Artifact::Regular(fingerprint),
-            Err(RootError::TargetUnavailable) => Artifact::Absent,
             Err(RootError::UnsupportedTarget(reason)) => Artifact::Unsupported(reason),
+            // The stat succeeded, so "absent" is no longer a possible answer:
+            // an unreadable slot is unavailable evidence, never an empty one.
             Err(_) => Artifact::Unavailable,
         },
         Err(error) if error.kind() == io::ErrorKind::NotFound => Artifact::Absent,
