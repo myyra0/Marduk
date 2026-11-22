@@ -1398,10 +1398,13 @@ pub(crate) struct PrivateFile {
 
 impl PrivateFile {
     pub(crate) fn path(&self, parent: &File) -> Result<PathBuf, RootError> {
-        // `/proc/self/fd/<dirfd>` resolves through the pinned directory inode, so
-        // renaming the verified directory cannot redirect this path. SQLite
-        // resolves the leaf and sidecars itself; the substitution residual is
-        // owned by `docs/contracts/m1-recovery.md` (catalog file containment).
+        // SQLite resolves this `/proc/self/fd/<dirfd>` spelling to a real pathname
+        // (`unixFullPathname`) before it opens the catalog, and derives the
+        // `-wal`/`-shm`/`-journal` names from that pathname. A same-privilege
+        // rename of the verified directory can therefore redirect the open; the
+        // post-open `PrivateFile::verify` refuses to continue. The residual and
+        // the still-name-resolved sidecars are owned by
+        // `docs/contracts/m1-recovery.md` (catalog file containment).
         Ok(PathBuf::from(format!(
             "/proc/self/fd/{}/{}",
             parent.as_raw_fd(),
