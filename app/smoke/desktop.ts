@@ -30,6 +30,7 @@ const uiTimeoutMs = Number(process.env.MARDUK_UI_TIMEOUT_MS ?? 90_000);
 /** Evaluated in the page. Reports only what the shell actually rendered. */
 const DOM_STATE = `
   const root = document.getElementById('root');
+  const shell = root !== null && root.querySelector('main.shell') !== null;
   const heading = document.querySelector('h1');
   const text = document.body ? document.body.innerText : '';
   const rows = Array.from(document.querySelectorAll('.availability')).map(function (row) {
@@ -38,14 +39,18 @@ const DOM_STATE = `
   const revision = Array.from(document.querySelectorAll('code'))
     .map(function (node) { return (node.textContent || '').trim(); })
     .find(function (value) { return value.startsWith('revision '); }) || null;
+  const installationRendered =
+    text.includes('No installation bound.') || /installation\\s+\\S/.test(text);
   return {
     documentTitle: document.title,
     root: root !== null,
     rootChildren: root ? root.children.length : 0,
+    shell: shell,
     heading: heading ? heading.textContent : null,
     text: text,
     rows: rows,
     revision: revision,
+    installationRendered: installationRendered,
   };
 `;
 
@@ -210,9 +215,19 @@ try {
   // 2. The status view loads from the real workspace, not a fixture. A typed
   //    failure is a failure here: a fresh catalog root must open successfully.
   const statusView = (await waitFor('the authoritative status view', uiTimeoutMs, async () => {
-    const state = (await execute(DOM_STATE)) as { text: string };
+    const state = (await execute(DOM_STATE)) as {
+      shell?: boolean;
+      heading?: string | null;
+      text: string;
+      installationRendered?: boolean;
+    };
+    if (state.shell !== true) return null;
+    if (state.heading?.trim() !== 'Marduk') return null;
     if (state.text.includes('Status unavailable')) {
       throw new Error(`the shell rendered its typed failure state: ${state.text.slice(0, 600)}`);
+    }
+    if (!(state.text.includes('No installation bound.') || state.installationRendered === true)) {
+      return null;
     }
     return state.text.includes('Deploy') && state.text.includes('Profile')
       ? state
