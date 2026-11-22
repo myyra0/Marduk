@@ -488,3 +488,105 @@ fn decode_rejects_applied_without_evidence_and_block_on_terminal() {
     let state = journal.root_state(&root(2)).unwrap();
     assert_eq!(state.active, Some(generation));
 }
+
+fn unreadable_retain() -> Evidence {
+    Evidence {
+        target: Observation::Regular(post_fp()),
+        stage: Artifact::Absent,
+        retained: Artifact::Unavailable,
+    }
+}
+
+fn readable_retain() -> Evidence {
+    Evidence {
+        target: Observation::Regular(post_fp()),
+        stage: Artifact::Absent,
+        retained: Artifact::Absent,
+    }
+}
+
+fn assert_latched_across_reopen(dir: &TempDir, op: OperationId) {
+    let mut journal = OperationJournal::open(dir.path()).unwrap();
+    assert!(journal.has_unresolved_displacement(op).unwrap());
+    assert_eq!(
+        journal.status(op).unwrap().unwrap().blocker,
+        Some(DeployError::RecoveryConflict)
+    );
+    assert_eq!(
+        journal.finish(op, Finalize::RolledBack),
+        Err(DeployError::RecoveryConflict)
+    );
+}
+
+#[test]
+fn displaced_canonical_slot_stays_unresolved_after_unknown_then_readable() {
+    let dir = fixture_v1();
+    let mut journal = open_fixture(&dir);
+    let (op, step) = applying_deploy(&mut journal);
+
+    journal
+        .block_displacement(op, &step, step.retain, &applied())
+        .unwrap();
+    journal
+        .record_unreadable_retain(op, &step, step.retain, &unreadable_retain())
+        .unwrap();
+    journal
+        .record_readable_slot(op, &step, step.retain, &readable_retain())
+        .unwrap();
+
+    assert!(journal.has_unresolved_displacement(op).unwrap());
+    drop(journal);
+    assert_latched_across_reopen(&dir, op);
+}
+
+#[test]
+fn displaced_alternate_slot_stays_unresolved_after_unknown_then_readable() {
+    let dir = fixture_v1();
+    let mut journal = open_fixture(&dir);
+    let (op, step) = applying_deploy(&mut journal);
+    let alternate = step.alternate_displacement();
+
+    journal
+        .block_displacement(op, &step, alternate, &applied())
+        .unwrap();
+    journal
+        .record_unreadable_retain(op, &step, alternate, &unreadable_retain())
+        .unwrap();
+    journal
+        .record_readable_slot(op, &step, alternate, &readable_retain())
+        .unwrap();
+
+    assert!(journal.has_unresolved_displacement(op).unwrap());
+    drop(journal);
+    assert_latched_across_reopen(&dir, op);
+}
+
+#[test]
+fn clean_slot_never_latches() {
+    let dir = fixture_v1();
+    let mut journal = open_fixture(&dir);
+    let (op, step) = applying_deploy(&mut journal);
+
+    journal
+        .record_readable_slot(op, &step, step.retain, &readable_retain())
+        .unwrap();
+    journal
+        .record_readable_slot(op, &step, step.alternate_displacement(), &readable_retain())
+        .unwrap();
+    assert!(!journal.has_unresolved_displacement(op).unwrap());
+
+    // An unreadable slot is unresolved while it is the latest observation, but
+    // it never becomes a positive displacement latch once it reads cleanly.
+    journal
+        .record_unreadable_retain(op, &step, step.retain, &unreadable_retain())
+        .unwrap();
+    assert!(journal.has_unresolved_displacement(op).unwrap());
+    journal
+        .record_readable_slot(op, &step, step.retain, &readable_retain())
+        .unwrap();
+    assert!(!journal.has_unresolved_displacement(op).unwrap());
+
+    drop(journal);
+    let mut journal = OperationJournal::open(dir.path()).unwrap();
+    assert!(!journal.has_unresolved_displacement(op).unwrap());
+}

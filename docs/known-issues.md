@@ -7,13 +7,6 @@ Last reviewed: 2026-11-22, at the commit recorded in `docs/research/m1-native-re
 
 ## Open defects
 
-**A displaced file can stop being flagged as unresolved.**
-`crates/storage/src/operation_journal.rs` (`write_readable_slot`) decides blocking from the latest observation only.
-A slot that was positively reported as displaced, then briefly unreadable, then readable again, clears the unresolved
-flag without operator review. Recovery can then continue past a displacement the user never saw. Closing it means
-keeping the positive displacement latch separate from current slot readability, with reopen tests for the canonical
-and alternate slots.
-
 **An exchange can settle with incomplete slot evidence.**
 `crates/storage/src/native_effects.rs` (`exchange_slots`) reports the stage as absent when the distinct `displaced`
 slot is occupied, even if the stage is unreadable or holds an unexpected object. A matching target and displaced

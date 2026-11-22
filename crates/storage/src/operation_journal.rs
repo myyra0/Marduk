@@ -1750,17 +1750,30 @@ struct LatestObservation {
     at: BackupRef,
     evidence: Evidence,
     state: SlotState,
+    /// A positive displacement report for this exact slot at any point in its
+    /// history. Append-only, so a later readable observation cannot erase it.
+    latched: bool,
 }
 
 /// The latest inspection of every exact slot (ordinal, direction, reported
-/// ref). Earlier history stays durable but never decides status or blocking.
+/// ref) plus that slot's positive displacement latch. Earlier history stays
+/// durable; only the positive report is latched, so later readability changes
+/// the current state without clearing operator review.
 fn latest_observations(
     connection: &Connection,
     op: OperationId,
 ) -> Result<Vec<LatestObservation>, DeployError> {
     let mut query = connection
         .prepare(
-            "SELECT d.ordinal, d.direction, d.reported_ref, d.evidence, d.slot_state
+            "SELECT d.ordinal, d.direction, d.reported_ref, d.evidence, d.slot_state,
+                    EXISTS (
+                        SELECT 1 FROM displacement_observations AS report
+                        WHERE report.operation_id = d.operation_id
+                          AND report.ordinal = d.ordinal
+                          AND report.direction = d.direction
+                          AND report.reported_ref = d.reported_ref
+                          AND report.slot_state = 1
+                    )
              FROM displacement_observations AS d
              JOIN (
                  SELECT ordinal, direction, reported_ref, MAX(seq) AS seq
@@ -1779,12 +1792,14 @@ fn latest_observations(
                 row.get::<_, Vec<u8>>(2)?,
                 row.get::<_, Vec<u8>>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
             ))
         })
         .map_err(|_| DeployError::Io)?;
     let mut observations = Vec::new();
     for row in rows {
-        let (ordinal, direction, at, evidence, state) = row.map_err(|_| DeployError::Io)?;
+        let (ordinal, direction, at, evidence, state, latched) =
+            row.map_err(|_| DeployError::Io)?;
         observations.push(LatestObservation {
             ordinal: u32::try_from(ordinal).map_err(|_| DeployError::Io)?,
             direction,
@@ -1796,16 +1811,17 @@ fn latest_observations(
                 2 => SlotState::Unknown,
                 _ => return Err(DeployError::Io),
             },
+            latched: latched != 0,
         });
     }
     Ok(observations)
 }
 
-/// Whether a latest observation requires operator review. A readable expected
-/// slot resolves a previous report; everything else stays unresolved until a
-/// later inspection supersedes it.
+/// Whether a slot requires operator review. A positive displacement report
+/// stays latched; otherwise only the latest observation decides, so an
+/// unreadable slot is unresolved and a readable expected slot is settled.
 fn unresolved(observation: &LatestObservation) -> bool {
-    observation.state != SlotState::Readable
+    observation.latched || observation.state != SlotState::Readable
 }
 
 fn read_displacement(connection: &Connection, op: OperationId) -> Result<Option<()>, DeployError> {
