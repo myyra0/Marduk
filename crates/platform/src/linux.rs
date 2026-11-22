@@ -1080,6 +1080,13 @@ pub(crate) struct StagingTree {
 }
 
 impl StagingTree {
+    /// The pinned root handle, for the evidence-only catalog composition that
+    /// must not open the same root a second time.
+    #[cfg(feature = "evidence")]
+    pub(crate) fn root_file(&self) -> &std::fs::File {
+        &self.root.file
+    }
+
     pub(crate) fn open(root: &Path) -> Result<Self, RootError> {
         let root_dir = verify_root(open_directory(root)?)?;
         if !library_filesystem_qualified(statfs_of(&root_dir.file)?.0) {
@@ -1340,11 +1347,26 @@ pub(crate) fn open_private_directory(path: &Path) -> Result<File, RootError> {
     Ok(current)
 }
 
+/// POSIX has no per-handle sharing mode, so the evidence open is the same
+/// boundary proof as production.
+#[cfg(feature = "evidence")]
+pub(crate) fn open_private_directory_for_evidence(path: &Path) -> Result<File, RootError> {
+    open_private_directory(path)
+}
+
 pub(crate) fn open_private_child_directory(parent: &File, name: &str) -> Result<File, RootError> {
     if !ordinary_component(name) {
         return Err(RootError::TargetUnavailable);
     }
     open_or_create_directory(parent, OsStr::new(name))
+}
+
+#[cfg(feature = "evidence")]
+pub(crate) fn open_private_child_directory_for_evidence(
+    parent: &File,
+    name: &str,
+) -> Result<File, RootError> {
+    open_private_child_directory(parent, name)
 }
 
 pub(crate) fn private_child_path(parent: &File, name: &str) -> Result<PathBuf, RootError> {
@@ -1370,6 +1392,15 @@ pub(crate) fn verify_private_directory(path: &Path, handle: &File) -> Result<(),
         return Err(RootError::TargetUnavailable);
     }
     Ok(())
+}
+
+/// POSIX has no sharing modes, so the evidence check is the same boundary proof.
+#[cfg(feature = "evidence")]
+pub(crate) fn verify_private_directory_for_evidence(
+    path: &Path,
+    handle: &File,
+) -> Result<(), RootError> {
+    verify_private_directory(path, handle)
 }
 
 pub(crate) struct PrivateFile {
