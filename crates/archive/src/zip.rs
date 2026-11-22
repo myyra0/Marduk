@@ -531,6 +531,10 @@ fn validate_duplicate_names(records: &[Record]) -> Result<(), ArchiveError> {
 
 /// Validation pass 2b: ASCII-folded equivalence, mixed parent spellings and
 /// file/directory overlaps. Conflicts report the earliest earlier witness.
+///
+/// Claims live in a trie so a deep name stores each component once instead of
+/// cloning every prefix. A directory-sized name budget therefore bounds the
+/// claim map, not the number of prefixes times their length.
 fn validate_conflicts(records: &[Record]) -> Result<(), ArchiveError> {
     struct Claim {
         spelling: String,
@@ -538,59 +542,79 @@ fn validate_conflicts(records: &[Record]) -> Result<(), ArchiveError> {
         is_dir: bool,
     }
 
-    let mut claims: HashMap<String, Claim> = HashMap::with_capacity(records.len());
-    for record in records {
-        for (at, _) in record.spelling.match_indices('/') {
-            let prefix = &record.spelling[..at];
-            let canonical = prefix.to_ascii_lowercase();
-            let existing = claims
-                .get(&canonical)
-                .map(|claim| (claim.first, claim.is_dir, claim.spelling != prefix));
-            match existing {
-                Some((first, is_dir, differs_spelling)) if !is_dir || differs_spelling => {
-                    return Err(ArchiveError::ConflictingNames {
-                        first,
-                        second: record.index,
-                    });
-                }
-                Some(_) => {}
-                None => {
-                    claims.insert(
-                        canonical,
-                        Claim {
-                            spelling: prefix.to_owned(),
-                            first: record.index,
-                            is_dir: true,
-                        },
-                    );
-                }
-            }
-        }
+    struct Node {
+        children: HashMap<Box<[u8]>, usize>,
+        claim: Claim,
+    }
 
-        let canonical = record.spelling.to_ascii_lowercase();
-        let existing = claims.get(&canonical).map(|claim| {
-            (
-                claim.first,
-                claim.spelling != record.spelling || claim.is_dir != record.is_dir,
-            )
-        });
-        match existing {
-            Some((first, true)) => {
+    fn fold(folded: &mut Vec<u8>, component: &str) {
+        folded.clear();
+        folded.extend(component.bytes().map(|byte| byte.to_ascii_lowercase()));
+    }
+
+    /// Claim one folded component below `parent`. The caller reuses `folded`
+    /// so a lookup allocates nothing; only a new node stores its key once.
+    fn claim(
+        nodes: &mut Vec<Node>,
+        parent: usize,
+        component: &str,
+        folded: &mut Vec<u8>,
+        index: usize,
+        is_dir: bool,
+    ) -> Result<usize, ArchiveError> {
+        fold(folded, component);
+        if let Some(&child) = nodes[parent].children.get(folded.as_slice()) {
+            let existing = &nodes[child].claim;
+            if existing.is_dir != is_dir || existing.spelling != component {
                 return Err(ArchiveError::ConflictingNames {
-                    first,
-                    second: record.index,
+                    first: existing.first,
+                    second: index,
                 });
             }
-            Some(_) => {}
-            None => {
-                claims.insert(
-                    canonical,
-                    Claim {
-                        spelling: record.spelling.clone(),
-                        first: record.index,
-                        is_dir: record.is_dir,
-                    },
-                );
+            return Ok(child);
+        }
+
+        let child = nodes.len();
+        nodes.push(Node {
+            children: HashMap::new(),
+            claim: Claim {
+                spelling: component.to_owned(),
+                first: index,
+                is_dir,
+            },
+        });
+        nodes[parent]
+            .children
+            .insert(folded.as_slice().into(), child);
+        Ok(child)
+    }
+
+    let mut nodes = Vec::with_capacity(records.len());
+    nodes.push(Node {
+        children: HashMap::new(),
+        claim: Claim {
+            spelling: String::new(),
+            first: 0,
+            is_dir: true,
+        },
+    });
+
+    let mut folded = Vec::new();
+    for record in records {
+        let mut parent = 0;
+        let mut components = record.spelling.split('/').peekable();
+        while let Some(component) = components.next() {
+            let is_dir = components.peek().is_some() || record.is_dir;
+            let child = claim(
+                &mut nodes,
+                parent,
+                component,
+                &mut folded,
+                record.index,
+                is_dir,
+            )?;
+            if components.peek().is_some() {
+                parent = child;
             }
         }
     }
