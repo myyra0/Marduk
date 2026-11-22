@@ -141,21 +141,27 @@ pub struct Proof {
     pub revision: &'static str,
 }
 
-/// A candidate approved for a future experiment, not a runtime proof.
+/// A decision that narrows a capability's guarantee where no runtime proof of
+/// the stronger guarantee exists. It records what was decided, not a run: it
+/// never satisfies a route and never stands in for crash evidence. Availability
+/// still comes from [`PROOFS`] alone.
 #[derive(Clone, Copy, Debug)]
-pub struct Theoretical {
+pub struct Narrowed {
     pub capability: Capability,
     pub os: Os,
     pub volume: VolumeClass,
     pub witness: &'static str,
+    /// The decision that narrows the guarantee.
+    pub adr: &'static str,
 }
 
-/// Deferred experiments, separate from the proofs that routes consult.
-pub const THEORETICAL: &[Theoretical] = &[Theoretical {
+/// Recorded narrowing decisions, separate from the proofs that routes consult.
+pub const NARROWED: &[Narrowed] = &[Narrowed {
     capability: Capability::NativeEffects,
     os: Os::Windows,
     volume: VolumeClass::Ntfs,
     witness: "native_namespace_survives_claimed_barrier",
+    adr: "docs/adr/0004-windows-writes-use-standard-flush.md",
 }];
 
 /// Code that exists on an operating system. Implementation is not evidence.

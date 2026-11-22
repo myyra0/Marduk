@@ -21,8 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use marduk_core::qualification::{
-    Capability, Layer, Os, PROOFS, Proof, Route, THEORETICAL, VolumeClass, available,
-    missing_witness,
+    Capability, Layer, NARROWED, Os, PROOFS, Proof, Route, VolumeClass, available, missing_witness,
 };
 
 const EVIDENCE: &str = "docs/research/m1-native-results.md";
@@ -32,7 +31,9 @@ enum Status {
     Ran,
     Unrun,
     NotApplicable,
-    Theoretical,
+    /// A recorded decision that narrows the guarantee. It is deliberately not
+    /// a runtime pass, so it can never satisfy a proof or imply crash coverage.
+    Narrowed,
 }
 
 fn repo_root() -> PathBuf {
@@ -236,8 +237,8 @@ fn parse_status(line: usize, witness: &str, cell: &str) -> Status {
     if lowered.starts_with("not run") {
         return Status::Unrun;
     }
-    if lowered == "theoretically approved for testing, empirical proof deferred" {
-        return Status::Theoretical;
+    if lowered.starts_with("narrowed") {
+        return Status::Narrowed;
     }
     if matches!(cell, "N/A" | "—" | "-" | "") {
         return Status::NotApplicable;
@@ -488,7 +489,7 @@ fn the_record_and_the_evidence_document_agree() {
                  availability record has no proof for it; add the witness to the record or \
                  correct the row"
             ),
-            Status::Unrun | Status::NotApplicable | Status::Theoretical => assert!(
+            Status::Unrun | Status::NotApplicable | Status::Narrowed => assert!(
                 !recorded,
                 "the availability record proves `{witness}` on {os} {volume}, but {EVIDENCE} \
                  does not record a pass for it; run the test or withdraw the proof"
@@ -513,8 +514,9 @@ fn a_composition_proof_opens_deploy_without_opening_an_unproven_configuration() 
             );
         }
     }
-    // The gate asks the record, so a Windows-shaped question is refused by the
-    // record itself: no NTFS composition proof exists.
+    // Windows deploy can only be opened by a composition run, never by the
+    // narrowed barrier row (ADR 0004): no NTFS composition proof exists yet, so
+    // the route stays refused.
     assert!(!available(
         Capability::NativeEffects,
         Route::Deploy,
@@ -533,28 +535,63 @@ fn a_composition_proof_opens_deploy_without_opening_an_unproven_configuration() 
         Os::Linux,
         VolumeClass::Ext4
     ));
+    assert!(!available(
+        Capability::NativeEffects,
+        Route::Deploy,
+        Os::Windows,
+        VolumeClass::Other
+    ));
 }
 
+/// A `narrowed` cell records an ADR decision, not a run. It may accompany a
+/// configuration whose composed deploy is separately proven, but it must never
+/// be the witness that proves anything, and it must never be read as a pass for
+/// the power-cut experiment that no run covers.
 #[test]
-fn theoretical_candidates_match_the_document_without_qualifying_a_route() {
+fn narrowed_rows_match_the_document_and_never_stand_in_for_a_run() {
     let text = evidence_text();
     let documented: BTreeSet<_> = observed_cells(&text)
         .into_iter()
         .chain(primitive_cells(&text))
-        .filter_map(|(key, status)| (status == Status::Theoretical).then_some(key))
+        .filter_map(|(key, status)| (status == Status::Narrowed).then_some(key))
         .collect();
-    let recorded: BTreeSet<_> = THEORETICAL
+    let recorded: BTreeSet<_> = NARROWED
         .iter()
         .map(|candidate| (candidate.witness.to_owned(), candidate.os, candidate.volume))
         .collect();
     assert_eq!(documented, recorded);
-    for candidate in THEORETICAL {
-        for route in [Route::Adapter, Route::Import, Route::Deploy, Route::Restore] {
+
+    for candidate in NARROWED {
+        assert!(!candidate.adr.is_empty(), "{candidate:?} names no decision");
+        for proof in proofs_naming(candidate.witness) {
             assert!(
-                !available(candidate.capability, route, candidate.os, candidate.volume),
-                "{candidate:?} is theoretical, but {route:?} is available"
+                proof.os != candidate.os || proof.volume != candidate.volume,
+                "`{}` is narrowed on {}/{} and cannot prove {proof:?}",
+                candidate.witness,
+                candidate.os,
+                candidate.volume
             );
         }
+        // The weakened barrier admits the composed route only because the
+        // composition itself ran. Without that proof the route stays closed.
+        let proved = PROOFS.iter().any(|proof| {
+            proof.capability == candidate.capability
+                && proof.os == candidate.os
+                && proof.volume == candidate.volume
+                && proof.layer >= Layer::Composition
+        });
+        assert_eq!(
+            available(
+                candidate.capability,
+                Route::Deploy,
+                candidate.os,
+                candidate.volume
+            ),
+            proved,
+            "a narrowed row must not open deploy on {}/{} on its own",
+            candidate.os,
+            candidate.volume
+        );
     }
 }
 
