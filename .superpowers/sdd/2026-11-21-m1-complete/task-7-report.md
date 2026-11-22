@@ -156,3 +156,5 @@ existing core warnings.
 - Run the desktop witnesses (`desktop_and_cli_share_winner_and_final_state`,
   stale preview, replay/no duplicate writes, recovery conflict, keyboard order,
   no generic write command, wire fixtures) on Linux and Windows.
+
+- Fix (da29c5f+): `app_data_root`'s `cfg(windows)` arm now maps `var_os("APPDATA")` to `Option<PathBuf>` before `base.map(|base| app_data_root_in(&base))`, removing the E0308 type mismatch. Location unchanged (`%APPDATA%\com.marduk.desktop`). Verified: `cargo test --locked --workspace` green, `cargo fmt --all -- --check` green (also reorders one pre-existing import line in the same file), `cargo build --locked --workspace` green. Not verified: `cargo check --target x86_64-pc-windows-msvc` on this host — `libsqlite3-sys` build fails for lack of MSVC/UCRT headers (`stdlib.h`), independent of this change; the Windows arm was type-checked by compiling the identical expression for that target in an isolated crate.

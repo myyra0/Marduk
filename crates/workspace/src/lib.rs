@@ -47,7 +47,9 @@ pub fn app_data_root_in(data_dir: &Path) -> PathBuf {
 /// identifier. No client may derive a different catalog location.
 pub fn app_data_root() -> Result<PathBuf, WireError> {
     #[cfg(windows)]
-    let base = std::env::var_os("APPDATA").filter(|value| !value.is_empty());
+    let base = std::env::var_os("APPDATA")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
 
     #[cfg(target_os = "macos")]
     let base = std::env::var_os("HOME")
