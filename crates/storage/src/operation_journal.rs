@@ -65,6 +65,10 @@ impl OperationJournal {
             marduk_platform::open_or_create_private_file(&root_handle, crate::schema::CATALOG_FILE)
                 .map_err(|_| DeployError::Io)?;
         let path = catalog.path(&root_handle).map_err(|_| DeployError::Io)?;
+        // SQLite resolves this pathname itself, including the sidecar names it
+        // derives from it. Prove the leaf and root before and after the open;
+        // the residual same-privilege substitution window is documented on
+        // `marduk_platform::PrivateFile`.
         let mut connection = Connection::open_with_flags(&path, OpenFlags::default())
             .map_err(|_| DeployError::Io)?;
         catalog.verify(&root_handle).map_err(|_| DeployError::Io)?;
@@ -74,6 +78,8 @@ impl OperationJournal {
         let _guard = gate.try_lock().map_err(gate_error)?;
         crate::schema::prepare(&mut connection).map_err(|_| DeployError::Io)?;
         catalog.verify(&root_handle).map_err(|_| DeployError::Io)?;
+        marduk_platform::verify_private_directory(app_data, &root_handle)
+            .map_err(|_| DeployError::Io)?;
 
         Ok(Self {
             root: app_data.to_path_buf(),

@@ -1372,8 +1372,11 @@ pub(crate) struct PrivateFile {
 
 impl PrivateFile {
     pub(crate) fn path(&self, parent: &File) -> Result<PathBuf, RootError> {
-        // The descriptor keeps the directory component pinned, so SQLite
-        // cannot be redirected by renaming or replacing an ancestor.
+        // The descriptor keeps the directory component pinned for *our* opens.
+        // This is a pathname, not an `openat` handle: SQLite resolves it (and
+        // derives `-wal`, `-shm` and `-journal` from the resolved spelling), so
+        // a same-privilege substitution of the verified directory is outside
+        // the guarantee. Callers re-prove the root and leaf after the open.
         Ok(PathBuf::from(format!(
             "/proc/self/fd/{}/{}",
             parent.as_raw_fd(),

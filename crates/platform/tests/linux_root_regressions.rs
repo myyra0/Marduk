@@ -8,7 +8,7 @@ use marduk_core::root_identity::{
 use marduk_core::targets::RelativePath;
 use marduk_platform::{
     WriterGate, bind_installation, observe_target, open_or_create_private_file,
-    open_private_directory, reopen_installation, resolve_existing_parent,
+    open_private_directory, reopen_installation, resolve_existing_parent, verify_private_directory,
 };
 
 const LAYOUT: GameLayout = GameLayout {
@@ -227,6 +227,35 @@ fn unavailable_flags_probe_refuses_an_original() {
             reason: UnsupportedReason::Metadata
         })
     );
+}
+
+#[test]
+fn post_open_reverification_refuses_a_substituted_root_and_leaf() {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("app-data");
+    fs::create_dir(&root).unwrap();
+    let pinned = open_private_directory(&root).unwrap();
+    let catalog = open_or_create_private_file(&pinned, "catalog.sqlite3").unwrap();
+    verify_private_directory(&root, &pinned).unwrap();
+    catalog.verify(&pinned).unwrap();
+
+    // SQLite opens the pathname after this point. A replaced directory makes
+    // every name-resolved open (main file and sidecars) land elsewhere; the
+    // re-proof after the open must refuse rather than keep writing.
+    fs::rename(&root, base.path().join("app-data-old")).unwrap();
+    fs::create_dir(&root).unwrap();
+    assert_eq!(
+        verify_private_directory(&root, &pinned),
+        Err(RootError::TargetUnavailable)
+    );
+    assert!(fs::read_dir(&root).unwrap().next().is_none());
+
+    // A leaf replaced inside the pinned directory is refused by the leaf proof.
+    let held = base.path().join("app-data-old").join("catalog.sqlite3");
+    fs::rename(&held, base.path().join("app-data-old").join("moved")).unwrap();
+    fs::write(&held, b"replacement").unwrap();
+    assert_eq!(catalog.verify(&pinned), Err(RootError::TargetUnavailable));
+    assert_eq!(fs::read(&held).unwrap(), b"replacement");
 }
 
 #[test]

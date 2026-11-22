@@ -102,6 +102,16 @@ pub fn verify_private_directory(path: &Path, handle: &std::fs::File) -> Result<(
 
 /// A regular file opened or created directly beneath a pinned app-owned
 /// directory, with the leaf's native identity kept for later re-proof.
+///
+/// The held handle is the authority for the leaf's identity. On Windows it
+/// deliberately does not share delete access, so the operating system refuses
+/// a rename or replacement of the leaf while the catalog is open. On Linux the
+/// handle is an `openat2`-pinned descriptor; SQLite still resolves the main
+/// file and its `-wal`/`-shm`/`-journal` sidecars by pathname, so a
+/// same-privilege substitution of the verified directory between the final
+/// re-proof and SQLite's own open is the documented residual window. Callers
+/// re-prove the directory and this leaf immediately after every pathname-based
+/// SQLite open.
 pub struct PrivateFile {
     inner: native::PrivateFile,
 }

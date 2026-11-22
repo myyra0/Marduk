@@ -367,6 +367,27 @@ fn journal_reopen_refuses_a_catalog_replaced_by_a_link() {
     assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
 }
 
+#[cfg(unix)]
+#[test]
+fn journal_reopen_refuses_a_substituted_app_root() {
+    let dir = fixture_v1();
+    let mut journal = open_fixture(&dir);
+    let root = dir.path().to_path_buf();
+    let moved = root.with_extension("moved");
+    std::fs::rename(&root, &moved).unwrap();
+    std::fs::create_dir(&root).unwrap();
+
+    assert!(matches!(journal.reopen(), Err(DeployError::Io)));
+    assert_eq!(
+        std::fs::read_dir(&root).unwrap().count(),
+        0,
+        "a refused re-proof must not write through the replacement path"
+    );
+    // Restore the fixture so the temporary directory cleans itself up.
+    std::fs::remove_dir(&root).unwrap();
+    std::fs::rename(&moved, &root).unwrap();
+}
+
 #[cfg(windows)]
 fn redirected_catalog(dir: &Path) -> Option<std::path::PathBuf> {
     let outside = dir.join("outside.sqlite3");

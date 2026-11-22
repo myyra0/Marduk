@@ -88,10 +88,12 @@ impl Catalog {
         let catalog_path = catalog
             .path(&root_handle)
             .map_err(|_| ImportError::Storage)?;
-        // The pathname starts at the pinned directory descriptor, so SQLite
-        // follows no ancestor that could be replaced. The leaf is proved by
-        // `PrivateFile` before and after the open instead of relying on the
-        // VFS no-follow flag.
+        // The pathname starts at the pinned directory descriptor, so our own
+        // opens follow no substituted ancestor. SQLite resolves that pathname
+        // itself and derives `-wal`/`-shm`/`-journal` from the resolved
+        // spelling, so the leaf is proved by `PrivateFile` and the root is
+        // re-proved by pathname before and after the open and after the first
+        // SQLite writes (see `PrivateFile` for the documented residual window).
         let mut connection = Connection::open_with_flags(&catalog_path, OpenFlags::default())
             .map_err(storage_error)?;
         catalog
@@ -104,6 +106,8 @@ impl Catalog {
         crate::schema::prepare(&mut connection).map_err(|_| ImportError::Storage)?;
         catalog
             .verify(&root_handle)
+            .map_err(|_| ImportError::Storage)?;
+        marduk_platform::verify_private_directory(root, &root_handle)
             .map_err(|_| ImportError::Storage)?;
 
         Ok(Self {

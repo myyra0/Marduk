@@ -61,6 +61,14 @@ The platform effect must support **observe**, **publish new into an absent path 
 
 **Known limitation (accepted by the 2026-11-22 user ruling):** On Linux and Windows, a same-privilege process can substitute the parent or leaf between the final live-handle check and the native syscall. Marduk does not claim to prevent that substitution. It mitigates the race by checking for divergence after the effect, retaining actually displaced bytes, and refusing to retry automatically on divergence.
 
+### Catalog file containment (app-owned data root)
+
+The catalog is app-owned state, not a game install, so containment follows the same ruling: a same-privilege substitution of the application data directory is accepted as a documented limitation, not a defect to solve with a custom SQLite VFS.
+
+- **Handle-verified:** the application data root is opened as a pinned directory descriptor (`openat2` with no symlink or magic-link resolution on Linux; a reparse-tag-free pinned handle on Windows) and re-proved by native identity before the first write, after SQLite opens, and after schema preparation. The `catalog.sqlite3` leaf is opened or created through that descriptor and its inode/volume identity is re-proved by `PrivateFile` around the same points. On Windows the catalog handle is held for the catalog's lifetime with `FILE_SHARE_READ | FILE_SHARE_WRITE` and no `FILE_SHARE_DELETE`, so the OS refuses a rename or replacement of the leaf while it is open.
+- **Name-resolved:** SQLite receives a pathname (Linux: `/proc/self/fd/<dirfd>/catalog.sqlite3`; Windows: the pinned leaf's final path) and resolves it itself. It derives `catalog.sqlite3-wal`, `catalog.sqlite3-shm` and `catalog.sqlite3-journal` from the resolved spelling and opens those by name. No handle of ours is consulted for those opens, and rollback journals are created and unlinked by name during the connection's life.
+- **Residual:** between the last post-open re-proof and SQLite's own open of the main file or of a sidecar, a same-privilege process that can rename the verified directory could redirect those pathname opens. Pinning the sidecars would require a custom SQLite VFS that opens every file relative to the held descriptor; that is not implemented. Marduk detects a substitution at the next re-proof and refuses to continue, but does not claim to prevent the redirected write that happens inside the window. The window requires write access to the user's own application data directory, which is also direct access to the catalog.
+
 ## Planner witnesses and gates
 
 Use `Data/textures/winner.dds = base\n`, `Data/untouched.txt = keep\n` and optional `Data/outside-plan.txt = user\n`. The candidate plan creates `a-only.dds = only-a\n` and replaces `winner.dds` with `b\n`. The canonical publish order is `a-only.dds`, then `winner.dds`; reverse it for Restore.
