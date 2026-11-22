@@ -232,7 +232,7 @@ fn import_preview_refuses_an_unreadable_archive_without_a_visible_revision() {
     let expected = if fixture.stage_qualified() {
         "ImportNotPrepared"
     } else {
-        "StageUnavailable"
+        "UnknownImport"
     };
     assert_eq!(code(&error), expected);
     assert_eq!(fixture.status()["profile"]["members"], json!([]));

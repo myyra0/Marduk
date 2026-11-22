@@ -275,15 +275,22 @@ fn blocked_routes_are_typed_unavailable() {
     assert_eq!(output.status.code(), Some(1));
     // An unqualified volume refuses before any write; a qualified one reaches
     // admission and rejects the container. Both are typed refusals.
-    let expected = match code(&envelope(&output)) {
-        "StageUnavailable" => "StageUnavailable",
-        "InvalidContainer" => "ImportNotPrepared",
-        other => panic!("unexpected preview refusal: {other}"),
-    };
+    let preview_envelope = envelope(&output);
+    let preview_code = code(&preview_envelope);
+    assert!(
+        preview_code == "StageUnavailable" || preview_code == "InvalidContainer",
+        "unexpected preview refusal: {preview_code}"
+    );
 
     let output = fixture.run(&["import", "apply", "1", "--json"]);
     assert_eq!(output.status.code(), Some(1));
-    assert_eq!(code(&envelope(&output)), expected);
+    // Unqualified volume: preview StageUnavailable, then apply -> UnknownImport.
+    // Qualified volume: preview InvalidContainer, then apply -> ImportNotPrepared.
+    if preview_code == "StageUnavailable" {
+        assert_eq!(code(&envelope(&output)), "UnknownImport");
+    } else {
+        assert_eq!(code(&envelope(&output)), "ImportNotPrepared");
+    }
 
     for arguments in [
         vec!["deploy", "preview", "--at-revision", "0", "--json"],
