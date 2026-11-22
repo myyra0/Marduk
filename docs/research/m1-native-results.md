@@ -74,6 +74,16 @@ Wired: private staging (private archive snapshot, admitted member set, hashed pa
 
 The runtime evidence behind the accepted magic set is the tmpfs/Btrfs effect table at the top of this document plus the catalog staging witnesses above. No ext4 or native NTFS catalog run exists; those cells stay `not run`.
 
+Windows private staging is still refused by `library_volume_qualified` (`false`) and `effects_volume_qualified` (`false`); the two gates did not move. The staging adapter itself was re-run on NTFS after the 2026-11-22 review fixes:
+
+- Tree: `7bcd2c1` plus the staging review fix. VM: Windows 10 `DESKTOP-4NP2KM5`, `rustc 1.100.0`. Scratch volume `C:` reported `File System Name : NTFS` (`fsutil fsinfo volumeinfo C:`).
+- `cargo test -p marduk-platform --test library_staging_witnesses -- --nocapture` → `running 8 tests`, `test result: ok. 8 passed; 0 failed`, including `reobserve_refuses_an_added_payload_file`.
+- Privacy was asserted by an independent `GetKernelObjectSecurity` DACL scan (not the adapter's `private_dacl`) for `revisions/<id>`, `payload/`, `payload/textures/` and `payload/textures/synthetic.dds`: protected DACL, owner equal to the token's default owner, owner-only ACEs, the object ACE plus the inherit-only descendant ACE on every directory, and exactly one non-inherit-only ACE on the file. `icacls` showed `BUILTIN\Administrators:(F)` plus `BUILTIN\Administrators:(OI)(CI)(IO)(F)` on the revision and `BUILTIN\Administrators:(F)` on the file; the SSH token is elevated, so Administrators is the token owner.
+- The redirect witnesses took `symlink_dir` (logged by `link_directory`), not the `mklink /J` fallback; the junction branch was not exercised in this run.
+- `cargo test --workspace --locked` on the VM → exit 0, no failures. Linux `TMPDIR=/tmp cargo test --workspace --locked`, `cargo fmt --all -- --check`, `cargo build --workspace` and the MSVC-target `cargo check -p marduk-platform --all-targets --target x86_64-pc-windows-msvc` also passed.
+
+Deploy-level NTFS rows remain `not run`; only the private staging adapter is evidenced here.
+
 ### Detach and classification witnesses
 
 `MARDUK_R03_SCRATCH` on Btrfs and tmpfs, `--test-threads=1`: `cargo test --locked -p marduk-platform --test native_proof_evidence` → 7 passed on each volume.
@@ -219,7 +229,7 @@ exists yet; `not run` is never a pass, and qualification stays closed.
 | `effects::replace` | exchange by three no-replace renames (target → `<operation>/displaced`, stage → target, displaced → retain); the canonical intermediate is the slot `evidence_for`, `prepare` and `sync_effect` already inspect, and a cut after the first rename resumes from it; the staged object's file id, creation time, attributes and DACL are preserved, so the public target fingerprints as the sealed staged artifact; a failure returns an error, never `Ok` | `effects_primitives::replace_retains_the_displaced_file_and_keeps_the_staged_object` and `interrupted_replace_keeps_the_canonical_displaced_slot_and_resumes` passed 2026-11-22 | not run | — |
 | `effects::detach` | one no-replace rename into the retain slot; an occupied slot fails, unknown bytes are never replaced | `effects_primitives::detach_preserves_an_unknown_file` passed 2026-11-22 | not run | — |
 | `effects::sync_directory` | `FlushFileBuffers` on a directory handle opened with `FILE_FLAG_BACKUP_SEMANTICS`; not a namespace or power-cut barrier | `effects_primitives::sync_directory_succeeds_on_a_real_directory` passed 2026-11-22 | not run | not claimed |
-| `effects::volume_qualified` | `false` on Windows until deploy-level evidence exists. `volume_is_ntfs` (from `GetVolumeInformationByHandleW` on the opened root) is kept for the evidence lane; NTFS alone is not qualification | `effects_primitives::volume_qualification_reads_the_opened_root` passed 2026-11-22 (refusal branch) | not run | — |
+| `effects::volume_qualified` | `false` on Windows until deploy-level evidence exists. The NTFS probe (from `GetVolumeInformationByHandleW` on the opened root) is kept for the private staging lane; NTFS alone is not qualification | `effects_primitives::volume_qualification_reads_the_opened_root` passed 2026-11-22 (refusal branch) | not run | — |
 
 Design note: `ReplaceFileW` is deliberately not used. It merges the replaced
 file's creation time and DACL into the replacement, so the resulting public file

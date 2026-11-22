@@ -94,14 +94,23 @@ fn link_directory(link: &Path, target: &Path) -> bool {
     #[cfg(windows)]
     {
         if std::os::windows::fs::symlink_dir(target, link).is_ok() {
+            eprintln!("link_directory: used symlink_dir for {}", link.display());
             return true;
         }
-        std::process::Command::new("cmd")
+        eprintln!(
+            "link_directory: symlink_dir refused, falling back to mklink /J for {}",
+            link.display()
+        );
+        let created = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
             .arg(link)
             .arg(target)
             .status()
-            .is_ok_and(|status| status.success())
+            .is_ok_and(|status| status.success());
+        if created {
+            eprintln!("link_directory: used mklink /J for {}", link.display());
+        }
+        created
     }
 }
 
@@ -129,10 +138,40 @@ fn staged_revision_keeps_real_bytes_private_and_reobserves_after_reopen() {
 
     assert_eq!(recorded.as_ref(), Some(&receipt.evidence().owner));
     let revision = root.join(REVISIONS).join("1");
-    assert!(
-        marduk_platform::native_proof::staged_revision_is_private(&revision),
-        "the revision directory must be private to the current user"
-    );
+    let payload = revision.join("payload");
+    let textures = payload.join("textures");
+    let staged_file = textures.join("synthetic.dds");
+    for (path, is_directory) in [
+        (&revision, true),
+        (&payload, true),
+        (&textures, true),
+        (&staged_file, false),
+    ] {
+        assert!(
+            marduk_platform::native_proof::staged_entry_is_private(path, is_directory),
+            "{} must be private to the current user",
+            path.display()
+        );
+    }
+    #[cfg(windows)]
+    {
+        // Printed evidence for the reviewer: the independent scanner above is
+        // the assertion, and `icacls` shows the protected owner-only DACL for
+        // the directory and for the per-file descriptor explicitly.
+        for path in [&revision, &staged_file] {
+            let output = std::process::Command::new("cmd")
+                .args(["/C", "icacls"])
+                .arg(path)
+                .output()
+                .expect("run icacls");
+            eprintln!(
+                "icacls {}:\n{}",
+                path.display(),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(output.status.success(), "icacls must succeed");
+        }
+    }
     assert!(revision.join("archive.zip").is_file());
     assert_eq!(
         fs::read(revision.join("payload").join(FILE)).unwrap(),
@@ -265,6 +304,35 @@ fn reobserve_refuses_a_changed_bound_entry() {
             .expect("run icacls");
         assert!(status.success(), "granting Everyone must succeed");
     }
+
+    assert_eq!(
+        stage.reobserve(&guard, receipt.evidence()).unwrap_err(),
+        ImportError::StageChanged
+    );
+}
+
+#[test]
+fn reobserve_refuses_an_added_payload_file() {
+    let Some(tmp) = scratch() else {
+        return;
+    };
+    let root = library(tmp.path());
+    let mut stage = NativeStage::open(&root).unwrap();
+    let gate = WriterGate::open(root.join("lock")).unwrap();
+    let guard = gate.try_lock().unwrap();
+    let archive = zip();
+    let mut input = archive.as_slice();
+    let receipt = stage
+        .stage(&guard, allocation(1), &mut input, &mut |_owner| Ok(()))
+        .unwrap();
+
+    let extra = root
+        .join(REVISIONS)
+        .join("1")
+        .join("payload")
+        .join("textures")
+        .join("extra.dds");
+    fs::write(&extra, b"added after the stage").unwrap();
 
     assert_eq!(
         stage.reobserve(&guard, receipt.evidence()).unwrap_err(),

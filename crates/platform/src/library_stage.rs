@@ -20,7 +20,7 @@
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use marduk_archive::{M1_ZIP_LIMITS, admit_zip};
 use marduk_core::import::{
@@ -48,7 +48,6 @@ impl NativeReceipt {
 
 /// The one concrete native library adapter.
 pub struct NativeStage {
-    root: PathBuf,
     tree: fsops::StagingTree,
 }
 
@@ -61,10 +60,7 @@ impl NativeStage {
             return Err(ImportError::StageUnavailable);
         }
         let tree = fsops::bind(root).map_err(|_| ImportError::StageUnavailable)?;
-        Ok(Self {
-            root: root.to_path_buf(),
-            tree,
-        })
+        Ok(Self { tree })
     }
 
     /// Take a bounded private snapshot, admit it, stream its members and record
@@ -176,7 +172,7 @@ impl NativeStage {
         self.tree
             .sync_revisions()
             .map_err(|_| ImportError::Storage)?;
-        fsops::sync_dir(&self.root).map_err(|_| ImportError::Storage)
+        self.tree.sync_root().map_err(|_| ImportError::Storage)
     }
 }
 
@@ -501,10 +497,6 @@ mod fsops {
             _ => ImportError::StageUnavailable,
         }
     }
-
-    pub fn sync_dir(path: &Path) -> Result<(), RootError> {
-        crate::native::sync_directory(path)
-    }
 }
 
 #[cfg(windows)]
@@ -532,9 +524,5 @@ mod fsops {
             RootError::TargetUnavailable | RootError::OutsideBoundary => ImportError::StageChanged,
             _ => ImportError::StageUnavailable,
         }
-    }
-
-    pub fn sync_dir(path: &Path) -> Result<(), RootError> {
-        crate::windows::sync_directory(path)
     }
 }

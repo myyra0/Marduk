@@ -1017,10 +1017,15 @@ fn copy_file(source: &Path, destination: &Path) -> Result<(), DeployError> {
         })
 }
 
-/// Witness-only privacy check for a staged revision directory: mode `0700` on
-/// Linux, or an owner-only protected DACL on Windows. It reopens the pathname,
-/// so success is evidence for the test, never authority for a write.
+/// Witness-only privacy proof for one staged path: mode `0700` for a directory
+/// or `0600` for a file on Linux, or an owner-only protected DACL on Windows
+/// (checked by an independent descriptor scan, not the adapter's own predicate).
+/// It reopens the pathname, so success is evidence for the test, never
+/// authority for a write.
+///
+/// Kept as `#[doc(hidden)] pub` because integration tests compile against the
+/// library without `cfg(test)`; it is not part of the supported surface.
 #[doc(hidden)]
-pub fn staged_revision_is_private(path: &Path) -> bool {
-    native::staged_revision_is_private(path)
+pub fn staged_entry_is_private(path: &Path, directory: bool) -> bool {
+    native::staged_entry_is_private(path, directory)
 }

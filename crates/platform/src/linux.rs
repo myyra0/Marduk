@@ -1180,6 +1180,11 @@ impl StagingTree {
         self.revisions.file.sync_all().map_err(|_| RootError::Io)
     }
 
+    /// Flush the bound root handle rather than reopening the root pathname.
+    pub(crate) fn sync_root(&self) -> Result<(), RootError> {
+        self.root.file.sync_all().map_err(|_| RootError::Io)
+    }
+
     /// Remove the name from the bound `revisions/` handle. `Ok(false)` means the
     /// directory was not empty; `Ok(true)` means removed or already absent.
     pub(crate) fn remove_revision_dir(&self, name: &str) -> io::Result<bool> {
@@ -1505,18 +1510,29 @@ pub(crate) fn sync_directory(path: &Path) -> Result<(), RootError> {
     open_directory(path)?.sync_all().map_err(|_| RootError::Io)
 }
 
-/// Witness-only check that a staged revision directory is a real directory
-/// owned by this user with mode `0700`.
-pub(crate) fn staged_revision_is_private(path: &Path) -> bool {
-    let Ok(file) = open_directory(path) else {
+/// Witness-only privacy proof for one staged path: a directory is a real
+/// directory with mode `0700`, a file a regular file with mode `0600`, both
+/// owned by the effective user.
+pub(crate) fn staged_entry_is_private(path: &Path, directory: bool) -> bool {
+    let opened = if directory {
+        open_directory(path)
+    } else {
+        open_file(path)
+    };
+    let Ok(file) = opened else {
         return false;
     };
     let Ok(stx) = statx_fd(&file) else {
         return false;
     };
     let mode = stx.stx_mode as u32;
-    mode & libc::S_IFMT == libc::S_IFDIR
-        && mode & 0o777 == 0o700
+    let (kind, allowed) = if directory {
+        (libc::S_IFDIR, 0o700)
+    } else {
+        (libc::S_IFREG, 0o600)
+    };
+    mode & libc::S_IFMT == kind
+        && mode & 0o777 == allowed
         && stx.stx_uid == unsafe { libc::geteuid() } as u32
 }
 
