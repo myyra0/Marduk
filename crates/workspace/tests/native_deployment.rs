@@ -32,6 +32,7 @@ use zip_fixture::{ClassicZip, Record};
 
 const BASE: &[u8] = b"base\n";
 const POST: &[u8] = b"b\n";
+const MIXED: &[u8] = b"mixed\n";
 const ONLY: &[u8] = b"only-a\n";
 const OUTSIDE: &[u8] = b"user\n";
 
@@ -199,14 +200,36 @@ impl Fixture {
     }
 
     fn zip(&self) -> PathBuf {
-        let path = self.temp.path().join("native.zip");
-        let bytes = ClassicZip::new(&[
-            Record::file(b"textures/winner.dds", POST),
-            Record::file(b"textures/a-only.dds", ONLY),
-        ])
-        .bytes;
+        self.zip_records(
+            "native.zip",
+            &[
+                Record::file(b"textures/winner.dds", POST),
+                Record::file(b"textures/a-only.dds", ONLY),
+            ],
+        )
+    }
+
+    fn zip_records(&self, name: &str, records: &[Record<'_>]) -> PathBuf {
+        let path = self.temp.path().join(name);
+        let bytes = ClassicZip::new(records).bytes;
         fs::write(&path, bytes).unwrap();
         path
+    }
+
+    /// Import one archive at the given profile revision.
+    fn import(&mut self, zip: &Path, name: &str, at_revision: &str) -> Value {
+        let prepared = expect_ok(self.send(json!({
+            "op": "import_preview",
+            "args": {
+                "zip": zip.to_str().unwrap(),
+                "name": name,
+                "atRevision": at_revision,
+            },
+        })));
+        expect_ok(self.send(json!({
+            "op": "import_apply",
+            "args": { "importId": prepared["id"] },
+        })))
     }
 
     /// Setup, import and deploy one pair, returning the reviewed plan and the
@@ -903,4 +926,77 @@ fn unqualified_installation_root_keeps_client_deploy_and_restore_refused() {
         !ops.exists() || fs::read_dir(&ops).unwrap().next().is_none(),
         "a refused route creates no operation-owned directory"
     );
+}
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn mixed_case_archive_target_merges_with_the_existing_spelling() {
+    let mut fixture = Fixture::new();
+    fixture.setup();
+
+    let lower = fixture.zip_records(
+        "lower.zip",
+        &[
+            Record::file(b"textures/winner.dds", POST),
+            Record::file(b"textures/a-only.dds", ONLY),
+        ],
+    );
+    let mixed = fixture.zip_records("mixed.zip", &[Record::file(b"Textures/Winner.dds", MIXED)]);
+    let first = fixture.import(&lower, "lower", "0");
+    let at_revision = first["revision"].as_str().unwrap().to_owned();
+    let second = fixture.import(&mixed, "mixed", &at_revision);
+
+    // The profile now holds both spellings; the higher-priority archive's
+    // spelling is the plan target. It must still name the one existing file,
+    // not a second case-different path.
+    let member_ids: Vec<Value> = second["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|member| member["id"].clone())
+        .collect();
+    assert_eq!(member_ids.len(), 2);
+    let ordered = expect_ok(fixture.send(json!({
+        "op": "order",
+        "args": {
+            "atRevision": second["revision"],
+            "memberIds": member_ids,
+        },
+    })));
+    let revision: u64 = ordered["revision"].as_str().unwrap().parse().unwrap();
+    let preview = fixture
+        .workspace
+        .proof_preview_deployment(ProfileRevision::new(revision))
+        .unwrap();
+    assert_eq!(preview.files.len(), 2, "case aliases are one target");
+    let winner = preview
+        .files
+        .iter()
+        .find(|file| file.target.path.eq_ignore_ascii_case("textures/winner.dds"))
+        .expect("the winner is one resolved target");
+    assert_eq!(winner.target.path, "Textures/Winner.dds");
+    assert!(winner.needs_backup, "the existing file is backed up");
+
+    let plan = PlanId::try_from_u64(preview.id.as_ref().unwrap().parse().unwrap()).unwrap();
+    let operation = fixture.workspace.proof_apply_deployment(plan).unwrap();
+    assert_eq!(operation.phase, "completed");
+    assert!(
+        operation.blocker.is_none(),
+        "apply blocker: {:?}",
+        operation.blocker
+    );
+
+    let after = tree(&fixture.game);
+    assert_eq!(after["Data/textures/winner.dds"], MIXED);
+    assert_eq!(after["Data/textures/a-only.dds"], ONLY);
+    assert!(
+        !after.keys().any(|path| path == "Data/Textures/Winner.dds"),
+        "the archive spelling must not create a second path"
+    );
+
+    let RestoreResult::Operation { operation } = fixture.workspace.proof_restore().unwrap() else {
+        panic!("expected a tracked restore");
+    };
+    assert_eq!(operation.phase, "completed");
+    assert_eq!(tree(&fixture.game), fixture.initial);
 }

@@ -334,6 +334,25 @@ impl ResolvedTarget<'_> {
     pub(crate) fn leaf(&self) -> &str {
         &self.leaf
     }
+
+    /// The target pathname rebuilt from the verified spelling of every bound
+    /// directory plus the resolved leaf. Never from a caller's or archive's
+    /// spelling: on a case-sensitive volume those can name a different entry.
+    pub(crate) fn public_path(&self) -> PathBuf {
+        let mut path = PathBuf::from("/");
+        for (name, _) in &self.binding.ancestors.children {
+            path.push(name);
+        }
+        if !self.binding.installation_name.is_empty() {
+            path.push(&self.binding.installation_name);
+        }
+        path.push(&self.binding.data_name);
+        for (name, _) in &self.parents.children {
+            path.push(name);
+        }
+        path.push(&self.leaf);
+        path
+    }
 }
 
 pub(crate) fn bind_installation(

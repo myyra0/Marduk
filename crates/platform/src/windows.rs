@@ -344,6 +344,13 @@ mod root {
         pub(crate) fn leaf(&self) -> &str {
             &self.leaf
         }
+
+        /// The target pathname rebuilt from the verified parent's final path
+        /// and the resolved leaf. The parent handle owns the spelling; the
+        /// caller's or archive's spelling is not used here.
+        pub(crate) fn public_path(&self) -> PathBuf {
+            PathBuf::from(join(&self.parent().final_path, &self.leaf))
+        }
     }
 
     pub(crate) fn bind_installation(

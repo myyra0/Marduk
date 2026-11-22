@@ -189,6 +189,13 @@ impl ResolvedTarget<'_> {
         self.inner.leaf()
     }
 
+    /// The target pathname rebuilt from the verified parent spelling and the
+    /// resolved leaf. Callers must not rebuild it from a planned or archived
+    /// spelling, which can name a different entry on a case-sensitive volume.
+    pub fn public_path(&self) -> std::path::PathBuf {
+        self.inner.public_path()
+    }
+
     /// A clone of the verified parent directory handle for a handle-relative
     /// effect. The caller re-observes before acting; the handle keeps the
     /// parent pinned.

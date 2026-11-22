@@ -185,22 +185,6 @@ impl NativeEffects {
         }
     }
 
-    fn target_path(&self, target: &BoundTarget) -> PathBuf {
-        let mut components = target
-            .target
-            .relative
-            .as_str()
-            .split('/')
-            .collect::<Vec<_>>();
-        components.pop();
-        let mut path = self.locator.join(self.layout.data);
-        for component in components {
-            path.push(component);
-        }
-        path.push(&target.leaf);
-        path
-    }
-
     fn source_path(&self, installed: InstalledRevisionId, relative: &RelativePath) -> PathBuf {
         let mut path = self
             .library
@@ -410,7 +394,7 @@ impl NativeEffects {
                     },
                     resolved.leaf().to_owned(),
                     resolved.parent_identity().clone(),
-                    self.target_path(target),
+                    resolved.public_path(),
                 ),
                 Err(error) => return EffectOutcome::Unavailable(error),
             };
@@ -556,7 +540,7 @@ impl NativeEffects {
                     },
                     resolved.leaf().to_owned(),
                     resolved.parent_identity().clone(),
-                    self.target_path(target),
+                    resolved.public_path(),
                 ),
                 Err(error) => return EffectOutcome::Unavailable(error),
             };
@@ -700,7 +684,7 @@ impl NativeEffects {
                     },
                     resolved.leaf().to_owned(),
                     resolved.parent_identity().clone(),
-                    self.target_path(target),
+                    resolved.public_path(),
                 ),
                 Err(error) => return EffectOutcome::Unavailable(error),
             };
@@ -798,6 +782,7 @@ impl NativeEffects {
 
     fn sync_effect(&mut self, step: &PreparedStep) -> Result<(), RootError> {
         let directory = self.op_dir(step.op.get(), step.ordinal, step.direction);
+        let target_tree_path = self.resolved(&step.spec.target)?.public_path();
         for name in ["stage", "displaced", "original", "step"] {
             let path = directory.join(name);
             if fs::symlink_metadata(&path).is_ok() {
@@ -805,14 +790,14 @@ impl NativeEffects {
             }
         }
         if let Observation::Regular(_) = self.observe_bound(&step.spec.target) {
-            effects::sync_file(&self.target_path(&step.spec.target))?;
+            effects::sync_file(&target_tree_path)?;
         }
         self.sync_directory_chain(&directory)?;
         // The changed target parent is part of the barrier. A failed
         // re-resolution or open must not leave the effect reported durable.
         let resolved = self.resolved(&step.spec.target)?;
         let target_directory = resolved.parent_dir()?;
-        let target_path = self.target_path(&step.spec.target);
+        let target_path = resolved.public_path();
         effects::sync_bound_directory(
             &target_directory,
             target_path.parent().ok_or(RootError::TargetUnavailable)?,
@@ -848,7 +833,7 @@ impl CopyEffects for NativeEffects {
         if pre != intent.pre {
             return Err(DeployError::RecoveryConflict);
         }
-        let target_path = self.target_path(&intent.target);
+        let target_path = resolved.public_path();
 
         let mut spec = intent.clone();
         match (&intent.original.observation, intent.original.backup) {
