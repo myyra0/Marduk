@@ -213,13 +213,12 @@ mod root {
         FILE_ATTRIBUTE_SYSTEM, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_EXTD_DIR_INFO,
         FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED,
-        FILE_READ_ATTRIBUTES, FILE_READ_EA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        FILE_STANDARD_INFO, FILE_STREAM_INFO, FileAttributeTagInfo, FileBasicInfo,
-        FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo, FileIdInfo, FileStandardInfo,
-        FileStreamInfo, FindClose, FindFirstFileW, GetFileInformationByHandleEx,
-        GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
-        GetVolumeNameForVolumeMountPointW, OPEN_EXISTING, READ_CONTROL, ReOpenFile,
-        VOLUME_NAME_GUID, WIN32_FIND_DATAW,
+        FILE_READ_ATTRIBUTES, FILE_READ_EA, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
+        FILE_STREAM_INFO, FileAttributeTagInfo, FileBasicInfo, FileIdExtdDirectoryInfo,
+        FileIdExtdDirectoryRestartInfo, FileIdInfo, FileStandardInfo, FileStreamInfo, FindClose,
+        FindFirstFileW, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
+        GetVolumeInformationByHandleW, GetVolumeNameForVolumeMountPointW, OPEN_EXISTING,
+        READ_CONTROL, ReOpenFile, VOLUME_NAME_GUID, WIN32_FIND_DATAW,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -1374,11 +1373,18 @@ mod root {
             let standard = standard_info(&file)?;
             let id = file_id(&file)?;
             let parent_id = file_id(parent)?;
+            // The handle held for the catalog's lifetime is the authority: the
+            // pathname is resolved afresh here, so a replaced leaf could pass a
+            // fresh-open check while the held object is a different file.
+            let pinned = file_id(&self._file)?;
             if is_reparse(&tag)
                 || standard.Directory
                 || id.VolumeSerialNumber != self.volume
                 || id.FileId.Identifier != self.file_id
                 || id.VolumeSerialNumber != parent_id.VolumeSerialNumber
+                || pinned.VolumeSerialNumber != self.volume
+                || pinned.FileId.Identifier != self.file_id
+                || pinned.VolumeSerialNumber != parent_id.VolumeSerialNumber
                 || !final_path(&file)?.eq_ignore_ascii_case(&expected)
             {
                 return Err(RootError::TargetUnavailable);
@@ -1426,7 +1432,9 @@ mod root {
             CreateFileW(
                 wide.as_ptr(),
                 GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                // No delete sharing: while this handle lives, the operating
+                // system refuses any rename or replace of the catalog leaf.
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
                 ptr::null(),
                 OPEN_EXISTING,
                 NO_FOLLOW,
@@ -1445,7 +1453,7 @@ mod root {
             CreateFileW(
                 wide.as_ptr(),
                 GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
                 ptr::null(),
                 CREATE_NEW,
                 FILE_ATTRIBUTE_NORMAL | NO_FOLLOW,

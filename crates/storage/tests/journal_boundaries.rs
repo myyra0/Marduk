@@ -430,3 +430,45 @@ fn reopen_refuses_a_redirected_catalog_leaf() {
     assert!(journal.reopen().is_err());
     assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
 }
+
+/// A rename or delete needs delete access to the catalog leaf; the held
+/// catalog handle shares read and write only, so the OS refuses both for as
+/// long as the catalog is open. This is the bootstrap path, where the catalog
+/// did not exist before the open.
+#[cfg(windows)]
+#[test]
+fn bootstrap_catalog_handle_blocks_leaf_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = OperationJournal::open(dir.path()).unwrap();
+    let catalog = dir.path().join(DB);
+    assert!(catalog.is_file());
+    assert_replacement_refused(&catalog, dir.path());
+    // The catalog is still usable through the held handle.
+    journal.root_state(&root(2)).unwrap();
+    drop(journal);
+    std::fs::rename(&catalog, dir.path().join("after-close.sqlite3")).unwrap();
+}
+
+/// The same guarantee survives `Journal::reopen`: the leaf handle is kept and
+/// re-proved, never re-created with delete sharing.
+#[cfg(windows)]
+#[test]
+fn reopen_catalog_handle_blocks_leaf_replacement() {
+    let dir = fixture_v1();
+    let mut journal = open_fixture(&dir);
+    journal.reopen().unwrap();
+    assert_replacement_refused(&dir.path().join(DB), dir.path());
+    journal.root_state(&root(2)).unwrap();
+}
+
+#[cfg(windows)]
+fn assert_replacement_refused(catalog: &Path, dir: &Path) {
+    let error = std::fs::rename(catalog, dir.join("replaced.sqlite3")).unwrap_err();
+    assert_eq!(
+        error.raw_os_error(),
+        Some(32),
+        "rename must be refused by the non-deleting catalog handle: {error}"
+    );
+    let error = std::fs::remove_file(catalog).unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(32));
+}
