@@ -178,6 +178,7 @@ fn open_error(code: WIN32_ERROR) -> GateError {
 mod root {
     use super::ERROR_ALREADY_EXISTS;
     use std::fs::File;
+    use std::io;
     use std::io::Read;
     use std::mem::offset_of;
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
@@ -191,36 +192,51 @@ mod root {
     };
     use marduk_core::targets::RelativePath;
     use sha2::{Digest, Sha256};
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_EA_INFORMATION, FileEaInformation, NtQueryInformationFile,
+        FILE_CREATE, FILE_DIRECTORY_FILE, FILE_EA_INFORMATION, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, FileEaInformation, NtCreateFile,
+        NtQueryInformationFile,
     };
     use windows_sys::Win32::Foundation::{
-        ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_INSUFFICIENT_BUFFER,
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_DIR_NOT_EMPTY, ERROR_FILE_EXISTS,
+        ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_NAME,
         ERROR_LOCK_VIOLATION, ERROR_MORE_DATA, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND,
         ERROR_SHARING_VIOLATION, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
-        INVALID_HANDLE_VALUE,
+        INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, RtlNtStatusToDosError,
+        UNICODE_STRING,
     };
     use windows_sys::Win32::Security::{
-        ACL, ATTRIBUTE_SECURITY_INFORMATION, DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION,
-        GetKernelObjectSecurity, GetSecurityDescriptorDacl, GetSecurityDescriptorGroup,
-        GetSecurityDescriptorOwner, GetSecurityDescriptorSacl, IsValidAcl, IsValidSid,
-        LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, SCOPE_SECURITY_INFORMATION,
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
+        ATTRIBUTE_SECURITY_INFORMATION, AclSizeInformation, AddAccessAllowedAceEx,
+        CONTAINER_INHERIT_ACE, CopySid, DACL_SECURITY_INFORMATION, EqualSid,
+        GROUP_SECURITY_INFORMATION, GetAce, GetAclInformation, GetKernelObjectSecurity,
+        GetLengthSid, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+        GetSecurityDescriptorGroup, GetSecurityDescriptorOwner, GetSecurityDescriptorSacl,
+        GetTokenInformation, INHERIT_ONLY_ACE, INHERITED_ACE, InitializeAcl,
+        InitializeSecurityDescriptor, IsValidAcl, IsValidSid, LABEL_SECURITY_INFORMATION,
+        MakeSelfRelativeSD, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSID,
+        SCOPE_SECURITY_INFORMATION, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR,
+        SetSecurityDescriptorControl, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner,
+        TOKEN_OWNER, TOKEN_QUERY, TokenOwner,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_ARCHIVE,
+        CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_ARCHIVE,
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL,
         FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_ATTRIBUTE_SYSTEM, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
+        FILE_ATTRIBUTE_SYSTEM, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_DISPOSITION_INFO,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_EXTD_DIR_INFO,
         FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED,
-        FILE_READ_ATTRIBUTES, FILE_READ_EA, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
-        FILE_STREAM_INFO, FileAttributeTagInfo, FileBasicInfo, FileIdExtdDirectoryInfo,
-        FileIdExtdDirectoryRestartInfo, FileIdInfo, FileStandardInfo, FileStreamInfo, FindClose,
-        FindFirstFileW, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
-        GetVolumeInformationByHandleW, GetVolumeNameForVolumeMountPointW, OPEN_EXISTING,
-        READ_CONTROL, ReOpenFile, VOLUME_NAME_GUID, WIN32_FIND_DATAW,
+        FILE_READ_ATTRIBUTES, FILE_READ_EA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_STANDARD_INFO, FILE_STREAM_INFO, FILE_TRAVERSE, FileAttributeTagInfo, FileBasicInfo,
+        FileDispositionInfo, FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo, FileIdInfo,
+        FileStandardInfo, FileStreamInfo, FindClose, FindFirstFileW, GetFileInformationByHandleEx,
+        GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
+        GetVolumeNameForVolumeMountPointW, OPEN_EXISTING, READ_CONTROL, ReOpenFile, SYNCHRONIZE,
+        SetFileInformationByHandle, VOLUME_NAME_GUID, WIN32_FIND_DATAW,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     const NO_FOLLOW: u32 = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT;
     const DIRECTORY_ACCESS: u32 = FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES;
@@ -827,7 +843,7 @@ mod root {
         let Some(text) = path.to_str() else {
             return false;
         };
-        let Ok(file) = open_path(text, DIRECTORY_ACCESS) else {
+        let Ok(file) = open_existing_directory(Path::new(text)) else {
             return false;
         };
         filesystem_name(&file).is_ok_and(|name| name.eq_ignore_ascii_case("NTFS"))
@@ -1501,17 +1517,845 @@ mod root {
         let file = open_path(text, DIRECTORY_ACCESS).map_err(|_| RootError::TargetUnavailable)?;
         Ok(verify_root(file)?.identity)
     }
+
+    // -----------------------------------------------------------------------
+    // Verified private staging tree.
+    //
+    // `revisions/` and every bound revision are opened as no-follow directory
+    // handles that deny delete sharing, so the operating system refuses to
+    // rename or replace the staged subtree while a stage is bound. The library
+    // root is pinned by handle identity and re-proved against its recorded
+    // pathname. Every
+    // child open below uses `NtCreateFile` with `OBJECT_ATTRIBUTES.RootDirectory`
+    // set to one of those handles: a substituted pathname cannot redirect the
+    // open, and no operation joins a caller path onto a spelling.
+    //
+    // Revision directories are created with a protected DACL that grants only
+    // the current user, with an inherit-only Owner Rights ACE for descendants
+    // (the Windows analogue of mode `0700`). Identity is re-proved from the
+    // live handle on every re-observe; a renamed, replaced or re-ACLed object
+    // is refused rather than adopted.
+    //
+    // Residual: the directory names in the verified chain cannot be renamed or
+    // replaced while the handles are live, but a same-privilege process can
+    // still add, remove or rewrite files *inside* a revision between the last
+    // re-proof and receipt issuance. The next re-observe proves the change and
+    // refuses to continue; the accepted limitation is that those bytes were
+    // reachable inside that window. Durability uses `FlushFileBuffers` on the
+    // revision and `revisions/` handles, because Windows has no directory
+    // entry fsync distinct from the handle flush.
+    // -----------------------------------------------------------------------
+
+    const STAGE_DIRECTORY_ACCESS: u32 =
+        DIRECTORY_ACCESS | FILE_TRAVERSE | GENERIC_WRITE | READ_CONTROL | SYNCHRONIZE;
+    const STAGE_FILE_ACCESS: u32 = GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE;
+    const STAGE_SHARE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
+    const STAGE_DELETE_SHARE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    const STAGE_DIRECTORY_OPTIONS: u32 =
+        FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT;
+    const STAGE_FILE_OPTIONS: u32 =
+        FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT;
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+
+    pub(crate) struct StagedDirectory {
+        root: RootDir,
+        private: bool,
+    }
+
+    pub(crate) struct StagingTree {
+        root: RootDir,
+        root_path: PathBuf,
+        revisions: StagedDirectory,
+    }
+
+    impl StagedDirectory {
+        pub(crate) fn identity(&self) -> &RootIdentity {
+            &self.root.identity
+        }
+
+        fn from_verified(root: &RootDir, file: File, private: bool) -> Result<Self, RootError> {
+            let directory = verify_root(file)?;
+            if directory.volume != root.volume || directory.identity == root.identity {
+                return Err(RootError::OutsideBoundary);
+            }
+            let staged = Self {
+                root: directory,
+                private,
+            };
+            staged.verify()?;
+            Ok(staged)
+        }
+
+        fn verify(&self) -> Result<(), RootError> {
+            check_locator(&self.root)?;
+            verify_staged_directory(&self.root.file, self.root.volume)?;
+            if !owned_by_current_user(&self.root.file)? {
+                return Err(RootError::TargetUnavailable);
+            }
+            if self.private && !private_dacl(&self.root.file)? {
+                return Err(RootError::TargetUnavailable);
+            }
+            Ok(())
+        }
+
+        fn open_dir_at(&self, relative: &[&str]) -> io::Result<File> {
+            let mut current = self.root.file.try_clone()?;
+            for component in checked_components(relative)? {
+                current = nt_open_relative(
+                    &current,
+                    component,
+                    STAGE_DIRECTORY_ACCESS,
+                    STAGE_SHARE,
+                    FILE_OPEN,
+                    STAGE_DIRECTORY_OPTIONS,
+                    0,
+                    None,
+                )
+                .map_err(nt_io)?;
+                verify_staged_directory(&current, self.root.volume).map_err(root_io)?;
+            }
+            Ok(current)
+        }
+
+        /// Create a missing private directory component relative to the held
+        /// handle. An existing component is reopened without following a
+        /// reparse point and its owner is checked, so a pre-created substitute
+        /// cannot redirect later writes.
+        fn ensure_dir_at(&self, relative: &[&str]) -> io::Result<File> {
+            let mut current = self.root.file.try_clone()?;
+            for component in checked_components(relative)? {
+                let next = match nt_open_relative(
+                    &current,
+                    component,
+                    STAGE_DIRECTORY_ACCESS,
+                    STAGE_SHARE,
+                    FILE_OPEN,
+                    STAGE_DIRECTORY_OPTIONS,
+                    0,
+                    None,
+                ) {
+                    Ok(file) => file,
+                    Err(code) if matches!(code, ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => {
+                        let security = private_security_descriptor(true).map_err(root_io)?;
+                        match nt_open_relative(
+                            &current,
+                            component,
+                            STAGE_DIRECTORY_ACCESS,
+                            STAGE_SHARE,
+                            FILE_CREATE,
+                            STAGE_DIRECTORY_OPTIONS,
+                            0,
+                            Some(&security),
+                        ) {
+                            Ok(file) => file,
+                            Err(ERROR_FILE_EXISTS | ERROR_ALREADY_EXISTS) => nt_open_relative(
+                                &current,
+                                component,
+                                STAGE_DIRECTORY_ACCESS,
+                                STAGE_SHARE,
+                                FILE_OPEN,
+                                STAGE_DIRECTORY_OPTIONS,
+                                0,
+                                None,
+                            )
+                            .map_err(nt_io)?,
+                            Err(code) => return Err(nt_io(code)),
+                        }
+                    }
+                    Err(code) => return Err(nt_io(code)),
+                };
+                verify_staged_directory(&next, self.root.volume).map_err(root_io)?;
+                if !owned_by_current_user(&next).map_err(root_io)? {
+                    return Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
+                }
+                current = next;
+            }
+            Ok(current)
+        }
+
+        pub(crate) fn create_private_file(&self, relative: &[&str]) -> io::Result<File> {
+            let (leaf, parents) = relative
+                .split_last()
+                .ok_or_else(|| io::Error::from_raw_os_error(ERROR_INVALID_NAME as i32))?;
+            let directory = self.ensure_dir_at(parents)?;
+            let security = private_security_descriptor(false).map_err(root_io)?;
+            let file = nt_open_relative(
+                &directory,
+                leaf,
+                STAGE_FILE_ACCESS,
+                STAGE_SHARE,
+                FILE_CREATE,
+                STAGE_FILE_OPTIONS,
+                FILE_ATTRIBUTE_NORMAL,
+                Some(&security),
+            )
+            .map_err(nt_io)?;
+            verify_staged_file(&file, self.root.volume).map_err(root_io)?;
+            Ok(file)
+        }
+
+        pub(crate) fn open_relative_file(&self, relative: &[&str]) -> io::Result<File> {
+            let (leaf, parents) = relative
+                .split_last()
+                .ok_or_else(|| io::Error::from_raw_os_error(ERROR_INVALID_NAME as i32))?;
+            let directory = self.open_dir_at(parents)?;
+            let file = nt_open_relative(
+                &directory,
+                leaf,
+                STAGE_FILE_ACCESS,
+                STAGE_SHARE,
+                FILE_OPEN,
+                STAGE_FILE_OPTIONS,
+                0,
+                None,
+            )
+            .map_err(nt_io)?;
+            verify_staged_file(&file, self.root.volume).map_err(root_io)?;
+            Ok(file)
+        }
+
+        /// List one directory relative to the held handle. The returned booleans
+        /// are `is_file` and `is_dir`; a reparse point or third object kind is
+        /// reported as neither.
+        pub(crate) fn list_relative(
+            &self,
+            relative: &[&str],
+        ) -> io::Result<Vec<(String, bool, bool)>> {
+            let directory = self.open_dir_at(relative)?;
+            let entries = read_directory(&directory).map_err(root_io)?;
+            Ok(entries
+                .into_iter()
+                .map(|entry| {
+                    let reparse = entry.is_reparse();
+                    let is_directory = entry.attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+                    (
+                        entry.name,
+                        !reparse && !is_directory,
+                        !reparse && is_directory,
+                    )
+                })
+                .collect())
+        }
+
+        pub(crate) fn remove_relative_file(&self, relative: &[&str]) -> io::Result<()> {
+            let (leaf, parents) = relative
+                .split_last()
+                .ok_or_else(|| io::Error::from_raw_os_error(ERROR_INVALID_NAME as i32))?;
+            let directory = self.open_dir_at(parents)?;
+            let file = match nt_open_relative(
+                &directory,
+                leaf,
+                DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                STAGE_DELETE_SHARE,
+                FILE_OPEN,
+                STAGE_FILE_OPTIONS,
+                0,
+                None,
+            ) {
+                Ok(file) => file,
+                Err(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => return Ok(()),
+                Err(code) => return Err(nt_io(code)),
+            };
+            verify_staged_file(&file, self.root.volume).map_err(root_io)?;
+            dispose(file)
+        }
+
+        /// Remove an empty directory relative to the held handle. `Ok(false)`
+        /// means the directory still had entries; `Ok(true)` means it was
+        /// removed or was already absent.
+        pub(crate) fn remove_relative_dir(&self, relative: &[&str]) -> io::Result<bool> {
+            let (leaf, parents) = relative
+                .split_last()
+                .ok_or_else(|| io::Error::from_raw_os_error(ERROR_INVALID_NAME as i32))?;
+            let directory = self.open_dir_at(parents)?;
+            let target = match nt_open_relative(
+                &directory,
+                leaf,
+                DELETE | STAGE_DIRECTORY_ACCESS,
+                STAGE_DELETE_SHARE,
+                FILE_OPEN,
+                STAGE_DIRECTORY_OPTIONS,
+                0,
+                None,
+            ) {
+                Ok(target) => target,
+                Err(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => return Ok(true),
+                Err(code) => return Err(nt_io(code)),
+            };
+            verify_staged_directory(&target, self.root.volume).map_err(root_io)?;
+            if !read_directory(&target).map_err(root_io)?.is_empty() {
+                return Ok(false);
+            }
+            match dispose(target) {
+                Ok(()) => Ok(true),
+                Err(error) => match error.raw_os_error() {
+                    Some(code) if code as u32 == ERROR_DIR_NOT_EMPTY => Ok(false),
+                    Some(code) if code as u32 == ERROR_FILE_NOT_FOUND => Ok(true),
+                    _ => Err(error),
+                },
+            }
+        }
+
+        pub(crate) fn sync_relative_dir(&self, relative: &[&str]) -> io::Result<()> {
+            self.open_dir_at(relative)?.sync_all()
+        }
+    }
+
+    impl StagingTree {
+        pub(crate) fn open(root: &Path) -> Result<Self, RootError> {
+            let text = root.to_str().ok_or(RootError::TargetUnavailable)?;
+            // The root handle shares delete so the durability flush in
+            // `reclaim` can reopen the same directory for write. A rename or
+            // replacement is still detected by handing identity plus the
+            // recorded pathname; only the staged subtree itself is locked.
+            let file = open_shared_path(text, STAGE_DIRECTORY_ACCESS)
+                .map_err(|_| RootError::TargetUnavailable)?;
+            let root_directory = verify_root(file)?;
+            if !filesystem_name(&root_directory.file)?.eq_ignore_ascii_case("NTFS") {
+                return Err(RootError::UnsupportedTarget(
+                    UnsupportedReason::Configuration,
+                ));
+            }
+            if !owned_by_current_user(&root_directory.file)? {
+                return Err(RootError::OutsideBoundary);
+            }
+            let revisions_file = nt_open_relative(
+                &root_directory.file,
+                "revisions",
+                STAGE_DIRECTORY_ACCESS,
+                STAGE_SHARE,
+                FILE_OPEN,
+                STAGE_DIRECTORY_OPTIONS,
+                0,
+                None,
+            )
+            .map_err(open_child_error)?;
+            let revisions = StagedDirectory::from_verified(&root_directory, revisions_file, false)?;
+            let root_path = std::path::absolute(root).map_err(|_| RootError::TargetUnavailable)?;
+            let tree = Self {
+                root: root_directory,
+                root_path,
+                revisions,
+            };
+            tree.reverify_revisions()?;
+            Ok(tree)
+        }
+
+        pub(crate) fn reverify_revisions(&self) -> Result<(), RootError> {
+            self.revisions.verify()?;
+            check_locator(&self.root)?;
+            let current = verify_root(open_existing_directory(&self.root_path.join("revisions"))?)?;
+            if current.identity != self.revisions.root.identity {
+                return Err(RootError::TargetUnavailable);
+            }
+            Ok(())
+        }
+
+        pub(crate) fn create_revision(&self, name: &str) -> Result<StagedDirectory, RootError> {
+            self.reverify_revisions()?;
+            let security = private_security_descriptor(true)?;
+            let file = nt_open_relative(
+                &self.revisions.root.file,
+                name,
+                STAGE_DIRECTORY_ACCESS,
+                STAGE_SHARE,
+                FILE_CREATE,
+                STAGE_DIRECTORY_OPTIONS,
+                0,
+                Some(&security),
+            )
+            .map_err(open_child_error)?;
+            let revision = StagedDirectory::from_verified(&self.root, file, true)?;
+            self.verify_revision_path(name, &revision)?;
+            Ok(revision)
+        }
+
+        pub(crate) fn open_revision(
+            &self,
+            name: &str,
+        ) -> Result<Option<StagedDirectory>, RootError> {
+            let file = match nt_open_relative(
+                &self.revisions.root.file,
+                name,
+                STAGE_DIRECTORY_ACCESS,
+                STAGE_SHARE,
+                FILE_OPEN,
+                STAGE_DIRECTORY_OPTIONS,
+                0,
+                None,
+            ) {
+                Ok(file) => file,
+                Err(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => return Ok(None),
+                Err(code) => return Err(open_child_error(code)),
+            };
+            StagedDirectory::from_verified(&self.root, file, true).map(Some)
+        }
+
+        /// Reopen the exact revision relative to the verified handle and prove
+        /// the path still names the same object.
+        pub(crate) fn reobserve(&self, name: &str) -> Result<StagedDirectory, RootError> {
+            self.reverify_revisions()?;
+            let revision = self
+                .open_revision(name)?
+                .ok_or(RootError::TargetUnavailable)?;
+            self.verify_revision_path(name, &revision)?;
+            Ok(revision)
+        }
+
+        pub(crate) fn reverify_revision(
+            &self,
+            name: &str,
+            revision: &StagedDirectory,
+        ) -> Result<(), RootError> {
+            revision.verify()?;
+            self.reverify_revisions()?;
+            self.verify_revision_path(name, revision)
+        }
+
+        pub(crate) fn sync_revisions(&self) -> Result<(), RootError> {
+            self.revisions
+                .root
+                .file
+                .sync_all()
+                .map_err(|_| RootError::Io)
+        }
+
+        pub(crate) fn remove_revision_dir(&self, name: &str) -> io::Result<bool> {
+            self.revisions.remove_relative_dir(&[name])
+        }
+
+        fn verify_revision_path(
+            &self,
+            name: &str,
+            revision: &StagedDirectory,
+        ) -> Result<(), RootError> {
+            if !stage_component(name) {
+                return Err(RootError::TargetUnavailable);
+            }
+            let current = verify_root(open_existing_directory(
+                &self.root_path.join("revisions").join(name),
+            )?)?;
+            if current.identity != revision.root.identity {
+                return Err(RootError::TargetUnavailable);
+            }
+            Ok(())
+        }
+    }
+
+    /// Whether the opened root lives on NTFS. The volume that owns the handle
+    /// decides, never the path spelling; a reparse final component is refused.
+    ///
+    /// This feeds `library_stage::fsops::qualified` only. The workspace-level
+    /// `library_volume_qualified` gate stays closed until deploy-level NTFS
+    /// evidence exists.
+    pub(crate) fn staging_volume_qualified(root: &Path) -> bool {
+        let Some(text) = root.to_str() else {
+            return false;
+        };
+        let Ok(file) = open_existing_directory(Path::new(text)) else {
+            return false;
+        };
+        let Ok(tag) = attribute_tag(&file) else {
+            return false;
+        };
+        let Ok(standard) = standard_info(&file) else {
+            return false;
+        };
+        if is_reparse(&tag) || !standard.Directory || identity(&file).is_err() {
+            return false;
+        }
+        filesystem_name(&file).is_ok_and(|name| name.eq_ignore_ascii_case("NTFS"))
+    }
+
+    pub(crate) fn sync_directory(path: &Path) -> Result<(), RootError> {
+        let text = path.to_str().ok_or(RootError::TargetUnavailable)?;
+        verify_root(
+            open_shared_path(text, STAGE_DIRECTORY_ACCESS)
+                .map_err(|_| RootError::TargetUnavailable)?,
+        )?
+        .file
+        .sync_all()
+        .map_err(|_| RootError::Io)
+    }
+
+    /// Witness-only check that a staged revision directory carries the
+    /// owner-only protected DACL this adapter creates.
+    pub(crate) fn staged_revision_is_private(path: &Path) -> bool {
+        let Ok(file) = open_existing_directory(path) else {
+            return false;
+        };
+        let Ok(directory) = verify_root(file) else {
+            return false;
+        };
+        verify_staged_directory(&directory.file, directory.volume).is_ok()
+            && owned_by_current_user(&directory.file).unwrap_or(false)
+            && private_dacl(&directory.file).unwrap_or(false)
+    }
+
+    fn open_existing_directory(path: &Path) -> Result<File, RootError> {
+        let text = path.to_str().ok_or(RootError::TargetUnavailable)?;
+        open_shared_path(text, DIRECTORY_ACCESS | READ_CONTROL)
+            .map_err(|_| RootError::TargetUnavailable)
+    }
+
+    /// Path-based verification opens must coexist with the pinned staging
+    /// handles, which grant read and write but deny delete sharing. The handle
+    /// returned here is used only to re-prove identity; it never writes.
+    fn open_shared_path(path: &str, access: u32) -> Result<File, u32> {
+        let wide: Vec<u16> = path.encode_utf16().chain([0]).collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                access,
+                STAGE_SHARE | FILE_SHARE_DELETE,
+                ptr::null(),
+                OPEN_EXISTING,
+                NO_FOLLOW,
+                ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(unsafe { GetLastError() });
+        }
+        Ok(unsafe { File::from_raw_handle(handle) })
+    }
+
+    fn checked_components<'a>(relative: &[&'a str]) -> io::Result<Vec<&'a str>> {
+        relative
+            .iter()
+            .map(|component| {
+                if stage_component(component) {
+                    Ok(*component)
+                } else {
+                    Err(io::Error::from_raw_os_error(ERROR_INVALID_NAME as i32))
+                }
+            })
+            .collect()
+    }
+
+    fn stage_component(name: &str) -> bool {
+        ordinary_component(name) && !name.ends_with('.') && !name.ends_with(' ')
+    }
+
+    /// Open one component relative to the pinned parent handle. `RootDirectory`
+    /// is the authority, so a renamed or replaced ancestor cannot redirect this
+    /// open; `FILE_OPEN_REPARSE_POINT` and `OBJ_DONT_REPARSE` refuse a link.
+    #[allow(clippy::too_many_arguments)]
+    fn nt_open_relative(
+        parent: &File,
+        name: &str,
+        access: u32,
+        share: u32,
+        disposition: u32,
+        options: u32,
+        file_attributes: u32,
+        security: Option<&[u64]>,
+    ) -> Result<File, u32> {
+        if !stage_component(name) {
+            return Err(ERROR_INVALID_NAME);
+        }
+        let mut wide: Vec<u16> = name.encode_utf16().collect();
+        let bytes = wide
+            .len()
+            .checked_mul(2)
+            .and_then(|bytes| u16::try_from(bytes).ok())
+            .ok_or(ERROR_INVALID_NAME)?;
+        let unicode = UNICODE_STRING {
+            Length: bytes,
+            MaximumLength: bytes,
+            Buffer: wide.as_mut_ptr(),
+        };
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: parent.as_raw_handle() as HANDLE,
+            ObjectName: &unicode,
+            Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+            SecurityDescriptor: security.map_or(ptr::null(), |words| words.as_ptr().cast()),
+            SecurityQualityOfService: ptr::null(),
+        };
+        let mut handle: HANDLE = ptr::null_mut();
+        let mut status_block = IO_STATUS_BLOCK::default();
+        let status = unsafe {
+            NtCreateFile(
+                &mut handle,
+                access,
+                &attributes,
+                &mut status_block,
+                ptr::null(),
+                file_attributes,
+                share,
+                disposition,
+                options,
+                ptr::null(),
+                0,
+            )
+        };
+        if status < 0 {
+            return Err(unsafe { RtlNtStatusToDosError(status) });
+        }
+        Ok(unsafe { File::from_raw_handle(handle) })
+    }
+
+    fn verify_staged_directory(file: &File, volume: u64) -> Result<(), RootError> {
+        let tag = attribute_tag(file)?;
+        let standard = standard_info(file)?;
+        if is_reparse(&tag)
+            || !standard.Directory
+            || standard.DeletePending
+            || file_id(file)?.VolumeSerialNumber != volume
+        {
+            return Err(RootError::TargetUnavailable);
+        }
+        Ok(())
+    }
+
+    fn verify_staged_file(file: &File, volume: u64) -> Result<(), RootError> {
+        let tag = attribute_tag(file)?;
+        let standard = standard_info(file)?;
+        if is_reparse(&tag) || standard.Directory || file_id(file)?.VolumeSerialNumber != volume {
+            return Err(RootError::TargetUnavailable);
+        }
+        Ok(())
+    }
+
+    /// Mark an open handle for deletion on close. The disposition is
+    /// handle-relative, so no pathname is resolved for the removal.
+    fn dispose(file: File) -> io::Result<()> {
+        let information = FILE_DISPOSITION_INFO { DeleteFile: true };
+        let ok = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle() as HANDLE,
+                FileDispositionInfo,
+                (&information as *const FILE_DISPOSITION_INFO).cast(),
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn open_child_error(code: u32) -> RootError {
+        match code {
+            ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => RootError::MissingParent,
+            ERROR_FILE_EXISTS
+            | ERROR_ALREADY_EXISTS
+            | ERROR_ACCESS_DENIED
+            | ERROR_SHARING_VIOLATION => RootError::TargetUnavailable,
+            _ => RootError::Io,
+        }
+    }
+
+    fn nt_io(code: u32) -> io::Error {
+        io::Error::from_raw_os_error(code as i32)
+    }
+
+    fn root_io(error: RootError) -> io::Error {
+        io::Error::other(error)
+    }
+
+    /// The SID this process assigns as owner to new objects: the token's
+    /// default owner. It is the user SID for an ordinary token and the
+    /// Administrators group for an elevated administrator token, which is the
+    /// principal that also owns directories created by the storage catalog.
+    fn current_principal_sid() -> Result<(Vec<u32>, u32), RootError> {
+        let mut token: HANDLE = ptr::null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(RootError::Io);
+        }
+        let mut needed = 0u32;
+        unsafe { GetTokenInformation(token, TokenOwner, ptr::null_mut(), 0, &mut needed) };
+        if needed == 0 {
+            unsafe { CloseHandle(token) };
+            return Err(RootError::Io);
+        }
+        let mut buffer = vec![0u64; (needed as usize).div_ceil(size_of::<u64>())];
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                TokenOwner,
+                buffer.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        };
+        if ok == 0 {
+            unsafe { CloseHandle(token) };
+            return Err(RootError::Io);
+        }
+        let owner = unsafe { ptr::read(buffer.as_ptr().cast::<TOKEN_OWNER>()) };
+        let length = unsafe { GetLengthSid(owner.Owner) };
+        if length == 0 || length > needed {
+            unsafe { CloseHandle(token) };
+            return Err(RootError::Io);
+        }
+        let mut sid = vec![0u32; (length as usize).div_ceil(size_of::<u32>())];
+        let copied = unsafe { CopySid(length, sid.as_mut_ptr().cast(), owner.Owner) };
+        unsafe { CloseHandle(token) };
+        if copied == 0 {
+            return Err(RootError::Io);
+        }
+        Ok((sid, length))
+    }
+
+    fn owned_by_current_user(file: &File) -> Result<bool, RootError> {
+        let (descriptor, _) = query_security(file, OWNER_SECURITY_INFORMATION)?;
+        let base = descriptor.as_ptr().cast_mut().cast();
+        let mut owner: PSID = ptr::null_mut();
+        let mut defaulted = 0;
+        if unsafe { GetSecurityDescriptorOwner(base, &mut owner, &mut defaulted) } == 0
+            || owner.is_null()
+            || unsafe { IsValidSid(owner) } == 0
+        {
+            return Ok(false);
+        }
+        let (sid, _) = current_principal_sid()?;
+        Ok(unsafe { EqualSid(owner, sid.as_ptr().cast_mut().cast()) } != 0)
+    }
+
+    /// Owner-only privacy: a protected DACL whose every ACE names the current
+    /// user, with at least one full-control ACE for the object itself. This is
+    /// the mode-`0700` equivalent; inherited ACEs are refused by construction.
+    fn private_dacl(file: &File) -> Result<bool, RootError> {
+        let (descriptor, _) =
+            query_security(file, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION)?;
+        let base = descriptor.as_ptr().cast_mut().cast();
+        let mut owner: PSID = ptr::null_mut();
+        let mut defaulted = 0;
+        if unsafe { GetSecurityDescriptorOwner(base, &mut owner, &mut defaulted) } == 0
+            || owner.is_null()
+            || unsafe { IsValidSid(owner) } == 0
+        {
+            return Ok(false);
+        }
+        let (sid, _) = current_principal_sid()?;
+        let user: PSID = sid.as_ptr().cast_mut().cast();
+        if unsafe { EqualSid(owner, user) } == 0 {
+            return Ok(false);
+        }
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        if unsafe { GetSecurityDescriptorControl(base, &mut control, &mut revision) } == 0
+            || control & SE_DACL_PROTECTED == 0
+        {
+            return Ok(false);
+        }
+        let mut present = 0;
+        let mut acl: *mut ACL = ptr::null_mut();
+        if unsafe { GetSecurityDescriptorDacl(base, &mut present, &mut acl, &mut defaulted) } == 0
+            || present == 0
+            || acl.is_null()
+            || unsafe { IsValidAcl(acl) } == 0
+        {
+            return Ok(false);
+        }
+        let mut information = ACL_SIZE_INFORMATION::default();
+        if unsafe {
+            GetAclInformation(
+                acl,
+                (&mut information as *mut ACL_SIZE_INFORMATION).cast(),
+                size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        } == 0
+        {
+            return Ok(false);
+        }
+        let mut full_control = false;
+        for index in 0..information.AceCount {
+            let mut ace: *mut std::ffi::c_void = ptr::null_mut();
+            if unsafe { GetAce(acl, index, &mut ace) } == 0 || ace.is_null() {
+                return Ok(false);
+            }
+            let header = unsafe { ptr::read(ace.cast::<ACE_HEADER>()) };
+            if header.AceType != ACCESS_ALLOWED_ACE_TYPE
+                || u32::from(header.AceFlags) & INHERITED_ACE != 0
+            {
+                return Ok(false);
+            }
+            let allowed = unsafe { ptr::read(ace.cast::<ACCESS_ALLOWED_ACE>()) };
+            let entry: PSID = unsafe {
+                ace.cast::<u8>()
+                    .add(offset_of!(ACCESS_ALLOWED_ACE, SidStart))
+                    .cast()
+            };
+            if unsafe { EqualSid(entry, user) } == 0 {
+                return Ok(false);
+            }
+            if u32::from(header.AceFlags) & INHERIT_ONLY_ACE == 0 && allowed.Mask == FILE_ALL_ACCESS
+            {
+                full_control = true;
+            }
+        }
+        Ok(full_control)
+    }
+
+    /// Build a self-relative security descriptor that grants only the current
+    /// user. A directory also gets an inherit-only ACE so its descendants stay
+    /// owner-only; the DACL is protected, so no parent ACE is merged in.
+    fn private_security_descriptor(directory: bool) -> Result<Vec<u64>, RootError> {
+        let (sid, sid_length) = current_principal_sid()?;
+        let user: PSID = sid.as_ptr().cast_mut().cast();
+        let ace_length = size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>() + sid_length as usize;
+        let acl_length = size_of::<ACL>() + ace_length * if directory { 2 } else { 1 };
+        let mut acl_words = vec![0u64; acl_length.div_ceil(size_of::<u64>())];
+        let acl = acl_words.as_mut_ptr().cast::<ACL>();
+        if unsafe { InitializeAcl(acl, acl_length as u32, ACL_REVISION) } == 0
+            || unsafe { AddAccessAllowedAceEx(acl, ACL_REVISION, 0, FILE_ALL_ACCESS, user) } == 0
+        {
+            return Err(RootError::Io);
+        }
+        if directory {
+            let inherit = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE | INHERIT_ONLY_ACE;
+            if unsafe { AddAccessAllowedAceEx(acl, ACL_REVISION, inherit, FILE_ALL_ACCESS, user) }
+                == 0
+            {
+                return Err(RootError::Io);
+            }
+        }
+
+        let mut descriptor = SECURITY_DESCRIPTOR::default();
+        let absolute: *mut std::ffi::c_void = (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast();
+        if unsafe { InitializeSecurityDescriptor(absolute, SECURITY_DESCRIPTOR_REVISION) } == 0
+            || unsafe { SetSecurityDescriptorOwner(absolute, user, 0) } == 0
+            || unsafe { SetSecurityDescriptorDacl(absolute, 1, acl, 0) } == 0
+            || unsafe {
+                SetSecurityDescriptorControl(absolute, SE_DACL_PROTECTED, SE_DACL_PROTECTED)
+            } == 0
+        {
+            return Err(RootError::Io);
+        }
+
+        let mut needed = 0u32;
+        unsafe { MakeSelfRelativeSD(absolute, ptr::null_mut(), &mut needed) };
+        if needed == 0 {
+            return Err(RootError::Io);
+        }
+        let mut self_relative = vec![0u64; (needed as usize).div_ceil(size_of::<u64>())];
+        if unsafe { MakeSelfRelativeSD(absolute, self_relative.as_mut_ptr().cast(), &mut needed) }
+            == 0
+        {
+            return Err(RootError::Io);
+        }
+        Ok(self_relative)
+    }
 }
 
 pub(crate) use root::{
-    Binding, PrivateFile, ResolvedTarget, bind_installation, directory_identity, fingerprint_path,
-    observe_target, open_or_create_private_file, open_private_child_directory,
-    open_private_directory, private_child_path, reopen_installation, resolve_existing_parent,
+    Binding, PrivateFile, ResolvedTarget, StagedDirectory, StagingTree, bind_installation,
+    directory_identity, fingerprint_path, observe_target, open_or_create_private_file,
+    open_private_child_directory, open_private_directory, private_child_path, reopen_installation,
+    resolve_existing_parent, staged_revision_is_private, staging_volume_qualified, sync_directory,
     verify_private_directory,
 };
 
-/// Private-library staging has no Windows runtime evidence yet; it stays
-/// disconnected even on NTFS.
+/// Private-library staging has no deploy-level Windows evidence yet; the
+/// workspace gate stays closed even on NTFS. Private staging itself is admitted
+/// through `library_stage::fsops::qualified`, which reads the opened root's
+/// volume and requires NTFS; that narrower predicate does not enable imports or
+/// deploys through the workspace catalog.
 pub(crate) fn library_volume_qualified(_root: &Path) -> bool {
     false
 }

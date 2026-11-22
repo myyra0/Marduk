@@ -7,6 +7,15 @@
 //! The archive snapshot, admitted member set and staged payload are all inside
 //! one owned revision directory. Publication never reopens a caller-selected
 //! ZIP path.
+//!
+//! On Windows the library root and `revisions/` are bound as no-follow handles
+//! that deny delete sharing, and every child operation is a relative
+//! `NtCreateFile` (or handle disposition) beneath one of those handles. The
+//! verified directory names therefore cannot be renamed or replaced while the
+//! stage is bound. The remaining residual is inside a revision: a same-privilege
+//! process can still add, delete or rewrite payload files between the last
+//! re-proof and receipt issuance, which the next re-observe detects. See the
+//! Windows adapter module and `docs/contracts/m1-recovery.md`.
 
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -155,6 +164,10 @@ impl NativeStage {
                 .map_err(|_| ImportError::Storage)?;
         }
         prune(&revision, evidence)?;
+        // Windows deletes an object only when every open handle shares delete;
+        // the pinned revision handle denies delete sharing, so it must go before
+        // the bound `revisions/` handle removes the name.
+        drop(revision);
         match self.tree.remove_revision_dir(&name) {
             Ok(true) => {}
             Ok(false) => return Err(ImportError::StageChanged),
@@ -498,94 +511,22 @@ mod fsops {
 mod fsops {
     use super::*;
 
-    /// Windows staging is disconnected; these placeholders keep the common
-    /// adapter code compiling without claiming a boundary implementation.
-    pub struct StagingTree;
+    pub(crate) use crate::windows::{StagedDirectory, StagingTree};
 
-    pub struct StagedDirectory {
-        identity: RootIdentity,
-    }
-
-    impl StagedDirectory {
-        pub fn identity(&self) -> &RootIdentity {
-            &self.identity
-        }
-
-        pub fn create_private_file(&self, _relative: &[&str]) -> io::Result<File> {
-            Err(unsupported_io())
-        }
-
-        pub fn open_relative_file(&self, _relative: &[&str]) -> io::Result<File> {
-            Err(unsupported_io())
-        }
-
-        pub fn list_relative(&self, _relative: &[&str]) -> io::Result<Vec<(String, bool, bool)>> {
-            Err(unsupported_io())
-        }
-
-        pub fn remove_relative_file(&self, _relative: &[&str]) -> io::Result<()> {
-            Err(unsupported_io())
-        }
-
-        pub fn remove_relative_dir(&self, _relative: &[&str]) -> io::Result<bool> {
-            Err(unsupported_io())
-        }
-
-        pub fn sync_relative_dir(&self, _relative: &[&str]) -> io::Result<()> {
-            Err(unsupported_io())
-        }
-    }
-
-    impl StagingTree {
-        pub fn open(_root: &Path) -> Result<Self, RootError> {
-            Err(unsupported())
-        }
-
-        pub fn create_revision(&self, _name: &str) -> Result<StagedDirectory, RootError> {
-            Err(unsupported())
-        }
-
-        pub fn open_revision(&self, _name: &str) -> Result<Option<StagedDirectory>, RootError> {
-            Err(unsupported())
-        }
-
-        pub fn reobserve(&self, _name: &str) -> Result<StagedDirectory, RootError> {
-            Err(unsupported())
-        }
-
-        pub fn reverify_revision(
-            &self,
-            _name: &str,
-            _revision: &StagedDirectory,
-        ) -> Result<(), RootError> {
-            Err(unsupported())
-        }
-
-        pub fn sync_revisions(&self) -> Result<(), RootError> {
-            Err(unsupported())
-        }
-
-        pub fn remove_revision_dir(&self, _name: &str) -> io::Result<bool> {
-            Err(unsupported_io())
-        }
-    }
-
-    fn unsupported() -> RootError {
-        RootError::UnsupportedTarget(marduk_core::root_identity::UnsupportedReason::Configuration)
-    }
-
-    fn unsupported_io() -> io::Error {
-        io::Error::new(io::ErrorKind::Unsupported, "native staging is unavailable")
-    }
-
-    pub fn qualified(_root: &Path) -> bool {
-        false
+    /// NTFS is qualified for private staging, decided from the opened root's
+    /// volume. This is narrower than the workspace-level
+    /// `library_volume_qualified` gate, which stays closed until deploy-level
+    /// NTFS evidence exists.
+    pub fn qualified(root: &Path) -> bool {
+        crate::windows::staging_volume_qualified(root)
     }
 
     pub fn bind(root: &Path) -> Result<StagingTree, RootError> {
         StagingTree::open(root)
     }
 
+    /// A redirect or changed bound object is `StageChanged`; an unreachable
+    /// tree is `StageUnavailable`.
     pub fn stage_error(error: RootError) -> ImportError {
         match error {
             RootError::TargetUnavailable | RootError::OutsideBoundary => ImportError::StageChanged,
@@ -593,10 +534,7 @@ mod fsops {
         }
     }
 
-    pub fn sync_dir(_path: &Path) -> Result<(), RootError> {
-        // No ordinary-token directory barrier is qualified on Windows.
-        Err(RootError::UnsupportedTarget(
-            marduk_core::root_identity::UnsupportedReason::Configuration,
-        ))
+    pub fn sync_dir(path: &Path) -> Result<(), RootError> {
+        crate::windows::sync_directory(path)
     }
 }

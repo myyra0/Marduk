@@ -1016,3 +1016,11 @@ fn copy_file(source: &Path, destination: &Path) -> Result<(), DeployError> {
             CopyError::Io => DeployError::Io,
         })
 }
+
+/// Witness-only privacy check for a staged revision directory: mode `0700` on
+/// Linux, or an owner-only protected DACL on Windows. It reopens the pathname,
+/// so success is evidence for the test, never authority for a write.
+#[doc(hidden)]
+pub fn staged_revision_is_private(path: &Path) -> bool {
+    native::staged_revision_is_private(path)
+}

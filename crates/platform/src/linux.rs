@@ -1505,6 +1505,21 @@ pub(crate) fn sync_directory(path: &Path) -> Result<(), RootError> {
     open_directory(path)?.sync_all().map_err(|_| RootError::Io)
 }
 
+/// Witness-only check that a staged revision directory is a real directory
+/// owned by this user with mode `0700`.
+pub(crate) fn staged_revision_is_private(path: &Path) -> bool {
+    let Ok(file) = open_directory(path) else {
+        return false;
+    };
+    let Ok(stx) = statx_fd(&file) else {
+        return false;
+    };
+    let mode = stx.stx_mode as u32;
+    mode & libc::S_IFMT == libc::S_IFDIR
+        && mode & 0o777 == 0o700
+        && stx.stx_uid == unsafe { libc::geteuid() } as u32
+}
+
 pub(crate) fn renameat2(
     from_dir: &File,
     from: &str,
