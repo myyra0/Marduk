@@ -36,6 +36,8 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use sha2::{Digest, Sha256};
 
 #[cfg(test)]
+mod boundary_tests;
+#[cfg(test)]
 mod contract_tests;
 #[cfg(test)]
 mod stage_tests;
@@ -1372,6 +1374,10 @@ fn collect_payload_files(
 }
 
 /// The revisions tree holds private payload bytes: no group or other access.
+///
+/// `revisions/` is the first write boundary under the catalog root. An existing
+/// symlink or non-directory is refused rather than followed, including when it
+/// appears between the first check and the create.
 fn private_directory(path: &Path) -> std::io::Result<()> {
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = fs::DirBuilder::new();
@@ -1380,9 +1386,22 @@ fn private_directory(path: &Path) -> std::io::Result<()> {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => return Ok(()),
+        Ok(_) => return Err(std::io::Error::other("revisions path is not a directory")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     match builder.create(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        other => other,
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+                Ok(_) => Err(std::io::Error::other("revisions path is not a directory")),
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
     }
 }
 

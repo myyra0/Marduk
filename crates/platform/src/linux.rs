@@ -769,6 +769,237 @@ fn same_object(left: &libc::statx, right: &libc::statx) -> bool {
         && left.stx_ctime.tv_nsec == right.stx_ctime.tv_nsec
 }
 
+// ---------------------------------------------------------------------------
+// Verified private staging tree.
+//
+// The catalog root being on a qualified volume says nothing about the tree the
+// stage will write. Bind `revisions/` once by a no-follow handle, prove it is a
+// real directory owned by this user on the same dev/mount/btrfs tree, and keep
+// the handle live. Revisions are created and reopened relative to that handle.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StagingDomain {
+    dev_major: u32,
+    dev_minor: u32,
+    mnt_id: u64,
+    tree_id: Option<u64>,
+}
+
+pub(crate) struct StagedDirectory {
+    file: File,
+    identity: RootIdentity,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    domain: StagingDomain,
+}
+
+impl StagedDirectory {
+    pub(crate) fn identity(&self) -> &RootIdentity {
+        &self.identity
+    }
+
+    fn open_child(parent: &RootDir, name: &str) -> Result<Self, RootError> {
+        let file = openat2(
+            parent.file.as_raw_fd(),
+            name.as_ref(),
+            DIRECTORY_FLAGS,
+            OPEN_RESOLVE,
+        )
+        .map_err(open_child_error)?;
+        let stx = statx_fd(&file)?;
+        Self::from_verified(parent, file, &stx)
+    }
+
+    fn from_verified(root: &RootDir, file: File, stx: &libc::statx) -> Result<Self, RootError> {
+        let mode = stx.stx_mode as u32;
+        if mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(RootError::TargetUnavailable);
+        }
+        ensure_within(root, &file, stx)?;
+        let uid = unsafe { libc::geteuid() } as u32;
+        if stx.stx_uid != uid {
+            return Err(RootError::OutsideBoundary);
+        }
+        let identity = RootIdentity::from_adapter_evidence(identity_from(&file, stx)?);
+        let tree_id = tree_id_of(&file)?;
+        Ok(Self {
+            file,
+            identity,
+            mode,
+            uid,
+            gid: stx.stx_gid,
+            domain: StagingDomain {
+                dev_major: stx.stx_dev_major,
+                dev_minor: stx.stx_dev_minor,
+                mnt_id: mount_id(stx)?,
+                tree_id,
+            },
+        })
+    }
+
+    /// Reobserve the live handle: identity, object type, owner, mode and the
+    /// same filesystem/mount/subvolume boundary as the verified root.
+    fn verify(&self, root: &RootDir) -> Result<(), RootError> {
+        let stx = statx_fd(&self.file)?;
+        let mode = stx.stx_mode as u32;
+        if mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(RootError::TargetUnavailable);
+        }
+        ensure_within(root, &self.file, &stx)?;
+        let current = StagingDomain {
+            dev_major: stx.stx_dev_major,
+            dev_minor: stx.stx_dev_minor,
+            mnt_id: mount_id(&stx)?,
+            tree_id: tree_id_of(&self.file)?,
+        };
+        let identity = RootIdentity::from_adapter_evidence(identity_from(&self.file, &stx)?);
+        if current != self.domain
+            || identity != self.identity
+            || mode != self.mode
+            || stx.stx_uid != self.uid
+            || stx.stx_gid != self.gid
+            || self.uid != unsafe { libc::geteuid() } as u32
+        {
+            return Err(RootError::TargetUnavailable);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct StagingTree {
+    root: RootDir,
+    root_path: PathBuf,
+    revisions: StagedDirectory,
+}
+
+impl StagingTree {
+    pub(crate) fn open(root: &Path) -> Result<Self, RootError> {
+        let root_dir = verify_root(open_directory(root)?)?;
+        if statfs_of(&root_dir.file)?.0 != BTRFS_SUPER_MAGIC {
+            return Err(RootError::UnsupportedTarget(
+                UnsupportedReason::Configuration,
+            ));
+        }
+        let revisions = StagedDirectory::open_child(&root_dir, "revisions")?;
+        let tree = Self {
+            root: root_dir,
+            root_path: root.to_path_buf(),
+            revisions,
+        };
+        tree.reverify_revisions()?;
+        Ok(tree)
+    }
+
+    pub(crate) fn reverify_revisions(&self) -> Result<(), RootError> {
+        self.revisions.verify(&self.root)?;
+        let path = open_directory(&self.root_path.join("revisions"))?;
+        let stx = statx_fd(&path)?;
+        let identity = RootIdentity::from_adapter_evidence(identity_from(&path, &stx)?);
+        if identity != self.revisions.identity {
+            return Err(RootError::TargetUnavailable);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn create_revision(&self, name: &str) -> Result<StagedDirectory, RootError> {
+        self.reverify_revisions()?;
+        let name_c = CString::new(name.as_bytes())
+            .map_err(|_| RootError::UnsupportedTarget(UnsupportedReason::Configuration))?;
+        let created = unsafe {
+            libc::mkdirat(
+                self.revisions.file.as_raw_fd(),
+                name_c.as_ptr(),
+                0o700 as libc::mode_t,
+            )
+        };
+        if created != 0 {
+            return Err(open_child_error(io::Error::last_os_error()));
+        }
+        let file = openat2(
+            self.revisions.file.as_raw_fd(),
+            name.as_ref(),
+            DIRECTORY_FLAGS,
+            OPEN_RESOLVE,
+        )
+        .map_err(open_child_error)?;
+        let stx = statx_fd(&file)?;
+        let revision = StagedDirectory::from_verified(&self.root, file, &stx)?;
+        if revision.mode & 0o777 != 0o700 {
+            return Err(RootError::TargetUnavailable);
+        }
+        self.verify_revision_path(name, &revision)?;
+        Ok(revision)
+    }
+
+    pub(crate) fn open_revision(&self, name: &str) -> Result<Option<StagedDirectory>, RootError> {
+        let file = match openat2(
+            self.revisions.file.as_raw_fd(),
+            name.as_ref(),
+            DIRECTORY_FLAGS,
+            OPEN_RESOLVE,
+        ) {
+            Ok(file) => file,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+            Err(error) => return Err(open_child_error(error)),
+        };
+        let stx = statx_fd(&file)?;
+        let revision = StagedDirectory::from_verified(&self.root, file, &stx)?;
+        if revision.mode & 0o777 != 0o700 {
+            return Err(RootError::TargetUnavailable);
+        }
+        Ok(Some(revision))
+    }
+
+    /// Reopen the exact revision relative to the verified handle and prove the
+    /// path still names the same object.
+    pub(crate) fn reobserve(&self, name: &str) -> Result<StagedDirectory, RootError> {
+        self.reverify_revisions()?;
+        let revision = self
+            .open_revision(name)?
+            .ok_or(RootError::TargetUnavailable)?;
+        self.verify_revision_path(name, &revision)?;
+        Ok(revision)
+    }
+
+    pub(crate) fn reverify_revision(
+        &self,
+        name: &str,
+        revision: &StagedDirectory,
+    ) -> Result<(), RootError> {
+        revision.verify(&self.root)?;
+        self.reverify_revisions()?;
+        self.verify_revision_path(name, revision)
+    }
+
+    pub(crate) fn sync_revisions(&self) -> Result<(), RootError> {
+        self.revisions.file.sync_all().map_err(|_| RootError::Io)
+    }
+
+    fn verify_revision_path(
+        &self,
+        name: &str,
+        revision: &StagedDirectory,
+    ) -> Result<(), RootError> {
+        let path = open_directory(&self.root_path.join("revisions").join(name))?;
+        let stx = statx_fd(&path)?;
+        let identity = RootIdentity::from_adapter_evidence(identity_from(&path, &stx)?);
+        if identity != revision.identity {
+            return Err(RootError::TargetUnavailable);
+        }
+        Ok(())
+    }
+}
+
+fn open_child_error(error: io::Error) -> RootError {
+    match error.raw_os_error() {
+        Some(libc::ENOENT) | Some(libc::ENOTDIR) => RootError::MissingParent,
+        Some(libc::ELOOP) | Some(libc::EXDEV) | Some(libc::EEXIST) => RootError::TargetUnavailable,
+        _ => RootError::Io,
+    }
+}
+
 fn supported_metadata(file: &File) -> bool {
     let mut flags: libc::c_long = 0;
     unsafe {

@@ -41,18 +41,21 @@ impl NativeReceipt {
 /// The one concrete native library adapter.
 pub struct NativeStage {
     root: PathBuf,
+    tree: fsops::StagingTree,
 }
 
 impl NativeStage {
     /// Connect only the volume classes this packet qualifies. Everything else
-    /// stays disconnected with `StageUnavailable`.
+    /// stays disconnected with `StageUnavailable`. The catalog root alone is not
+    /// the staging boundary: `revisions/` is bound by a live no-follow handle.
     pub fn open(root: &Path) -> Result<Self, ImportError> {
         if !fsops::qualified(root) {
             return Err(ImportError::StageUnavailable);
         }
-        fsops::directory_identity(root).map_err(|_| ImportError::StageUnavailable)?;
+        let tree = fsops::bind(root).map_err(|_| ImportError::StageUnavailable)?;
         Ok(Self {
             root: root.to_path_buf(),
+            tree,
         })
     }
 
@@ -65,15 +68,20 @@ impl NativeStage {
         input: &mut dyn Read,
         record_owner: &mut dyn FnMut(&RootIdentity) -> Result<(), ImportError>,
     ) -> Result<NativeReceipt, ImportError> {
-        let directory = self
-            .root
-            .join(REVISIONS_DIR)
-            .join(allocation.id.get().to_string());
-        private_create_dir(&directory).map_err(|_| ImportError::StageUnavailable)?;
-        let owner =
-            fsops::directory_identity(&directory).map_err(|_| ImportError::StageUnavailable)?;
+        let name = allocation.id.get().to_string();
+        let revision = self
+            .tree
+            .create_revision(&name)
+            .map_err(fsops::stage_error)?;
+        let owner = revision.identity().clone();
         record_owner(&owner)?;
+        // The caller's ownership write can take time; re-prove the bound tree
+        // before the first payload byte is written through the path.
+        self.tree
+            .reverify_revision(&name, &revision)
+            .map_err(fsops::stage_error)?;
 
+        let directory = self.revision_dir(&name);
         let archive = directory.join(ARCHIVE_FILE);
         let archive_sha256 = copy_archive(input, &archive)?;
         let files = extract(&directory, &archive)?;
@@ -83,8 +91,16 @@ impl NativeStage {
             files,
             owner,
         };
+        self.tree
+            .reverify_revision(&name, &revision)
+            .map_err(fsops::stage_error)?;
         verify_tree(&directory, &evidence)?;
         flush(&self.root, &directory, &evidence)?;
+        // The receipt is issued only after the bound handles and their paths are
+        // re-observed unchanged; content checks alone are not boundary evidence.
+        self.tree
+            .reverify_revision(&name, &revision)
+            .map_err(fsops::stage_error)?;
         Ok(NativeReceipt { evidence })
     }
 
@@ -95,8 +111,15 @@ impl NativeStage {
         _guard: &WriterGuard,
         evidence: &StageEvidence,
     ) -> Result<(), ImportError> {
-        let directory = self.revision_dir(evidence);
-        verify_tree(&directory, evidence)
+        let name = evidence.allocation.id.get().to_string();
+        let revision = self.tree.reobserve(&name).map_err(fsops::stage_error)?;
+        if revision.identity() != &evidence.owner {
+            return Err(ImportError::StageChanged);
+        }
+        verify_tree(&self.revision_dir(&name), evidence)?;
+        self.tree
+            .reverify_revision(&name, &revision)
+            .map_err(fsops::stage_error)
     }
 
     /// Reclaim only a fully re-verified owned stage. Changed or unavailable data
@@ -106,12 +129,20 @@ impl NativeStage {
         _guard: &WriterGuard,
         evidence: &StageEvidence,
     ) -> Result<(), ImportError> {
-        let directory = self.revision_dir(evidence);
-        match fs::symlink_metadata(&directory) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(_) => return Err(ImportError::StageUnavailable),
-            Ok(_) => {}
+        let name = evidence.allocation.id.get().to_string();
+        let revision = match self.tree.open_revision(&name) {
+            Ok(Some(revision)) => revision,
+            Ok(None) => return Ok(()),
+            Err(error) => return Err(fsops::stage_error(error)),
+        };
+        if revision.identity() != &evidence.owner {
+            return Err(ImportError::StageChanged);
         }
+        self.tree
+            .reverify_revision(&name, &revision)
+            .map_err(fsops::stage_error)?;
+
+        let directory = self.revision_dir(&name);
         verify_tree(&directory, evidence)?;
 
         remove_file_if_present(&directory.join(ARCHIVE_FILE))?;
@@ -119,17 +150,19 @@ impl NativeStage {
             remove_file_if_present(&payload_path(&directory, file.target.relative.as_str()))?;
         }
         prune(&directory, evidence)?;
+        self.tree
+            .sync_revisions()
+            .map_err(|_| ImportError::Storage)?;
         fsops::sync_dir(&self.root).map_err(|_| ImportError::Storage)
     }
 
-    fn revision_dir(&self, evidence: &StageEvidence) -> PathBuf {
-        self.root
-            .join(REVISIONS_DIR)
-            .join(evidence.allocation.id.get().to_string())
+    fn revision_dir(&self, name: &str) -> PathBuf {
+        self.root.join(REVISIONS_DIR).join(name)
     }
 }
 
 /// The staged tree is private application data: no group or other access.
+#[cfg(all(test, unix))]
 fn private_create_dir(path: &Path) -> io::Result<()> {
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = fs::DirBuilder::new();
@@ -484,8 +517,23 @@ impl Write for HashingFile {
 mod fsops {
     use super::*;
 
+    pub(crate) use crate::linux::StagingTree;
+
     pub fn qualified(root: &Path) -> bool {
         crate::native::library_volume_qualified(root)
+    }
+
+    pub fn bind(root: &Path) -> Result<StagingTree, RootError> {
+        StagingTree::open(root)
+    }
+
+    /// A redirect or changed bound object is `StageChanged`; an unreachable
+    /// tree is `StageUnavailable`.
+    pub fn stage_error(error: RootError) -> ImportError {
+        match error {
+            RootError::TargetUnavailable | RootError::OutsideBoundary => ImportError::StageChanged,
+            _ => ImportError::StageUnavailable,
+        }
     }
 
     pub fn directory_identity(path: &Path) -> Result<RootIdentity, RootError> {
@@ -513,8 +561,67 @@ mod fsops {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
 
+    /// Windows staging is disconnected; these placeholders keep the common
+    /// adapter code compiling without claiming a boundary implementation.
+    pub struct StagingTree;
+
+    pub struct StagedDirectory {
+        identity: RootIdentity,
+    }
+
+    impl StagedDirectory {
+        pub fn identity(&self) -> &RootIdentity {
+            &self.identity
+        }
+    }
+
+    impl StagingTree {
+        pub fn open(_root: &Path) -> Result<Self, RootError> {
+            Err(unsupported())
+        }
+
+        pub fn create_revision(&self, _name: &str) -> Result<StagedDirectory, RootError> {
+            Err(unsupported())
+        }
+
+        pub fn open_revision(&self, _name: &str) -> Result<Option<StagedDirectory>, RootError> {
+            Err(unsupported())
+        }
+
+        pub fn reobserve(&self, _name: &str) -> Result<StagedDirectory, RootError> {
+            Err(unsupported())
+        }
+
+        pub fn reverify_revision(
+            &self,
+            _name: &str,
+            _revision: &StagedDirectory,
+        ) -> Result<(), RootError> {
+            Err(unsupported())
+        }
+
+        pub fn sync_revisions(&self) -> Result<(), RootError> {
+            Err(unsupported())
+        }
+    }
+
+    fn unsupported() -> RootError {
+        RootError::UnsupportedTarget(marduk_core::root_identity::UnsupportedReason::Configuration)
+    }
+
     pub fn qualified(_root: &Path) -> bool {
         false
+    }
+
+    pub fn bind(root: &Path) -> Result<StagingTree, RootError> {
+        StagingTree::open(root)
+    }
+
+    pub fn stage_error(error: RootError) -> ImportError {
+        match error {
+            RootError::TargetUnavailable | RootError::OutsideBoundary => ImportError::StageChanged,
+            _ => ImportError::StageUnavailable,
+        }
     }
 
     pub fn directory_identity(path: &Path) -> Result<RootIdentity, RootError> {
