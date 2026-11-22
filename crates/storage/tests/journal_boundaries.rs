@@ -323,3 +323,46 @@ fn restore_seal_requires_the_committed_managed_identity() {
     step.step_pre.observation = step.spec.pre.clone();
     journal.seal(restore, vec![step]).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn journal_open_refuses_a_redirected_root_ancestor_without_writing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), tmp.path().join("link")).unwrap();
+
+    assert!(matches!(
+        OperationJournal::open(&tmp.path().join("link").join("app-data")),
+        Err(DeployError::Io)
+    ));
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn journal_open_refuses_a_redirected_catalog_file_without_writing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tmp.path().join("outside.sqlite3");
+    std::fs::write(&outside, b"not a catalog").unwrap();
+    std::os::unix::fs::symlink(&outside, tmp.path().join(DB)).unwrap();
+
+    assert!(matches!(
+        OperationJournal::open(tmp.path()),
+        Err(DeployError::Io)
+    ));
+    assert_eq!(std::fs::read(&outside).unwrap(), b"not a catalog");
+}
+
+#[cfg(unix)]
+#[test]
+fn journal_reopen_refuses_a_catalog_replaced_by_a_link() {
+    let dir = fixture_v1();
+    let mut journal = open_fixture(&dir);
+    let outside = dir.path().join("outside.sqlite3");
+    std::fs::write(&outside, b"outside").unwrap();
+    std::fs::rename(dir.path().join(DB), dir.path().join("moved.sqlite3")).unwrap();
+    std::os::unix::fs::symlink(&outside, dir.path().join(DB)).unwrap();
+
+    assert!(matches!(journal.reopen(), Err(DeployError::Io)));
+    assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+}

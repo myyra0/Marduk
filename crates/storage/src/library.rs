@@ -5,6 +5,7 @@
 //! the catalog changes visibility, never payload paths.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::fs;
 use std::fs::File;
 use std::io::Read;
@@ -32,7 +33,9 @@ use marduk_core::targets::RelativePath;
 use marduk_core::targets::{RootRole, TargetFile};
 use marduk_platform::library_stage::NativeStage;
 use marduk_platform::{GateError, WriterGate, WriterGuard};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 #[cfg(test)]
 use sha2::{Digest, Sha256};
 
@@ -69,13 +72,26 @@ impl Catalog {
         // later `revisions/`, lock or SQLite write into a game-tree write.
         let root_handle =
             marduk_platform::open_private_directory(root).map_err(|_| ImportError::Storage)?;
-        private_directory(&root.join(REVISIONS_DIR)).map_err(|_| ImportError::Storage)?;
+        marduk_platform::open_private_child_directory(&root_handle, REVISIONS_DIR)
+            .map_err(|_| ImportError::Storage)?;
 
-        let gate = WriterGate::open(root.join(crate::schema::LOCK_FILE)).map_err(gate_error)?;
+        let lock_path = marduk_platform::private_child_path(&root_handle, crate::schema::LOCK_FILE)
+            .map_err(|_| ImportError::Storage)?;
+        let gate = WriterGate::open(lock_path).map_err(gate_error)?;
         let _guard = gate.try_lock().map_err(gate_error)?;
 
-        let mut connection =
-            Connection::open(crate::schema::catalog_path(root)).map_err(storage_error)?;
+        let catalog_path =
+            marduk_platform::private_child_path(&root_handle, crate::schema::CATALOG_FILE)
+                .map_err(|_| ImportError::Storage)?;
+        let mut connection = Connection::open_with_flags(
+            &catalog_path,
+            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(storage_error)?;
+        // The SQLite pathname cannot consume the descriptor, so re-prove that
+        // it still names the pinned directory after the open.
+        marduk_platform::verify_private_directory(root, &root_handle)
+            .map_err(|_| ImportError::Storage)?;
         crate::schema::prepare(&mut connection).map_err(|_| ImportError::Storage)?;
 
         Ok(Self {
@@ -1419,38 +1435,6 @@ fn collect_payload_files(
         }
     }
     Ok(())
-}
-
-/// The revisions tree holds private payload bytes: no group or other access.
-///
-/// `revisions/` is the first write boundary under the catalog root. An existing
-/// symlink or non-directory is refused rather than followed, including when it
-/// appears between the first check and the create.
-fn private_directory(path: &Path) -> std::io::Result<()> {
-    #[cfg_attr(not(unix), allow(unused_mut))]
-    let mut builder = fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_dir() => return Ok(()),
-        Ok(_) => return Err(std::io::Error::other("revisions path is not a directory")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    match builder.create(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            match fs::symlink_metadata(path) {
-                Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
-                Ok(_) => Err(std::io::Error::other("revisions path is not a directory")),
-                Err(error) => Err(error),
-            }
-        }
-        Err(error) => Err(error),
-    }
 }
 
 #[cfg(test)]

@@ -1278,20 +1278,75 @@ pub(crate) fn directory_identity(path: &Path) -> Result<RootIdentity, RootError>
 }
 
 pub(crate) fn open_private_directory(path: &Path) -> Result<File, RootError> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    fn open_final(path: &Path) -> io::Result<File> {
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)
+    let path = std::path::absolute(path).map_err(|_| RootError::TargetUnavailable)?;
+    let mut current = File::open("/").map_err(|_| RootError::Io)?;
+    for component in path.components().skip(1) {
+        let Component::Normal(name) = component else {
+            return Err(RootError::TargetUnavailable);
+        };
+        current = open_or_create_directory(&current, name)?;
     }
+    Ok(current)
+}
 
-    match open_final(path) {
-        Ok(file) => Ok(file),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(path).map_err(|_| RootError::Io)?;
-            open_final(path).map_err(|_| RootError::TargetUnavailable)
+pub(crate) fn open_private_child_directory(parent: &File, name: &str) -> Result<File, RootError> {
+    if !ordinary_component(name) {
+        return Err(RootError::TargetUnavailable);
+    }
+    open_or_create_directory(parent, OsStr::new(name))
+}
+
+pub(crate) fn private_child_path(parent: &File, name: &str) -> Result<PathBuf, RootError> {
+    if !ordinary_component(name) {
+        return Err(RootError::TargetUnavailable);
+    }
+    // SQLite rejects a pathname with any symlink component, so translate the
+    // pinned descriptor back to its resolved path. `verify_private_directory`
+    // re-proves this spelling around every pathname-based open.
+    let proc_path = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()));
+    let resolved = std::fs::read_link(proc_path).map_err(|_| RootError::TargetUnavailable)?;
+    if !resolved.is_absolute() || resolved.to_string_lossy().contains(" (deleted)") {
+        return Err(RootError::TargetUnavailable);
+    }
+    Ok(resolved.join(name))
+}
+
+pub(crate) fn verify_private_directory(path: &Path, handle: &File) -> Result<(), RootError> {
+    let expected = directory_identity(path)?;
+    let stx = statx_fd(handle)?;
+    let actual = RootIdentity::from_adapter_evidence(identity_from(handle, &stx)?);
+    if expected != actual {
+        return Err(RootError::TargetUnavailable);
+    }
+    Ok(())
+}
+
+fn open_or_create_directory(parent: &File, name: &OsStr) -> Result<File, RootError> {
+    if name.to_str().is_none_or(|name| !ordinary_component(name)) {
+        return Err(RootError::TargetUnavailable);
+    }
+    match openat2(
+        parent.as_raw_fd(),
+        name,
+        DIRECTORY_FLAGS,
+        libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_NO_SYMLINKS,
+    ) {
+        Ok(directory) => Ok(directory),
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+            let name_c = CString::new(name.as_bytes()).map_err(|_| RootError::TargetUnavailable)?;
+            if unsafe { libc::mkdirat(parent.as_raw_fd(), name_c.as_ptr(), 0o700) } != 0 {
+                return Err(match io::Error::last_os_error().raw_os_error() {
+                    Some(libc::EEXIST) => RootError::TargetUnavailable,
+                    _ => RootError::Io,
+                });
+            }
+            openat2(
+                parent.as_raw_fd(),
+                name,
+                DIRECTORY_FLAGS,
+                libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_NO_SYMLINKS,
+            )
+            .map_err(|_| RootError::TargetUnavailable)
         }
         Err(_) => Err(RootError::TargetUnavailable),
     }

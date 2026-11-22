@@ -2,7 +2,6 @@
 //! seed rows. Both the library catalog and the operation journal open the same
 //! `catalog.sqlite3` through this module.
 
-use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::{Connection, TransactionBehavior};
@@ -24,10 +23,6 @@ impl From<rusqlite::Error> for SchemaError {
     fn from(_: rusqlite::Error) -> Self {
         Self
     }
-}
-
-pub(crate) fn catalog_path(root: &Path) -> std::path::PathBuf {
-    root.join(CATALOG_FILE)
 }
 
 /// Configure, migrate to the current schema, seed the profile row and read the

@@ -67,6 +67,32 @@ pub fn open_private_directory(path: &Path) -> Result<std::fs::File, RootError> {
     native::open_private_directory(path)
 }
 
+/// Open an application-owned child directory through the pinned parent handle,
+/// refusing a final link and every redirected ancestor, and creating only that
+/// one missing child when absent.
+pub fn open_private_child_directory(
+    parent: &std::fs::File,
+    name: &str,
+) -> Result<std::fs::File, RootError> {
+    native::open_private_child_directory(parent, name)
+}
+
+/// Resolve a child pathname that stays beneath the pinned parent handle.
+///
+/// The parent must remain open for the returned path to keep its meaning.
+pub fn private_child_path(
+    parent: &std::fs::File,
+    name: &str,
+) -> Result<std::path::PathBuf, RootError> {
+    native::private_child_path(parent, name)
+}
+
+/// Re-prove that `path` still resolves to the pinned directory handle. Callers
+/// use this around a pathname-based open that cannot consume the handle.
+pub fn verify_private_directory(path: &Path, handle: &std::fs::File) -> Result<(), RootError> {
+    native::verify_private_directory(path, handle)
+}
+
 /// A live, verified installation pair owned by the platform adapter.
 ///
 /// The handles pin the selected installation and its direct data directory.

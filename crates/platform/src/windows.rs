@@ -6,8 +6,8 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, GENERIC_READ, GENERIC_WRITE, GetLastError,
-    HANDLE, INVALID_HANDLE_VALUE, WIN32_ERROR,
+    ERROR_ALREADY_EXISTS, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, GENERIC_READ,
+    GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WIN32_ERROR,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
@@ -152,11 +152,12 @@ fn open_error(code: WIN32_ERROR) -> GateError {
 // resolved parent. Observation is not write authority.
 // ---------------------------------------------------------------------------
 mod root {
+    use super::ERROR_ALREADY_EXISTS;
     use std::fs::File;
     use std::io::Read;
     use std::mem::offset_of;
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
-    use std::path::{Component, Path, Prefix};
+    use std::path::{Component, Path, PathBuf, Prefix};
     use std::ptr;
     use std::sync::Mutex;
 
@@ -181,15 +182,15 @@ mod root {
         LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, SCOPE_SECURITY_INFORMATION,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
-        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, FILE_ATTRIBUTE_READONLY,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM, FILE_ATTRIBUTE_TAG_INFO,
-        FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY,
-        FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_READ_EA, FILE_SHARE_READ,
-        FILE_STANDARD_INFO, FILE_STREAM_INFO, FileAttributeTagInfo, FileBasicInfo,
-        FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo, FileIdInfo, FileStandardInfo,
-        FileStreamInfo, FindClose, FindFirstFileW, GetFileInformationByHandleEx,
+        CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_NOT_CONTENT_INDEXED,
+        FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM,
+        FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO,
+        FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
+        FILE_READ_EA, FILE_SHARE_READ, FILE_STANDARD_INFO, FILE_STREAM_INFO, FileAttributeTagInfo,
+        FileBasicInfo, FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo, FileIdInfo,
+        FileStandardInfo, FileStreamInfo, FindClose, FindFirstFileW, GetFileInformationByHandleEx,
         GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
         GetVolumeNameForVolumeMountPointW, OPEN_EXISTING, READ_CONTROL, ReOpenFile,
         VOLUME_NAME_GUID, WIN32_FIND_DATAW,
@@ -319,7 +320,7 @@ mod root {
     }
 
     fn bind_pair(location: &Path, layout: &GameLayout) -> Result<Binding, RootError> {
-        let mut ancestors = open_selection(location)?;
+        let mut ancestors = open_selection(location, false)?;
         let installation = ancestors.pop().expect("volume root is pinned");
         let data = pin_directory(&installation, layout.data)
             .map_err(|_| RootError::UnsupportedTarget(UnsupportedReason::Configuration))?;
@@ -460,7 +461,7 @@ mod root {
         Ok(TargetObservation::Regular { fingerprint })
     }
 
-    fn open_selection(path: &Path) -> Result<Vec<RootDir>, RootError> {
+    fn open_selection(path: &Path, create: bool) -> Result<Vec<RootDir>, RootError> {
         if path.components().any(|part| part == Component::ParentDir) {
             return Err(RootError::TargetUnavailable);
         }
@@ -523,10 +524,35 @@ mod root {
                 return Err(RootError::TargetUnavailable);
             };
             let name = name.to_str().ok_or(RootError::TargetUnavailable)?;
-            let child = pin_selected_directory(chain.last().expect("volume root is pinned"), name)?;
-            chain.push(child);
+            let parent = chain.last().expect("volume root is pinned");
+            match pin_selected_directory(parent, name) {
+                Ok(child) => chain.push(child),
+                Err(RootError::TargetUnavailable) if create => {
+                    if leaf_match(parent, name)?.is_some() {
+                        return Err(RootError::TargetUnavailable);
+                    }
+                    create_directory(parent, name)?;
+                    chain.push(pin_selected_directory(parent, name)?);
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(chain)
+    }
+
+    fn create_directory(parent: &RootDir, name: &str) -> Result<(), RootError> {
+        check_locator(parent)?;
+        let wide: Vec<u16> = join(&parent.final_path, name)
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        if unsafe { CreateDirectoryW(wide.as_ptr(), ptr::null()) } == 0 {
+            let code = unsafe { GetLastError() };
+            if code != ERROR_ALREADY_EXISTS {
+                return Err(RootError::Io);
+            }
+        }
+        Ok(())
     }
 
     fn open_path(path: &str, access: u32) -> Result<File, u32> {
@@ -1285,32 +1311,33 @@ mod root {
     }
 
     pub(crate) fn open_private_directory(path: &Path) -> Result<File, RootError> {
-        use std::os::windows::fs::OpenOptionsExt;
+        open_selection(path, true).map(|mut chain| chain.pop().expect("pinned root").file)
+    }
 
-        fn open_final(path: &Path) -> Result<File, RootError> {
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(NO_FOLLOW)
-                .open(path)
-                .map_err(|_| RootError::TargetUnavailable)?;
-            let tag = attribute_tag(&file)?;
-            if is_reparse(&tag) || tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
-                return Err(RootError::TargetUnavailable);
-            }
-            Ok(file)
+    pub(crate) fn open_private_child_directory(
+        parent: &File,
+        name: &str,
+    ) -> Result<File, RootError> {
+        if !ordinary_component(name) {
+            return Err(RootError::TargetUnavailable);
         }
+        open_private_directory(Path::new(&join(&final_path(parent)?, name)))
+    }
 
-        match open_final(path) {
-            Ok(file) => Ok(file),
-            Err(RootError::TargetUnavailable)
-                if std::fs::symlink_metadata(path)
-                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                std::fs::create_dir_all(path).map_err(|_| RootError::Io)?;
-                open_final(path)
-            }
-            Err(error) => Err(error),
+    pub(crate) fn private_child_path(parent: &File, name: &str) -> Result<PathBuf, RootError> {
+        if !ordinary_component(name) {
+            return Err(RootError::TargetUnavailable);
         }
+        Ok(PathBuf::from(join(&final_path(parent)?, name)))
+    }
+
+    pub(crate) fn verify_private_directory(path: &Path, handle: &File) -> Result<(), RootError> {
+        let expected = directory_identity(path)?;
+        let actual = RootIdentity::from_adapter_evidence(identity(handle)?);
+        if expected != actual {
+            return Err(RootError::TargetUnavailable);
+        }
+        Ok(())
     }
 
     pub(crate) fn directory_identity(path: &Path) -> Result<RootIdentity, RootError> {
@@ -1322,5 +1349,6 @@ mod root {
 
 pub(crate) use root::{
     Binding, ResolvedTarget, bind_installation, directory_identity, fingerprint_path,
-    observe_target, open_private_directory, reopen_installation, resolve_existing_parent,
+    observe_target, open_private_child_directory, open_private_directory, private_child_path,
+    reopen_installation, resolve_existing_parent, verify_private_directory,
 };
