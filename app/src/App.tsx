@@ -365,7 +365,14 @@ export function App({ transport }: Props) {
     setProgressIssue(null);
     setRestoreNoActive(false);
     await perform(
-      () => transport.deployApply(planId, onProgress, onProgressFault),
+      () =>
+        transport.deployApply(planId, onProgress, onProgressFault).catch((error: unknown) => {
+          // The write may have landed. A surviving review would re-enable the
+          // same plan ID if the refresh reports an unchanged revision.
+          setReview(null);
+          setReviewInvalidated(true);
+          throw error;
+        }),
       {
         apply: async (operation) => {
           operationRef.current = operation;

@@ -7,7 +7,12 @@ import { describeBlocker } from './format';
 import errorStalePlan from './transport/fixtures/error-stale-plan.json';
 import operationFixture from './transport/fixtures/operation.json';
 import statusFixture from './transport/fixtures/status.json';
-import { createTauriTransport, type InvokeFn, type WorkspaceTransport } from './transport/client';
+import {
+  createTauriTransport,
+  TransportFault,
+  type InvokeFn,
+  type WorkspaceTransport,
+} from './transport/client';
 import type {
   Operation,
   Prepared,
@@ -542,6 +547,29 @@ describe('workspace shell', () => {
     expect(await screen.findByText(/Not applied: StalePlan/)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Apply deployment/ })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Review deployment/ })).toBeEnabled();
+  });
+
+  it('clears the review and keeps Apply absent when the Apply transport faults', async () => {
+    const user = userEvent.setup();
+    const status = statusWithEffects();
+    const deployApply = vi.fn(async () => {
+      throw new TransportFault('ipc', 'deploy_apply: request failed');
+    });
+    await renderReady({
+      status: async () => ({ ok: true, result: status }),
+      deployPreview: async () => ({ ok: true, result: reviewFor(status) }),
+      deployApply,
+    });
+
+    await user.click(screen.getByRole('button', { name: /Review deployment/ }));
+    await user.click(await screen.findByRole('button', { name: /Apply deployment/ }));
+
+    expect(
+      await screen.findByText(/Connection lost; authoritative state reloaded\. No write was retried\./),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/review the deployment again before applying/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Apply deployment/ })).not.toBeInTheDocument();
+    expect(deployApply).toHaveBeenCalledTimes(1);
   });
 
   it('reloads authoritative status and keeps the review-again hint after Apply fails', async () => {
