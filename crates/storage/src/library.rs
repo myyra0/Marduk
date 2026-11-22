@@ -6,11 +6,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 #[cfg(test)]
 use std::io::Write as _;
 
@@ -50,6 +51,8 @@ const ARCHIVE_FILE: &str = "archive.zip";
 
 pub struct Catalog {
     root: PathBuf,
+    /// Pins the verified app-owned directory for this catalog's lifetime.
+    _root_handle: File,
     connection: Connection,
     gate: WriterGate,
     stage: StageAdapter,
@@ -61,7 +64,11 @@ impl Catalog {
     /// Configuration and migration run under the library writer gate. PRAGMAs
     /// are read back from the live connection and a mismatch is an error.
     pub fn open(root: &Path) -> Result<Self, ImportError> {
-        fs::create_dir_all(root).map_err(|_| ImportError::Storage)?;
+        // Prove the app-owned root before creating anything beneath it. The
+        // handle refuses a final symlink/junction, so a redirect cannot turn a
+        // later `revisions/`, lock or SQLite write into a game-tree write.
+        let root_handle =
+            marduk_platform::open_private_directory(root).map_err(|_| ImportError::Storage)?;
         private_directory(&root.join(REVISIONS_DIR)).map_err(|_| ImportError::Storage)?;
 
         let gate = WriterGate::open(root.join(crate::schema::LOCK_FILE)).map_err(gate_error)?;
@@ -73,6 +80,7 @@ impl Catalog {
 
         Ok(Self {
             root: root.to_path_buf(),
+            _root_handle: root_handle,
             connection,
             gate,
             // Native staging stays disconnected until the publication gate
@@ -281,6 +289,31 @@ impl Catalog {
 
         let prepared = import_ids_in_state(&self.connection, "prepared")?;
         let writing = import_ids_in_state(&self.connection, "writing")?;
+        let discarded = import_ids_in_state(&self.connection, "discarded")?;
+
+        // A tombstone may survive a crash or a failed reclaim. Retry cleanup
+        // only for rows whose ownership receipt is intact; committed and
+        // unprovable entries are never touched.
+        for id in discarded {
+            let record = load_import(&self.connection, id)?;
+            if record.owner.is_none()
+                || record.archive_sha256.is_none()
+                || !self.stage.available()
+                || is_published(&self.connection, id)?
+            {
+                continue;
+            }
+            let stage = StageRecord {
+                id,
+                archive_sha256: record.archive_sha256,
+                owner: record.owner,
+                files: stored_files(&self.connection, id)?,
+            };
+            match self.stage.reclaim(&_guard, &self.root, &stage) {
+                Ok(()) | Err(ImportError::StageChanged) | Err(ImportError::StageUnavailable) => {}
+                Err(error) => return Err(error),
+            }
+        }
 
         for id in writing {
             let record = load_import(&self.connection, id)?;

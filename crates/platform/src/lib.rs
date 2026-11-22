@@ -57,6 +57,16 @@ pub mod library_stage;
 #[doc(hidden)]
 pub mod native_proof;
 
+/// Open an application-owned directory without following a final link or
+/// junction, creating it (and missing parents) only when it is absent.
+///
+/// The returned handle pins the verified directory. A path that already exists
+/// as a symlink, junction or non-directory is refused and left untouched, so a
+/// caller cannot be redirected into another tree before its first write.
+pub fn open_private_directory(path: &Path) -> Result<std::fs::File, RootError> {
+    native::open_private_directory(path)
+}
+
 /// A live, verified installation pair owned by the platform adapter.
 ///
 /// The handles pin the selected installation and its direct data directory.

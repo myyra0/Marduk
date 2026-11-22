@@ -251,6 +251,51 @@ fn discard_preserves_unexpected_empty_directory() {
 }
 
 #[test]
+fn reconcile_retries_owned_discarded_tombstones_and_keeps_unprovable_ones() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let mut catalog = Catalog::open_for_test(root).unwrap();
+    let id = prepare(&mut catalog, 0, append("A"), A).id;
+    let directory = revision_dir(root, id);
+    let unexpected = directory.join("unexpected");
+    std::fs::write(&unexpected, b"not ours").unwrap();
+
+    // Simulate a crash after the tombstone but before reclamation.
+    catalog
+        .connection
+        .execute(
+            "UPDATE imports SET state = 'discarded' WHERE id = ?1",
+            [i64::try_from(id.get()).unwrap()],
+        )
+        .unwrap();
+    assert!(catalog.reconcile().unwrap().is_empty());
+    assert_eq!(state(&catalog, id), "discarded");
+    assert!(
+        directory.exists(),
+        "an incomplete reclaim keeps the tombstone"
+    );
+
+    std::fs::remove_file(&unexpected).unwrap();
+    assert!(catalog.reconcile().unwrap().is_empty());
+    assert!(!directory.exists(), "the next reconciliation reclaims it");
+
+    let unprovable = prepare(&mut catalog, 0, append("B"), b"b").id;
+    catalog
+        .connection
+        .execute(
+            "UPDATE imports SET state = 'discarded', owner = NULL WHERE id = ?1",
+            [i64::try_from(unprovable.get()).unwrap()],
+        )
+        .unwrap();
+    assert!(catalog.reconcile().unwrap().is_empty());
+    assert!(
+        revision_dir(root, unprovable).exists(),
+        "an unprovable tombstone is never reclaimed"
+    );
+    assert_eq!(published(&catalog), []);
+}
+
+#[test]
 fn reconcile_reclaims_abandoned_owned_writing_and_keeps_published_payload() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();

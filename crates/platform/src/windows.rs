@@ -1284,6 +1284,35 @@ mod root {
         fingerprint_open_file(&file)
     }
 
+    pub(crate) fn open_private_directory(path: &Path) -> Result<File, RootError> {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        fn open_final(path: &Path) -> Result<File, RootError> {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(NO_FOLLOW)
+                .open(path)
+                .map_err(|_| RootError::TargetUnavailable)?;
+            let tag = attribute_tag(&file)?;
+            if is_reparse(&tag) || tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+                return Err(RootError::TargetUnavailable);
+            }
+            Ok(file)
+        }
+
+        match open_final(path) {
+            Ok(file) => Ok(file),
+            Err(RootError::TargetUnavailable)
+                if std::fs::symlink_metadata(path)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                std::fs::create_dir_all(path).map_err(|_| RootError::Io)?;
+                open_final(path)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) fn directory_identity(path: &Path) -> Result<RootIdentity, RootError> {
         let text = path.to_str().ok_or(RootError::TargetUnavailable)?;
         let file = open_path(text, DIRECTORY_ACCESS).map_err(|_| RootError::TargetUnavailable)?;
@@ -1293,5 +1322,5 @@ mod root {
 
 pub(crate) use root::{
     Binding, ResolvedTarget, bind_installation, directory_identity, fingerprint_path,
-    observe_target, reopen_installation, resolve_existing_parent,
+    observe_target, open_private_directory, reopen_installation, resolve_existing_parent,
 };

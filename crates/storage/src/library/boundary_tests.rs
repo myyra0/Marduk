@@ -6,6 +6,21 @@ use marduk_core::import::ImportError;
 
 #[cfg(unix)]
 #[test]
+fn catalog_open_refuses_a_redirected_app_root_without_writing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let game_tree = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(game_tree.path(), tmp.path().join("app-data")).unwrap();
+
+    let error = match Catalog::open(&tmp.path().join("app-data")) {
+        Ok(_) => panic!("a symlinked app-data root must not be opened"),
+        Err(error) => error,
+    };
+    assert_eq!(error, ImportError::Storage);
+    assert_eq!(std::fs::read_dir(game_tree.path()).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
 fn catalog_open_refuses_symlinked_revisions_without_writing() {
     let tmp = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();

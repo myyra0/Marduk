@@ -1277,6 +1277,26 @@ pub(crate) fn directory_identity(path: &Path) -> Result<RootIdentity, RootError>
     )?))
 }
 
+pub(crate) fn open_private_directory(path: &Path) -> Result<File, RootError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fn open_final(path: &Path) -> io::Result<File> {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+    }
+
+    match open_final(path) {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path).map_err(|_| RootError::Io)?;
+            open_final(path).map_err(|_| RootError::TargetUnavailable)
+        }
+        Err(_) => Err(RootError::TargetUnavailable),
+    }
+}
+
 pub(crate) fn open_directory(path: &Path) -> Result<File, RootError> {
     let (_chain, _name, file) = open_absolute(path, DIRECTORY_FLAGS)?;
     let stx = statx_fd(&file)?;
