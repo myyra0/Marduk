@@ -482,10 +482,10 @@ was removed. `effects::sync_bound_directory` flushes the changed parent, and
 `NativeEffects::durability_barrier` returns `Durable` only when the reobserved
 evidence is unchanged. There is no post-effect file flush: retained bytes were
 stable before the effect and must not be reopened for write, while copies this
-process created are flushed by `copy_file`. The NTFS composition run at
-`62b9b94b` reached and
-completed that sequence for apply and restore; the change remains a narrowed
-standard flush, not power-cut evidence.
+process created are flushed by `copy_file`. The current sequence is at
+`0e194d6`; the NTFS composition run at `62b9b94b` exercised the earlier form
+that still reopened retained files, and completed apply and restore. The change
+remains a narrowed standard flush, not power-cut evidence.
 Context7's `windows-sys` lookup was checked against the locked
 `windows-sys-0.61.2/src/Windows/Win32/Storage/FileSystem/mod.rs` bindings;
 [Rust's Windows file implementation](https://github.com/rust-lang/rust/blob/master/library/std/src/sys/fs/windows.rs)
