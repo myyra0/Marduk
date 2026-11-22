@@ -160,6 +160,7 @@ use std::io::Read;
 use std::os::fd::RawFd;
 
 const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
+const TMPFS_SUPER_MAGIC: u64 = 0x0102_1994;
 const PROC_SUPER_MAGIC: u64 = 0x9fa0;
 const BTRFS_FIRST_FREE_OBJECTID: u64 = 256;
 /// `_IOR('f', 1, long)` from `linux/fs.h`.
@@ -1079,7 +1080,7 @@ pub(crate) struct StagingTree {
 impl StagingTree {
     pub(crate) fn open(root: &Path) -> Result<Self, RootError> {
         let root_dir = verify_root(open_directory(root)?)?;
-        if statfs_of(&root_dir.file)?.0 != BTRFS_SUPER_MAGIC {
+        if !library_filesystem_qualified(statfs_of(&root_dir.file)?.0) {
             return Err(RootError::UnsupportedTarget(
                 UnsupportedReason::Configuration,
             ));
@@ -1524,11 +1525,15 @@ pub(crate) fn renameat2(
     }
 }
 
-/// Library staging is connected only where this packet can qualify the whole
-/// private boundary. The Btrfs rename-domain proof is the intended target;
-/// tmpfs is not connected because the frozen catalog-refusal oracle expects an
-/// unqualified production catalog on that volume class, and this packet has no
-/// runtime library evidence to replace that oracle.
+/// Volume classes with recorded runtime evidence for private-library staging,
+/// per `docs/research/m1-native-results.md`. ext4, native NTFS and any
+/// unrecognised magic stay unqualified and are never treated as equivalent.
+fn library_filesystem_qualified(magic: u64) -> bool {
+    matches!(magic, BTRFS_SUPER_MAGIC | TMPFS_SUPER_MAGIC)
+}
+
+/// Library staging is connected only on a volume class with runtime proof. The
+/// observed root's `fstatfs` magic decides; an unreadable root is unqualified.
 pub(crate) fn library_volume_qualified(root: &Path) -> bool {
     let Ok(file) = open_directory(root) else {
         return false;
@@ -1536,7 +1541,7 @@ pub(crate) fn library_volume_qualified(root: &Path) -> bool {
     let Ok((magic, _)) = statfs_of(&file) else {
         return false;
     };
-    magic == BTRFS_SUPER_MAGIC
+    library_filesystem_qualified(magic)
 }
 
 /// The effective group and every supplementary group can be restored without

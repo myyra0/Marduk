@@ -2,7 +2,7 @@
 
 Runtime evidence from 2026-11-22 (IST), code commit `29e587d`, base `ebd9e07`. `not run` is never a pass. No power-cut or VM evidence exists.
 
-Close-out 2026-11-22: the Task 5 gate blocked native wiring. Native library staging is now disconnected from `Catalog::open`; the Btrfs library witness is `not run` and every corrected branch is marked below. No Task 6 native wiring is unlocked.
+Close-out 2026-11-22: the Task 5 gate blocked native wiring. A later Task 5 continuation connected private-library staging on the two volume classes with runtime evidence (Linux Btrfs and Linux tmpfs); see [Qualified library staging](#qualified-library-staging-connected-2026-11-22). `not run` rows stay `not run`, and no game-directory publication, Apply or Restore is wired. No Task 6 native wiring is unlocked.
 
 Environment: Linux 7.3.5-1-cachyos, x86-64, rustc 1.100.0, uid 1000 with `CapEff: 0` (ordinary user, no elevated token). tmpfs scratch: `/tmp` `rw,noatime,inode64,huge=advise`, fsid `b6b575e7…`, mount view 74, no Btrfs tree. Btrfs scratch: `/home` on `/dev/nvme0n1p2[/@home]` `rw,noatime,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/@home`, fsid `b68b24bc…`, view 61, tree 257. All fixtures are synthetic files under a disposable parent; no game, external root or elevated operation was touched.
 
@@ -14,7 +14,7 @@ Environment: Linux 7.3.5-1-cachyos, x86-64, rustc 1.100.0, uid 1000 with `CapEff
 | `native_detach_preserves_unknown_file` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run | — |
 | `native_error_does_not_prove_no_change` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run | — |
 | `native_namespace_survives_claimed_barrier` | ran 2026-11-22, passed (process-only, new create only) | ran 2026-11-22, passed (process-only, new create only) | not run | not run | Task 8, not run |
-| `library_catalog_never_names_missing_payload` | not run (native library staging disconnected pending gate) | not run (native library staging disconnected pending gate) | not run | not run | Task 8, not run |
+| `library_catalog_never_names_missing_payload` | not run (staging wired on this volume; catalog witness not run) | not run (staging wired on this volume; catalog witness not run) | not run (unqualified; `StageUnavailable`) | not run (unqualified; `StageUnavailable`) | Task 8, not run |
 | `btrfs_cross_subvolume_copy_does_not_use_cross_subvolume_rename` | not run (subvolume teardown EPERM; two-subvolume `EXDEV`/substitution not run) | N/A | N/A | N/A | — |
 
 **Evidence scope:** The root/parent substitution row covers refusal when substitution was visible at the last live check. It does not demonstrate prevention inside the final check-to-syscall window.
@@ -27,15 +27,15 @@ Environment: Linux 7.3.5-1-cachyos, x86-64, rustc 1.100.0, uid 1000 with `CapEff
 4. **Checked detach** — same swap race with no staged output: outcome `Conflict`, the child's `edit\n` remained at the public name, no retained slot was created, and nothing was deleted or settled as a removal.
 5. **Error is not "no change"** — injection returned `Fault::LoseAcknowledgement` after a successful exchange. The port reobserved and returned `Ambiguous` with the new target `mod\n`, the canonical retained slot holding `base\n`, and the logical stage absent. Genuine missing-target and read-only-metadata (`user.r03` xattr) refusals were exercised separately and were not reported as success. No claim is made for Win32 1175/1176/1177.
 6. **Namespace barrier** — process-only cuts for a **new create only**. Before publish the target was absent; after publication and before the barrier the child process saw the new name; after the claimed Linux barrier a reopened verifier saw the same object identity and bytes. The replace, detach and Restore barriers are `not run`. No power-loss or VM-restart claim is made.
-7. **Catalog never names a missing payload** — `not run`. `Catalog::open` now always uses the `Unavailable` stage; native library staging is disconnected pending the Task 5 gate, so the real catalog cannot reach a native receipt on any volume. A `StageUnavailable` readiness probe is all the witness can report; it is not a pass.
+7. **Catalog never names a missing payload** — `not run`. Private library staging is now wired on Linux Btrfs and Linux tmpfs (see below), and on an unqualified volume `Catalog::open` keeps the `Unavailable` stage; the interrupted-stream/prepared/committed cut witness itself has not been re-run in the current tree, so no pass is claimed.
 8. **Btrfs cross-subvolume** — `not run`. `btrfs subvolume create` succeeded and `btrfs subvolume delete` returned `EPERM` ("Operation not permitted"), which the runbook treats as not run. The scratch path was retained; no shim or other filesystem was substituted. The matching-inode substitute-subvolume assertion and the `EXDEV`/cross-subvolume copy check belong to this unrun two-subvolume case; they were not exercised.
 
 ## Commands
 
 - `python tests/platform/m1/native-publication/run.py /tmp/opencode/r03-run` (tmpfs): exit 0; 8 passed, 1 ignored; library case reported `R03 NOT RUN: catalog native receipt unavailable on this volume`; subvolume case reported not run.
-- `python tests/platform/m1/native-publication/run.py /home/parth/.cache/r03-run3` (Btrfs): exit 0; 8 passed, 1 ignored; the library case then ran the real catalog cuts against volume-selected native staging. That wiring is now disconnected pending the gate, so this observation is superseded and does not qualify the current tree; subvolume case reported teardown EPERM.
+- `python tests/platform/m1/native-publication/run.py /home/parth/.cache/r03-run3` (Btrfs): exit 0; 8 passed, 1 ignored; the library case then ran the real catalog cuts against volume-selected native staging (Btrfs only at that revision). That observation is superseded by the disconnected revision and was not re-run after the qualified reconnection below; subvolume case reported teardown EPERM.
 - `cargo test --locked -p marduk-platform --test native_publication`: compiles and passes; without `MARDUK_R03_SCRATCH` every runtime case prints `R03 NOT RUN`.
-- `cargo test --locked -p marduk-storage --test library_contract` (`TMPDIR=/tmp`): 5 passed; the production stage is `Unavailable` on every volume.
+- `cargo test --locked -p marduk-storage --test library_contract` (`TMPDIR=/tmp`): 5 passed; at that revision the production stage was `Unavailable` on every volume (now volume-selected, see below).
 - `cargo check --locked --target x86_64-pc-windows-msvc -p marduk-platform --tests`: passed; this is compile-only, not NTFS runtime.
 - `cargo fmt --all -- --check`, `cargo build --workspace --locked`, `cargo test --workspace --locked`: passed.
 
@@ -45,20 +45,33 @@ The frozen `run.py` builds its probe with only `.rlib` artifact directories. In 
 
 Adds `crates/platform/tests/native_proof_evidence.rs` detach witnesses, `library_stage.rs` error classification and a private `revisions/` mode. Frozen harness and oracle unchanged.
 
-### Library staging (disconnected 2026-11-22)
+### Library staging (disconnected 2026-11-22, superseded below)
 
-The Task 5 gate blocked native library wiring. `Catalog::open` now always uses `StageAdapter::Unavailable`, so `prepare_import` returns `StageUnavailable` on every volume, including Btrfs. The native adapter and its proof code remain for the gate to qualify; the only retained entry point is the private, unused `Catalog::open_native` reservation. There is no public injection path or feature flag.
+The Task 5 gate blocked native library wiring at that revision: `Catalog::open` used `StageAdapter::Unavailable` on every volume. The Btrfs library witness was therefore `not run` there, and the earlier Btrfs-only observation (selected from the catalog root's filesystem magic, `crates/platform/src/linux.rs:904` at the time) did not qualify the disconnected code. The frozen `library_contract` reported the same 5 passes under a Btrfs `TMPDIR` because staging was disconnected everywhere. This paragraph is history; the next section is the current state.
 
-The Btrfs library witness is therefore `not run` in the current tree. An earlier revision selected native staging from the catalog root's filesystem magic (Btrfs only, `crates/platform/src/linux.rs:904`); those observations are historical and do not qualify the disconnected code.
+### Qualified library staging (connected 2026-11-22)
+
+Continuation of Task 5 after the 2026-11-22 ruling. `Catalog::open` now selects native staging only when `marduk_platform::library_volume_qualified` reports a volume class with recorded runtime evidence: **Linux Btrfs** and **Linux tmpfs**. The predicate reads the observed private library root with the crate's existing `fstatfs` path (`crates/platform/src/linux.rs`), not a `statfs` type string. Refused and staying `StageUnavailable`:
+
+- Linux ext4 and every other unrecognised magic, including `FUSE` (ntfs-3g) and `ntfs3`.
+- Windows/native NTFS: `library_volume_qualified` is `false` and `StagingTree::open` is `Unsupported(Configuration)`.
+- A qualified volume whose private boundary will not bind: a redirected root or `revisions/`, an owner or mount mismatch, or a two-subvolume/`EXDEV` layout with no evidence. `NativeStage::open` refusal is final; it is never retried through a weaker adapter.
+
+Wired: private staging (private archive snapshot, admitted member set, hashed payload under `revisions/<id>/`, `sync_revisions` before the receipt) and catalog publication of a prepared import into the library (SQLite membership only, after native re-observation). Not wired: any game-directory effect. `DeploymentInputs`, `Catalog::prepare` deploy/restore routes, game publication/Apply and Restore remain typed unavailable, and no power-cut claim exists.
 
 | Suite / test | Required volume | Exact run condition | Observed |
 |---|---|---|---|
-| `crates/storage/tests/library_contract.rs` (5 tests), including `unqualified_production_catalog_refuses_preview_without_visible_changes` (`:57`) and `second_catalog_observes_the_active_writer_gate` (`:131`) | any | `TMPDIR=/tmp cargo test --locked -p marduk-storage --test library_contract` | 5 passed |
-| `library_catalog_never_names_missing_payload` (`tests/platform/m1/native-publication/library.rs:134`) | any | `python tests/platform/m1/native-publication/run.py <scratch>` | `R03 NOT RUN: catalog native receipt unavailable on this volume`; not a pass |
-| `cargo test --workspace --locked` | any | `TMPDIR=/tmp cargo test --workspace --locked` | every suite passed |
+| `crates/storage/tests/qualified_stage.rs::qualified_volume_stages_the_payload_through_the_production_catalog` | tmpfs or Btrfs | `TMPDIR=/tmp cargo test --locked -p marduk-storage --test qualified_stage`; also run with `TMPDIR=/var/tmp` | passed on tmpfs and Btrfs 2026-11-22; asserts the volume class instead of skipping; payload read back at `revisions/<id>/payload/textures/synthetic.dds`, revision dir `0700`, `reconcile` re-observes the receipt |
+| `crates/storage/src/library/stage_tests.rs::refused_volume_configuration_keeps_the_stage_unavailable` | any | `TMPDIR=/tmp cargo test --locked -p marduk-storage` | passed; `StageUnavailable`, no import row, no `revisions/` entry |
+| `crates/platform/src/linux_root_tests.rs` predicate tests (5) | any | `cargo test --locked -p marduk-platform --lib` | accept Btrfs/tmpfs; refuse ext4, FUSE/NTFS3 and unknown magic |
+| `crates/storage/tests/library_contract.rs` (5 tests) | any | `TMPDIR=/tmp cargo test --locked -p marduk-storage --test library_contract`; also with `TMPDIR=/var/tmp` | 5 passed on both; the volume-dependent test is now `production_stage_follows_the_qualified_volume` (refusal on unqualified, staging plus re-observation on qualified) |
+| `crates/storage/tests/production_refusal.rs` | any | `TMPDIR=/tmp cargo test --locked -p marduk-storage --test production_refusal` | 1 passed; an unprovable seeded stage row is never published on either adapter |
+| `crates/platform/tests/library_boundary.rs` (10 witnesses) | Btrfs | `MARDUK_M1_BTRFS_SCRATCH=/var/tmp cargo test -p marduk-platform --test library_boundary -- --ignored --test-threads=1` | 10 passed; without `--ignored` 10 ignored, none silently passing |
 | `crates/storage/src/library/contract_tests.rs` (11 unit tests, frozen oracle) | any | `Catalog::open_for_test` forces the fixture stage | 11 passed under `TMPDIR=/tmp` |
+| `crates/workspace/tests/workflow.rs::import_preview_and_apply_round_trip_on_a_qualified_volume` | tmpfs or Btrfs | `TMPDIR=/tmp cargo test --locked -p marduk-workspace` | passed; preview stages, apply publishes the recorded revision once, replay returns the same snapshot |
+| `library_catalog_never_names_missing_payload` (`tests/platform/m1/native-publication/library.rs:134`) | tmpfs or Btrfs | `python tests/platform/m1/native-publication/run.py <scratch>` | `not run` in this continuation; the table row above stays `not run` |
 
-There is no longer a volume-dependent difference: the frozen `library_contract` reports the same 5 passes under a Btrfs `TMPDIR` because production staging is disconnected everywhere. The earlier Btrfs negative evidence applied to volume-selected staging and is superseded.
+The runtime evidence behind the accepted magic set is the tmpfs/Btrfs effect table at the top of this document plus the catalog staging witnesses above. No ext4 or native NTFS catalog run exists; those cells stay `not run`.
 
 ### Detach and classification witnesses
 
@@ -75,11 +88,11 @@ There is no longer a volume-dependent difference: the frozen `library_contract` 
 
 Base `8110c38`. `NativeStage` now keeps every archive and payload effect on the verified revision handle: parents are created with `mkdirat(0700)`, leaves with `openat2(O_CREAT|O_EXCL|O_NOFOLLOW)`, and hashing, listing, fsyncs and reclaim unlinks resolve beneath the handle with `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_XDEV`. The revision name is removed through the bound `revisions/` handle. This closes the path-join window for bytes; it does not qualify publication.
 
-- `MARDUK_M1_BTRFS_SCRATCH=/var/tmp cargo test -p marduk-platform --test library_boundary` — 8 witnesses ignored without `--ignored` (none pass silently); with `--ignored --test-threads=1`, 8 passed.
+- `MARDUK_M1_BTRFS_SCRATCH=/var/tmp cargo test -p marduk-platform --test library_boundary` — 8 witnesses ignored without `--ignored` (none pass silently); with `--ignored --test-threads=1`, 8 passed. (The suite has since grown to 10 witnesses; the qualified re-run records 10 passed.)
 - New witnesses redirect a staged revision after its handle was opened and require `StageChanged`/`StageUnavailable` from `reobserve` and `reclaim` with the redirect target untouched and the original revision retained.
 - `TMPDIR=/tmp cargo test -p marduk-platform`, `TMPDIR=/tmp cargo test -p marduk-storage`, `cargo fmt --all -- --check`, `cargo build --workspace --locked`, `TMPDIR=/tmp cargo test --workspace --locked` — passed.
-- Windows compile check passed; Windows/NTFS staging remains `Unsupported(Configuration)`. `Catalog::open` remains `StageUnavailable` and no native Apply is connected.
+- Windows compile check passed; Windows/NTFS staging remains `Unsupported(Configuration)`. `Catalog::open` connects native staging on qualified Linux volumes only (see above); no native Apply is connected.
 
 **Known limitation (accepted by the 2026-11-22 user ruling):** On Linux and Windows, a same-privilege process can substitute the parent or leaf between the final live-handle check and the syscall. The [R02 contract](../contracts/m1-recovery.md#native-seam-that-r03-must-qualify) requires post-effect reobservation to detect divergence, retention of actually displaced bytes, and refusal to retry automatically on divergence. It does not claim prevention. A syscall error is not evidence of no change.
 
-The ruling changes the qualification criterion; it supplies no runtime evidence. Native staging and publication remain unqualified on ext4 and native NTFS and are not wired into the product.
+The ruling changes the qualification criterion; it supplies no runtime evidence. Native staging is now wired only on Linux Btrfs and Linux tmpfs, and remains unqualified and unwired on ext4 and native NTFS. Publication into a game directory, Apply, Restore and power-cut behaviour remain unqualified and unwired.

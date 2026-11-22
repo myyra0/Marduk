@@ -43,6 +43,50 @@ fn extent_mapped_flags_are_supported() {
 }
 
 #[test]
+fn library_staging_accepts_btrfs() {
+    assert!(library_filesystem_qualified(BTRFS_SUPER_MAGIC));
+}
+
+#[test]
+fn library_staging_accepts_tmpfs() {
+    assert!(library_filesystem_qualified(TMPFS_SUPER_MAGIC));
+}
+
+#[test]
+fn library_staging_refuses_ext4() {
+    const EXT4_SUPER_MAGIC: u64 = 0xef53;
+    assert!(!library_filesystem_qualified(EXT4_SUPER_MAGIC));
+}
+
+#[test]
+fn library_staging_refuses_ntfs_mounts() {
+    // ntfs-3g reports FUSE; the kernel `ntfs3` driver reports NTFS3. Neither
+    // has run-time library evidence.
+    const FUSE_SUPER_MAGIC: u64 = 0x6573_5546;
+    const NTFS3_SUPER_MAGIC: u64 = 0x7366_7433;
+    assert!(!library_filesystem_qualified(FUSE_SUPER_MAGIC));
+    assert!(!library_filesystem_qualified(NTFS3_SUPER_MAGIC));
+}
+
+#[test]
+fn library_staging_refuses_an_unrecognised_magic() {
+    assert!(!library_filesystem_qualified(0));
+    assert!(!library_filesystem_qualified(0x1234_5678));
+}
+
+#[test]
+fn library_volume_qualification_reads_the_observed_root() {
+    let directory = scratch();
+    let file = open_directory(directory.path()).expect("scratch directory");
+    let (magic, _) = statfs_of(&file).expect("statfs");
+    assert_eq!(
+        library_volume_qualified(directory.path()),
+        library_filesystem_qualified(magic)
+    );
+    assert!(!library_volume_qualified(&directory.path().join("absent")));
+}
+
+#[test]
 fn immutable_append_encrypt_verity_and_cow_flags_are_refused() {
     for flag in [
         FS_IMMUTABLE_FL,

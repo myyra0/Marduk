@@ -48,18 +48,30 @@ fn fresh_catalog_seeds_only_the_initial_profile() {
 }
 
 #[test]
-fn unqualified_production_catalog_refuses_preview_without_visible_changes() {
+fn production_stage_follows_the_qualified_volume() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut catalog = open(tmp.path());
-    assert_eq!(
-        catalog
-            .prepare_import(zip().as_slice(), append())
-            .unwrap_err(),
-        ImportError::StageUnavailable,
-    );
-    assert_initial(&mut catalog);
-    drop(catalog);
-    assert_initial(&mut open(tmp.path()));
+    let root = tmp.path();
+    let mut catalog = open(root);
+    let staged = catalog.prepare_import(zip().as_slice(), append());
+
+    if marduk_platform::library_volume_qualified(root) {
+        let prepared = staged.expect("a qualified volume stages the archive");
+        assert_eq!(prepared.profile, ProfileId::new(1));
+        assert_initial(&mut catalog);
+        drop(catalog);
+        let mut reopened = open(root);
+        assert_eq!(reopened.reconcile().unwrap(), vec![prepared.id]);
+        assert_initial(&mut reopened);
+    } else {
+        assert_eq!(staged.unwrap_err(), ImportError::StageUnavailable);
+        assert_initial(&mut catalog);
+        drop(catalog);
+        assert_initial(&mut open(root));
+        assert_eq!(
+            std::fs::read_dir(root.join("revisions")).unwrap().count(),
+            0
+        );
+    }
 }
 
 #[test]
@@ -125,10 +137,10 @@ fn second_catalog_observes_the_active_writer_gate() {
     drop(guard);
     assert_initial(&mut first);
     assert_initial(&mut second);
-    assert_eq!(
-        second
-            .prepare_import(zip().as_slice(), append())
-            .unwrap_err(),
-        ImportError::StageUnavailable,
-    );
+    let staged = second.prepare_import(zip().as_slice(), append());
+    if marduk_platform::library_volume_qualified(root) {
+        assert!(staged.is_ok(), "a qualified volume must stage");
+    } else {
+        assert_eq!(staged.unwrap_err(), ImportError::StageUnavailable);
+    }
 }

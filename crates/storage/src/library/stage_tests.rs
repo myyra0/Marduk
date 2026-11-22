@@ -90,6 +90,29 @@ fn import_count(catalog: &Catalog) -> i64 {
 }
 
 #[test]
+fn refused_volume_configuration_keeps_the_stage_unavailable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let mut catalog = Catalog::open_unqualified_for_test(root).unwrap();
+    assert!(!catalog.stage_available());
+
+    let archive = zip(A);
+    assert_eq!(
+        catalog
+            .prepare_import(archive.as_slice(), plan(0, append("A")))
+            .unwrap_err(),
+        ImportError::StageUnavailable
+    );
+    assert_eq!(import_count(&catalog), 0);
+    assert_eq!(
+        std::fs::read_dir(root.join("revisions")).unwrap().count(),
+        0
+    );
+    assert!(catalog.reconcile().unwrap().is_empty());
+    assert!(published(&catalog).is_empty());
+}
+
+#[test]
 fn reconcile_verifies_prepared_stage_integrity() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();

@@ -1,5 +1,9 @@
 //! Cross-client workflow witnesses for the shared workspace service.
 
+#[allow(dead_code)]
+#[path = "../../archive/tests/fixtures/mod.rs"]
+mod zip_fixture;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -8,6 +12,7 @@ use marduk_workspace::{
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use zip_fixture::{ClassicZip, Record};
 
 struct Fixture {
     temp: TempDir,
@@ -63,6 +68,19 @@ impl Fixture {
     fn revision_files(&self) -> usize {
         fs::read_dir(self.app.join("revisions")).unwrap().count()
     }
+
+    /// Whether the platform adapter has runtime evidence for staging this
+    /// library volume; the workflow must follow it rather than a constant.
+    fn stage_qualified(&self) -> bool {
+        marduk_platform::library_volume_qualified(&self.app)
+    }
+
+    fn zip(&self, name: &str) -> PathBuf {
+        let path = self.temp.path().join(name);
+        let bytes = ClassicZip::new(&[Record::file(b"synthetic.txt", b"fixture bytes")]).bytes;
+        fs::write(&path, bytes).unwrap();
+        path
+    }
 }
 
 fn expect_ok(envelope: Envelope<Value>) -> Value {
@@ -103,11 +121,18 @@ fn setup_status_and_restart_share_the_authoritative_state() {
     assert_eq!(status["profile"]["id"], json!("1"));
     assert_eq!(status["profile"]["members"], json!([]));
     assert_eq!(status["availability"]["target"]["available"], json!(true));
-    assert_eq!(status["availability"]["import"]["available"], json!(false));
     assert_eq!(
-        status["availability"]["import"]["blocker"]["code"],
-        json!("StageUnavailable")
+        status["availability"]["import"]["available"],
+        json!(fixture.stage_qualified())
     );
+    if fixture.stage_qualified() {
+        assert!(status["availability"]["import"]["blocker"].is_null());
+    } else {
+        assert_eq!(
+            status["availability"]["import"]["blocker"]["code"],
+            json!("StageUnavailable")
+        );
+    }
     assert_eq!(status["availability"]["deploy"]["available"], json!(false));
     assert_eq!(
         status["availability"]["deploy"]["blocker"]["code"],
@@ -174,10 +199,15 @@ fn stale_order_is_refused_without_a_second_increment() {
 }
 
 #[test]
-fn import_preview_reports_stage_unavailable_without_persisting() {
+fn import_preview_refuses_an_unreadable_archive_without_a_visible_revision() {
     let mut fixture = Fixture::new();
     fixture.setup();
     let zip = scratch_file(fixture.temp.path(), "import.zip");
+    let expected = if fixture.stage_qualified() {
+        "InvalidContainer"
+    } else {
+        "StageUnavailable"
+    };
 
     let error = expect_error(fixture.send(json!({
         "op": "import_preview",
@@ -187,16 +217,66 @@ fn import_preview_reports_stage_unavailable_without_persisting() {
             "atRevision": "0",
         },
     })));
-    assert_eq!(code(&error), "StageUnavailable");
+    assert_eq!(code(&error), expected);
     assert_eq!(fixture.status()["profile"]["revision"], json!("0"));
     assert_eq!(fixture.status()["profile"]["members"], json!([]));
-    assert_eq!(fixture.revision_files(), 0);
+    if !fixture.stage_qualified() {
+        assert_eq!(fixture.revision_files(), 0);
+    }
 
+    // The refused reservation is never published, on either adapter.
     let error = expect_error(fixture.send(json!({
         "op": "import_apply",
         "args": { "importId": "1" },
     })));
-    assert_eq!(code(&error), "StageUnavailable");
+    let expected = if fixture.stage_qualified() {
+        "ImportNotPrepared"
+    } else {
+        "StageUnavailable"
+    };
+    assert_eq!(code(&error), expected);
+    assert_eq!(fixture.status()["profile"]["members"], json!([]));
+}
+
+#[test]
+fn import_preview_and_apply_round_trip_on_a_qualified_volume() {
+    let mut fixture = Fixture::new();
+    fixture.setup();
+    let zip = fixture.zip("qualified.zip");
+    let request = json!({
+        "op": "import_preview",
+        "args": {
+            "zip": zip.to_str().unwrap(),
+            "name": "Qualified",
+            "atRevision": "0",
+        },
+    });
+
+    if !fixture.stage_qualified() {
+        assert_eq!(
+            code(&expect_error(fixture.send(request))),
+            "StageUnavailable"
+        );
+        return;
+    }
+
+    let prepared = expect_ok(fixture.send(request));
+    assert_eq!(prepared["files"][0]["path"], json!("synthetic.txt"));
+    assert_eq!(fixture.status()["profile"]["members"], json!([]));
+
+    let snapshot = expect_ok(fixture.send(json!({
+        "op": "import_apply",
+        "args": { "importId": prepared["id"] },
+    })));
+    assert_eq!(snapshot["revision"], json!("1"));
+    assert_eq!(snapshot["members"][0]["displayName"], json!("Qualified"));
+
+    // A replayed apply returns the recorded result without a second revision.
+    let replayed = expect_ok(fixture.send(json!({
+        "op": "import_apply",
+        "args": { "importId": prepared["id"] },
+    })));
+    assert_eq!(replayed, snapshot);
 }
 
 #[test]
@@ -294,7 +374,12 @@ fn desktop_import_preview_consumes_the_opened_archive_handle() {
     })));
     // The selection was consumed and reached the import stage; a replayed
     // handle cannot be resolved again.
-    assert_eq!(code(&error), "StageUnavailable");
+    let expected = if fixture.stage_qualified() {
+        "InvalidContainer"
+    } else {
+        "StageUnavailable"
+    };
+    assert_eq!(code(&error), expected);
     let error = expect_error(fixture.send(json!({
         "op": "import_preview",
         "args": {

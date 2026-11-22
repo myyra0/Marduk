@@ -7,12 +7,17 @@
 
 #![cfg(unix)]
 
+#[allow(dead_code)]
+#[path = "../../archive/tests/fixtures/mod.rs"]
+mod zip_fixture;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use zip_fixture::{ClassicZip, Record};
 
 struct Fixture {
     temp: TempDir,
@@ -103,10 +108,12 @@ fn setup_status_and_empty_order_workflow() {
         value["result"]["availability"]["target"]["available"],
         json!(true)
     );
-    assert_eq!(
-        value["result"]["availability"]["import"]["blocker"]["code"],
-        json!("StageUnavailable")
-    );
+    let import = &value["result"]["availability"]["import"];
+    if import["available"] == json!(true) {
+        assert!(import["blocker"].is_null());
+    } else {
+        assert_eq!(import["blocker"]["code"], json!("StageUnavailable"));
+    }
 
     let output = fixture.run(&["status", "--json"]);
     assert_eq!(output.status.code(), Some(0));
@@ -210,6 +217,46 @@ fn human_mode_keeps_the_stable_code_and_serialized_detail() {
 }
 
 #[test]
+fn import_availability_matches_the_stage_route() {
+    let fixture = Fixture::new();
+    let output = fixture.run(&["setup", "--game-dir", fixture.game_dir(), "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let available = envelope(&output)["result"]["availability"]["import"]["available"]
+        .as_bool()
+        .unwrap();
+
+    let zip = fixture.temp.path().join("qualified.zip");
+    let bytes = ClassicZip::new(&[Record::file(b"synthetic.txt", b"fixture bytes")]).bytes;
+    fs::write(&zip, bytes).unwrap();
+    let output = fixture.run(&[
+        "import",
+        "preview",
+        zip.to_str().unwrap(),
+        "--name",
+        "Example",
+        "--at-revision",
+        "0",
+        "--json",
+    ]);
+
+    if available {
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(
+            envelope(&output)["result"]["files"][0]["path"],
+            json!("synthetic.txt")
+        );
+    } else {
+        assert_eq!(code(&envelope(&output)), "StageUnavailable");
+        assert_eq!(
+            fs::read_dir(fixture.app_root().join("revisions"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+}
+
+#[test]
 fn blocked_routes_are_typed_unavailable() {
     let fixture = Fixture::new();
     let zip = fixture.temp.path().join("import.zip");
@@ -226,11 +273,17 @@ fn blocked_routes_are_typed_unavailable() {
         "--json",
     ]);
     assert_eq!(output.status.code(), Some(1));
-    assert_eq!(code(&envelope(&output)), "StageUnavailable");
+    // An unqualified volume refuses before any write; a qualified one reaches
+    // admission and rejects the container. Both are typed refusals.
+    let expected = match code(&envelope(&output)) {
+        "StageUnavailable" => "StageUnavailable",
+        "InvalidContainer" => "ImportNotPrepared",
+        other => panic!("unexpected preview refusal: {other}"),
+    };
 
     let output = fixture.run(&["import", "apply", "1", "--json"]);
     assert_eq!(output.status.code(), Some(1));
-    assert_eq!(code(&envelope(&output)), "StageUnavailable");
+    assert_eq!(code(&envelope(&output)), expected);
 
     for arguments in [
         vec!["deploy", "preview", "--at-revision", "0", "--json"],

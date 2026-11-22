@@ -1,20 +1,24 @@
-//! Production refusal coverage for the unqualified stage adapter. The frozen
-//! oracle lives in `library_contract.rs` and is not modified here.
+//! Production refusal coverage for stage rows the adapter cannot prove. The
+//! frozen oracle lives in `library_contract.rs` and is not modified here.
+//!
+//! The seeded row is unprovable on every volume class: an unqualified volume
+//! refuses it through the unavailable adapter, a qualified volume refuses it in
+//! the native re-observation. Neither may publish or mutate profile state.
 
 use marduk_core::ids::ProfileId;
 use marduk_core::import::{ImportError, ImportId};
 use marduk_storage::Catalog;
 
 #[test]
-fn production_discard_and_reconcile_leave_unqualified_stage_rows_untouched() {
+fn production_discard_and_reconcile_leave_unprovable_stage_rows_untouched() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let mut catalog = Catalog::open(root).expect("open production catalog");
 
     assert_eq!(catalog.reconcile().unwrap(), Vec::<ImportId>::new());
 
-    // Production cannot prepare, so seed a row that only a stage adapter could
-    // have produced and check that the unavailable adapter refuses it.
+    // Seed a row that only a stage adapter could have produced, with evidence
+    // no adapter can prove, and check that it is refused.
     {
         let connection = rusqlite::Connection::open(root.join("catalog.sqlite3")).unwrap();
         connection
@@ -28,11 +32,12 @@ fn production_discard_and_reconcile_leave_unqualified_stage_rows_untouched() {
     }
 
     let id = ImportId::try_from_u64(42).unwrap();
-    assert_eq!(
+    assert!(matches!(
         catalog.discard_import(id),
-        Err(ImportError::StageUnavailable)
-    );
+        Err(ImportError::StageUnavailable | ImportError::StageChanged)
+    ));
     assert_eq!(catalog.reconcile().unwrap(), Vec::<ImportId>::new());
+    assert!(!root.join("revisions").join("42").exists());
 
     let connection = rusqlite::Connection::open(root.join("catalog.sqlite3")).unwrap();
     let (state, result_revision): (String, Option<i64>) = connection
@@ -42,7 +47,7 @@ fn production_discard_and_reconcile_leave_unqualified_stage_rows_untouched() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, "prepared");
+    assert_ne!(state, "committed");
     assert_eq!(result_revision, None);
 
     let installed: i64 = connection

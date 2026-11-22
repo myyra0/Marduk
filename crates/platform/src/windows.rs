@@ -1482,3 +1482,8 @@ pub(crate) use root::{
     open_private_directory, private_child_path, reopen_installation, resolve_existing_parent,
     verify_private_directory,
 };
+
+/// No Windows volume class has private-library staging evidence.
+pub(crate) fn library_volume_qualified(_root: &Path) -> bool {
+    false
+}

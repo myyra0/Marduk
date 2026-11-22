@@ -111,23 +111,32 @@ impl Catalog {
             _catalog: catalog,
             connection,
             gate,
-            // Native staging stays disconnected until the publication gate
-            // qualifies it. `open_native` below is the retained reservation.
-            stage: StageAdapter::Unavailable(UnavailableStage),
+            stage: Self::select_stage(marduk_platform::library_volume_qualified(root), root),
         })
     }
 
-    /// Reserved native constructor. It is intentionally unreachable from
-    /// [`Catalog::open`] and has no product injection path or feature flag.
-    #[allow(dead_code)]
-    fn open_native(root: &Path) -> Result<StageAdapter, ImportError> {
-        NativeStage::open(root)
-            .map(StageAdapter::Native)
-            .map_err(|_| ImportError::StageUnavailable)
+    /// Connect native staging only on volume classes with recorded runtime
+    /// evidence (`docs/research/m1-native-results.md`: Linux Btrfs, Linux tmpfs).
+    /// A qualified volume whose private boundary will not bind — a redirect, an
+    /// owner or mount mismatch, or a cross-subvolume `EXDEV` layout — stays
+    /// refused; the bind is the final gate, never a downgrade to a weaker write.
+    fn select_stage(qualified: bool, root: &Path) -> StageAdapter {
+        if !qualified {
+            return StageAdapter::Unavailable(UnavailableStage);
+        }
+        match NativeStage::open(root) {
+            Ok(stage) => StageAdapter::Native(stage),
+            Err(_) => StageAdapter::Unavailable(UnavailableStage),
+        }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Whether this catalog can write a private staged payload at all.
+    pub fn stage_available(&self) -> bool {
+        self.stage.available()
     }
 
     /// Read the profile snapshot and its display names in one transaction.
@@ -628,6 +637,15 @@ impl Catalog {
         catalog.stage = StageAdapter::Fixture(FixtureStage);
         Ok(catalog)
     }
+
+    /// Test-only constructor for the refused stage configuration: the same
+    /// adapter an unqualified volume selects, with no test fake behind it.
+    #[cfg(test)]
+    pub(crate) fn open_unqualified_for_test(root: &Path) -> Result<Self, ImportError> {
+        let mut catalog = Self::open(root)?;
+        catalog.stage = Self::select_stage(false, root);
+        Ok(catalog)
+    }
 }
 
 struct StageRecord {
@@ -691,9 +709,9 @@ impl StageAdapter {
     }
 }
 
-/// Production seam. Native payload publication arrives in Task 5; until a
-/// qualified adapter exists every prepare attempt is refused rather than faked,
-/// and no persisted stage can be re-observed or reclaimed.
+/// Refusal seam for unqualified volumes. Every prepare, re-observe and reclaim
+/// is refused rather than faked, and no persisted stage can be treated as
+/// intact.
 struct UnavailableStage;
 
 impl UnavailableStage {

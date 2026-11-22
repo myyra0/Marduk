@@ -67,6 +67,12 @@ pub fn open_private_directory(path: &Path) -> Result<std::fs::File, RootError> {
     native::open_private_directory(path)
 }
 
+/// Whether the adapter has recorded runtime evidence for private-library
+/// staging on the volume holding `root`. Unqualified volumes must not stage.
+pub fn library_volume_qualified(root: &Path) -> bool {
+    native::library_volume_qualified(root)
+}
+
 /// Open an application-owned child directory through the pinned parent handle,
 /// refusing a final link and every redirected ancestor, and creating only that
 /// one missing child when absent.

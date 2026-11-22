@@ -608,15 +608,24 @@ impl Workspace {
             };
         }
 
+        let import = if self.catalog.stage_available() {
+            Availability {
+                available: true,
+                blocker: None,
+            }
+        } else {
+            Availability {
+                available: false,
+                blocker: Some(WireError::new(Code::StageUnavailable)),
+            }
+        };
+
         Ok(WorkspaceStatus {
             installation,
             profile: snapshot_dto(named),
             availability: AvailabilitySet {
                 target,
-                import: Availability {
-                    available: false,
-                    blocker: Some(WireError::new(Code::StageUnavailable)),
-                },
+                import,
                 deploy: effect_availability(),
                 restore: effect_availability(),
             },
@@ -652,10 +661,17 @@ impl Workspace {
     }
 
     fn import_apply(&mut self, args: ImportApplyArgs) -> Result<Snapshot, WireError> {
-        let _ = ImportId::try_from_u64(parse_id(&args.import_id)?)
+        let id = ImportId::try_from_u64(parse_id(&args.import_id)?)
             .map_err(|_| WireError::new(Code::InvalidRequest))?;
-        // No import can have been prepared while the native stage is closed.
-        Err(WireError::new(Code::StageUnavailable))
+        // Publication stays inside the app-owned library: the adapter re-observes
+        // the staged bytes before the catalog records visible membership.
+        let snapshot = self.catalog.publish_import(id).map_err(import_error)?;
+        let names = self
+            .catalog
+            .named_profile(profile())
+            .map_err(import_error)?
+            .names;
+        Ok(snapshot_dto(NamedProfile { snapshot, names }))
     }
 
     fn order(&mut self, args: OrderArgs) -> Result<Snapshot, WireError> {
