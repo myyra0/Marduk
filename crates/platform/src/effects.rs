@@ -600,7 +600,8 @@ fn source_dacl_grants_only_current_user(
         WinLocalSystemSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_APPEND_DATA, FILE_WRITE_DATA, WRITE_DAC, WRITE_OWNER,
+        FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_GENERIC_WRITE, FILE_WRITE_ATTRIBUTES,
+        FILE_WRITE_DATA, FILE_WRITE_EA, WRITE_DAC, WRITE_OWNER,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -609,8 +610,21 @@ fn source_dacl_grants_only_current_user(
     const SYSTEM_AUDIT_ACE_TYPE: u8 = 2;
     const SYSTEM_ALARM_ACE_TYPE: u8 = 3;
     const DELETE: u32 = 0x0001_0000;
+    // Generic and maximum-rights bits. `STANDARD_RIGHTS_WRITE` aliases
+    // `READ_CONTROL`, so it is expanded through `FILE_GENERIC_WRITE` rather than
+    // tested alone; an ACE that grants only it grants no write access.
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
 
-    let write_rights = FILE_WRITE_DATA | FILE_APPEND_DATA | WRITE_DAC | WRITE_OWNER | DELETE;
+    let write_rights = FILE_WRITE_DATA
+        | FILE_APPEND_DATA
+        | FILE_WRITE_EA
+        | FILE_WRITE_ATTRIBUTES
+        | FILE_DELETE_CHILD
+        | WRITE_DAC
+        | WRITE_OWNER
+        | DELETE;
 
     let mut token: HANDLE = std::ptr::null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
@@ -698,7 +712,19 @@ fn source_dacl_grants_only_current_user(
                     continue;
                 }
                 let allowed = unsafe { &*(ace.cast::<ACCESS_ALLOWED_ACE>()) };
-                if allowed.Mask & write_rights == 0 {
+                // Access checks expand generic rights before evaluation, so a
+                // mask test on concrete bits alone misses `GENERIC_WRITE`.
+                if allowed.Mask & MAXIMUM_ALLOWED != 0 {
+                    return Ok(false);
+                }
+                let mut mask = allowed.Mask;
+                if mask & GENERIC_ALL != 0 {
+                    mask |= u32::MAX;
+                }
+                if mask & GENERIC_WRITE != 0 {
+                    mask |= FILE_GENERIC_WRITE;
+                }
+                if mask & write_rights == 0 {
                     continue;
                 }
                 let sid = unsafe {

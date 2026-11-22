@@ -240,7 +240,34 @@ fn volume_qualification_reads_the_opened_root() {
 
 #[cfg(windows)]
 #[test]
-fn copy_refuses_a_source_dacl_that_grants_write_to_another_principal() {
+fn copy_refuses_concrete_file_write_data_in_source_dacl() {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_GENERIC_WRITE};
+
+    const DELETE: u32 = 0x0001_0000;
+    refuse_widened_dacl(FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE);
+}
+
+#[cfg(windows)]
+#[test]
+fn copy_refuses_generic_write_in_source_dacl() {
+    use windows_sys::Win32::Foundation::GENERIC_WRITE;
+    use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
+
+    refuse_widened_dacl(GENERIC_WRITE | FILE_GENERIC_READ);
+}
+
+#[cfg(windows)]
+#[test]
+fn copy_refuses_generic_all_in_source_dacl() {
+    use windows_sys::Win32::Foundation::GENERIC_ALL;
+
+    refuse_widened_dacl(GENERIC_ALL);
+}
+
+/// The source's DACL is replaced by one Everyone ACE with `mask`. Reading the
+/// source must still work, so every mask below also carries read access.
+#[cfg(windows)]
+fn refuse_widened_dacl(mask: u32) {
     use std::mem::{offset_of, size_of};
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
@@ -248,10 +275,8 @@ fn copy_refuses_a_source_dacl_that_grants_write_to_another_principal() {
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, CreateWellKnownSid,
         DACL_SECURITY_INFORMATION, InitializeAcl, WinWorldSid,
     };
-    use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_GENERIC_WRITE};
 
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
-    const DELETE: u32 = 0x0001_0000;
 
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("source");
@@ -286,7 +311,7 @@ fn copy_refuses_a_source_dacl_that_grants_write_to_another_principal() {
         (*header).AceFlags = 0;
         (*header).AceSize = ace_size as u16;
         let allowed = ace.cast::<ACCESS_ALLOWED_ACE>();
-        (*allowed).Mask = FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE;
+        (*allowed).Mask = mask;
         std::ptr::copy_nonoverlapping(
             sid.as_ptr(),
             ace.add(offset_of!(ACCESS_ALLOWED_ACE, SidStart)),
