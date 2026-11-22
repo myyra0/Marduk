@@ -100,7 +100,8 @@ The ruling changes the qualification criterion; it supplies no runtime evidence.
 
 ## Native copy adapter (Task 6, 2026-11-22)
 
-Base `5fe1a02`. Adapter commit `b522b48`; primitive promotion `3f03ac8`.
+Base `5fe1a02`. Adapter commit `b522b48`; primitive promotion `3f03ac8`;
+Windows compile fix `8fd7f79`.
 The checked effect primitives moved out of the hidden proof
 harness into `marduk_platform::effects`; `native_proof` now calls the same code.
 A production `marduk_storage::native_effects::NativeEffects` adapter implements
@@ -148,6 +149,7 @@ both qualified volumes afterwards: 7 passed on each.
 - `TMPDIR=/var/tmp cargo test -p marduk-workspace --test native_deployment -- --ignored --test-threads=1` — 2 passed.
 - `TMPDIR=/tmp` and `TMPDIR=/var/tmp cargo test -p marduk-storage --test qualified_stage -- --ignored` — 1 passed on each.
 - `MARDUK_R03_SCRATCH=/tmp` and `/var/tmp cargo test -p marduk-platform --test native_proof_evidence -- --test-threads=1` — 7 passed on each.
+- `MARDUK_R03_SCRATCH=/tmp` and `/var/tmp cargo test -p marduk-platform --test native_publication -- --test-threads=1` — 8 passed, 1 ignored on each after the `futimens` correction.
 - `TMPDIR=/tmp cargo test -p marduk-platform -p marduk-storage -p marduk-workspace -p marduk-cli` — passed.
 - `cargo fmt --all -- --check`, `cargo build --workspace --locked`, `TMPDIR=/tmp cargo test --workspace --locked` — passed.
 
