@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, Subcommand};
-use marduk_workspace::{app_data_root, Code, Envelope, Op, Request, WireError, Workspace};
-use serde_json::{json, Value};
+use marduk_workspace::{Code, Envelope, Op, Request, WireError, Workspace, app_data_root};
+use serde_json::{Value, json};
 
 #[derive(Parser)]
 #[command(

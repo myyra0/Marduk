@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use marduk_core::qualification::{
-    available, missing_witness, Capability, Layer, Os, Proof, Route, VolumeClass, NARROWED, PROOFS,
+    Capability, Layer, NARROWED, Os, PROOFS, Proof, Route, VolumeClass, available, missing_witness,
 };
 
 const EVIDENCE: &str = "docs/research/m1-native-results.md";
