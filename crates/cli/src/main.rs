@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, Subcommand};
-use marduk_workspace::{Code, Envelope, Op, Request, WireError, Workspace, app_data_root};
-use serde_json::{Value, json};
+use marduk_workspace::{app_data_root, Code, Envelope, Op, Request, WireError, Workspace};
+use serde_json::{json, Value};
 
 #[derive(Parser)]
 #[command(
@@ -218,16 +218,14 @@ fn emit(envelope: &Envelope<Value>) {
     }
 }
 
-/// A blocked reconciliation is an `Ok` envelope whose recorded operation
-/// carries a non-null `blocker`; it exits 1 like a typed refusal because the
-/// work did not settle. `null` and a blocker-free operation exit 0.
+/// A blocked operation is an `Ok` envelope whose recorded operation carries a
+/// non-null `blocker`; it exits 1 like a typed refusal because the work did not
+/// settle. `DeployApply` returns the operation directly; `Restore` nests it
+/// under `operation`. `null` and a blocker-free operation exit 0.
 fn exit_code(envelope: &Envelope<Value>) -> i32 {
     match envelope {
         Envelope::Ok { result, .. } => {
-            if result
-                .get("blocker")
-                .is_some_and(|blocker| !blocker.is_null())
-            {
+            if is_blocked(result) {
                 1
             } else {
                 0
@@ -241,6 +239,15 @@ fn exit_code(envelope: &Envelope<Value>) -> i32 {
             }
         }
     }
+}
+
+fn is_blocked(value: &Value) -> bool {
+    let has_blocker = |operation: &Value| {
+        operation
+            .get("blocker")
+            .is_some_and(|blocker| !blocker.is_null())
+    };
+    has_blocker(value) || value.get("operation").is_some_and(has_blocker)
 }
 
 #[cfg(test)]
@@ -283,5 +290,31 @@ mod tests {
             result: Value::Null,
         };
         assert_eq!(exit_code(&nothing), 0);
+
+        let blocked_restore: Envelope<Value> = Envelope::Ok {
+            result: json!({
+                "outcome": "operation",
+                "operation": {
+                    "id": "9223372036854775803",
+                    "kind": "restore",
+                    "phase": "rolling_back",
+                    "blocker": { "code": "RecoveryConflict" },
+                },
+            }),
+        };
+        assert_eq!(exit_code(&blocked_restore), 1);
+
+        let settled_restore: Envelope<Value> = Envelope::Ok {
+            result: json!({
+                "outcome": "operation",
+                "operation": {
+                    "id": "9223372036854775803",
+                    "kind": "restore",
+                    "phase": "completed",
+                    "blocker": null,
+                },
+            }),
+        };
+        assert_eq!(exit_code(&settled_restore), 0);
     }
 }

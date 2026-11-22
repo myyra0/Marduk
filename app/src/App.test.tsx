@@ -613,6 +613,7 @@ describe('workspace shell', () => {
     expect(
       await screen.findByText(/Outcome unknown; refreshing authoritative state\./),
     ).toBeInTheDocument();
+    expect(screen.getByText(/StalePlan/)).toBeInTheDocument();
     await waitFor(() => expect(statusCall).toHaveBeenCalledTimes(2));
     expect(screen.queryByRole('button', { name: /Apply deployment/ })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Review deployment/ })).toBeEnabled();
@@ -978,6 +979,7 @@ describe('workspace shell', () => {
     expect(
       await screen.findByText(/Outcome unknown; refreshing authoritative state\./),
     ).toBeInTheDocument();
+    expect(screen.getByText(/RecoveryConflict/)).toBeInTheDocument();
     await waitFor(() => expect(statusCall).toHaveBeenCalledTimes(2));
     await waitFor(() => {
       expect(screen.getByRole('button', { name: /Restore deployment/ })).toBeDisabled();

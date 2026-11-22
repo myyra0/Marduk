@@ -482,9 +482,12 @@ export function App({ transport }: Props) {
           setReviewInvalidated(true);
         },
         // The write may have reached the game folder before the error. Only the
-        // refreshed authoritative status may say what happened.
-        rejectNotice: () => 'Outcome unknown; refreshing authoritative state.',
-        refreshOnReject: () => 'Outcome unknown; refreshing authoritative state.',
+        // refreshed authoritative status may say what happened; the typed code
+        // still identifies a refusal that arrived before any claim.
+        rejectNotice: (error) =>
+          `Outcome unknown; refreshing authoritative state. ${describeBlocker(error)}`,
+        refreshOnReject: (error) =>
+          `Outcome unknown; refreshing authoritative state. ${describeBlocker(error)}`,
       },
     );
   }
@@ -511,9 +514,12 @@ export function App({ transport }: Props) {
           if (error.code === 'NoActiveDeployment') setRestoreNoActive(true);
         },
         // Restore can fail after moving public files. The refresh decides the
-        // outcome; the notice must not assert that nothing happened.
-        rejectNotice: () => 'Outcome unknown; refreshing authoritative state.',
-        refreshOnReject: () => 'Outcome unknown; refreshing authoritative state.',
+        // outcome; the notice must not assert that nothing happened, and the
+        // typed refusal stays visible so a pre-claim block cannot vanish.
+        rejectNotice: (error) =>
+          `Outcome unknown; refreshing authoritative state. ${describeBlocker(error)}`,
+        refreshOnReject: (error) =>
+          `Outcome unknown; refreshing authoritative state. ${describeBlocker(error)}`,
       },
     );
   }
