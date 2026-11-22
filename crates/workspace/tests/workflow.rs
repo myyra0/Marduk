@@ -428,6 +428,25 @@ fn ids_and_revisions_serialize_as_exact_decimal_strings() {
     assert!(status["profile"]["revision"].is_string());
 }
 
+#[cfg(unix)]
+#[test]
+fn desktop_pick_refuses_a_symlinked_selection_ancestor() {
+    let mut fixture = Fixture::new();
+    let alias = fixture.temp.path().join("alias");
+    std::os::unix::fs::symlink(fixture.temp.path(), &alias).unwrap();
+    let selected = alias.join(fixture.game.file_name().unwrap());
+
+    let error = match fixture
+        .workspace
+        .remember_selection(Purpose::Installation, selected)
+    {
+        Ok(_) => panic!("a redirected picker ancestor must be refused, not canonicalized"),
+        Err(error) => error,
+    };
+    assert_eq!(error, WireError::new(Code::TargetUnavailable));
+    assert_eq!(fixture.status()["installation"], Value::Null);
+}
+
 #[test]
 fn desktop_setup_refuses_a_replacement_at_the_picked_path() {
     let mut fixture = Fixture::new();

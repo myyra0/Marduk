@@ -4,7 +4,8 @@
 //! [`SelectionId`] minted here. The owning module resolves the handle, so a
 //! renderer can never supply a path, replay a handle or reuse one across
 //! operations. Archive picks are opened immediately and consumed as a file
-//! descriptor; installation picks are canonicalized once, before validation.
+//! descriptor; installation picks keep their absolute spelling, so the native
+//! binder sees any redirected link instead of validating its target.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -103,12 +104,11 @@ impl SelectionStore {
         installation: RootIdentity,
         data: RootIdentity,
     ) -> Result<SelectionId, WireError> {
-        let resolved =
-            std::fs::canonicalize(&path).map_err(|_| WireError::new(Code::InvalidPath))?;
+        let absolute = std::path::absolute(&path).map_err(|_| WireError::new(Code::InvalidPath))?;
         Ok(self.insert(
             Purpose::Installation,
             Source::Installation(PickedInstallation {
-                path: resolved,
+                path: absolute,
                 installation,
                 data,
             }),
@@ -171,7 +171,7 @@ mod tests {
             .unwrap();
         match store.take(id, Purpose::Installation).unwrap() {
             Source::Installation(picked) => {
-                assert_eq!(picked.path, fs::canonicalize(&game).unwrap());
+                assert_eq!(picked.path, std::path::absolute(&game).unwrap());
                 assert_eq!((picked.installation, picked.data), (root(1), root(2)));
             }
             Source::Archive(_) => panic!("wrong source kind"),

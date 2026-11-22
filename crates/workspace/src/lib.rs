@@ -453,8 +453,11 @@ impl Workspace {
         match purpose {
             Purpose::Archive => self.selections.insert_archive(path),
             Purpose::Installation => {
+                // Make the locator absolute but never resolve its links: the
+                // native binder must see and refuse a redirected picker root,
+                // and consumption re-binds this same spelling.
                 let resolved =
-                    std::fs::canonicalize(&path).map_err(|_| WireError::new(Code::InvalidPath))?;
+                    std::path::absolute(&path).map_err(|_| WireError::new(Code::InvalidPath))?;
                 let binding = marduk_platform::bind_installation(&resolved, &skyrim_se::LAYOUT)
                     .map_err(root_error)?;
                 let (installation, data) = binding.identities();

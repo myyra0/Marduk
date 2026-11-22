@@ -1,4 +1,11 @@
 //! CLI workflow witnesses against the real shared workspace service.
+//!
+//! The shared resolver reads `XDG_DATA_HOME`/`HOME` on Unix. Windows resolves
+//! the roaming known folder with no environment input, so a subprocess cannot
+//! be isolated there without touching the runner's real catalog; these
+//! witnesses are Unix-only and the pure resolver test covers the layout.
+
+#![cfg(unix)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -29,7 +36,8 @@ impl Fixture {
             .args(arguments)
             .current_dir(cwd)
             .env("XDG_DATA_HOME", &self.data)
-            .env("APPDATA", &self.data)
+            .env("HOME", self.temp.path())
+            .env_remove("APPDATA")
             .env_remove("LOCALAPPDATA");
         command
     }
