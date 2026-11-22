@@ -377,6 +377,122 @@ describe('workspace shell', () => {
     expect(deployApply).not.toHaveBeenCalled();
   });
 
+  it('keeps Apply disabled when a pending operation exists', async () => {
+    const user = userEvent.setup();
+    const status = {
+      ...statusWithEffects(),
+      pending: { ...fixtureOperation(), phase: 'applying' as const },
+    };
+    const deployApply = vi.fn(async () => ({ ok: true as const, result: fixtureOperation() }));
+    await renderReady({
+      status: async () => ({ ok: true, result: status }),
+      deployPreview: async () => ({ ok: true, result: reviewFor(status) }),
+      deployApply,
+    });
+
+    await user.click(screen.getByRole('button', { name: /Review deployment/ }));
+
+    const apply = await screen.findByRole('button', { name: /Apply deployment/ });
+    expect(apply).toBeDisabled();
+    await user.click(apply);
+    expect(deployApply).not.toHaveBeenCalled();
+  });
+
+  it('keeps Apply disabled when the review issued no plan ID', async () => {
+    const user = userEvent.setup();
+    const status = statusWithEffects();
+    const deployApply = vi.fn(async () => ({ ok: true as const, result: fixtureOperation() }));
+    await renderReady({
+      status: async () => ({ ok: true, result: status }),
+      deployPreview: async () => ({ ok: true, result: reviewFor(status, { id: null }) }),
+      deployApply,
+    });
+
+    await user.click(screen.getByRole('button', { name: /Review deployment/ }));
+
+    const apply = await screen.findByRole('button', { name: /Apply deployment/ });
+    expect(apply).toBeDisabled();
+    expect(screen.getByText(/none issued/)).toBeInTheDocument();
+    await user.click(apply);
+    expect(deployApply).not.toHaveBeenCalled();
+  });
+
+  it('keeps Apply disabled when the review has blockers', async () => {
+    const user = userEvent.setup();
+    const status = statusWithEffects();
+    const deployApply = vi.fn(async () => ({ ok: true as const, result: fixtureOperation() }));
+    await renderReady({
+      status: async () => ({ ok: true, result: status }),
+      deployPreview: async () => ({
+        ok: true,
+        result: reviewFor(status, { blockers: [{ code: 'Busy' }] }),
+      }),
+      deployApply,
+    });
+
+    await user.click(screen.getByRole('button', { name: /Review deployment/ }));
+
+    const apply = await screen.findByRole('button', { name: /Apply deployment/ });
+    expect(apply).toBeDisabled();
+    expect(screen.getByText(/A review with blockers cannot be applied/)).toBeInTheDocument();
+    await user.click(apply);
+    expect(deployApply).not.toHaveBeenCalled();
+  });
+
+  it('keeps Apply disabled while a status refresh is stale after a valid review', async () => {
+    const user = userEvent.setup();
+    const status = vi.fn<WorkspaceTransport['status']>();
+    status
+      .mockResolvedValueOnce({ ok: true as const, result: statusWithEffects() })
+      .mockResolvedValueOnce({ ok: false as const, error: { code: 'StalePlan' as const } });
+    const deployApply = vi.fn(async () => ({ ok: true as const, result: fixtureOperation() }));
+    await renderReady({
+      status,
+      deployPreview: async () => ({ ok: true, result: reviewFor(statusWithEffects()) }),
+      deployApply,
+    });
+
+    await user.click(screen.getByRole('button', { name: /Review deployment/ }));
+    expect(await screen.findByRole('button', { name: /Apply deployment/ })).toBeEnabled();
+
+    await user.click(screen.getByRole('button', { name: /Refresh status/ }));
+
+    expect(await screen.findByText(/previous authoritative state/)).toBeInTheDocument();
+    const apply = screen.getByRole('button', { name: /Apply deployment/ });
+    expect(apply).toBeDisabled();
+    await user.click(apply);
+    expect(deployApply).not.toHaveBeenCalled();
+  });
+
+  it('clears the review when the installation root changes', async () => {
+    const user = userEvent.setup();
+    const current = statusWithEffects();
+    const moved = {
+      ...current,
+      installation: { id: '9007199254740994', label: 'Other installation' },
+    };
+    const status = vi.fn<WorkspaceTransport['status']>();
+    status
+      .mockResolvedValueOnce({ ok: true as const, result: current })
+      .mockResolvedValueOnce({ ok: true as const, result: moved });
+    const deployApply = vi.fn(async () => ({ ok: true as const, result: fixtureOperation() }));
+    await renderReady({
+      status,
+      deployPreview: async () => ({ ok: true, result: reviewFor(current) }),
+      deployApply,
+    });
+
+    await user.click(screen.getByRole('button', { name: /Review deployment/ }));
+    expect(await screen.findByRole('button', { name: /Apply deployment/ })).toBeEnabled();
+
+    await user.click(screen.getByRole('button', { name: /Refresh status/ }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: /Apply deployment/ })).not.toBeInTheDocument();
+    });
+    expect(deployApply).not.toHaveBeenCalled();
+  });
+
   it('requires a new review after the profile revision changes', async () => {
     const user = userEvent.setup();
     const status = statusWithEffects();
@@ -407,7 +523,7 @@ describe('workspace shell', () => {
     expect(calls.filter((call) => call.command === 'deploy_apply')).toEqual([]);
   });
 
-  it('clears the review when Apply reports a stale plan', async () => {
+  it('clears the review and reloads status when Apply reports a stale plan', async () => {
     const user = userEvent.setup();
     const status = statusWithEffects();
     const deployApply = vi.fn(async () => ({
@@ -426,6 +542,37 @@ describe('workspace shell', () => {
     expect(await screen.findByText(/Not applied: StalePlan/)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Apply deployment/ })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Review deployment/ })).toBeEnabled();
+  });
+
+  it('reloads authoritative status and keeps the review-again hint after Apply fails', async () => {
+    const user = userEvent.setup();
+    const status = statusWithEffects();
+    const refreshed = {
+      ...status,
+      pending: { ...fixtureOperation(), phase: 'applying' as const },
+    };
+    const statusCall = vi.fn<WorkspaceTransport['status']>();
+    statusCall
+      .mockResolvedValueOnce({ ok: true as const, result: status })
+      .mockResolvedValueOnce({ ok: true as const, result: refreshed });
+    const deployApply = vi.fn(async () => ({
+      ok: false as const,
+      error: { code: 'RecoveryConflict' as const },
+    }));
+    await renderReady({
+      status: statusCall,
+      deployPreview: async () => ({ ok: true, result: reviewFor(status) }),
+      deployApply,
+    });
+
+    await user.click(screen.getByRole('button', { name: /Review deployment/ }));
+    await user.click(await screen.findByRole('button', { name: /Apply deployment/ }));
+
+    expect(await screen.findByText(/Not applied: RecoveryConflict/)).toBeInTheDocument();
+    expect(screen.getByText(/review the deployment again before applying/)).toBeInTheDocument();
+    await waitFor(() => expect(statusCall).toHaveBeenCalledTimes(2));
+    expect(screen.queryByRole('button', { name: /Apply deployment/ })).not.toBeInTheDocument();
+    expect(deployApply).toHaveBeenCalledTimes(1);
   });
 
   it('reloads authoritative status and operation on a progress gap without retrying', async () => {
@@ -543,7 +690,7 @@ describe('workspace shell', () => {
 
   it('shows NoActiveDeployment cleanly and never retries Restore', async () => {
     const user = userEvent.setup();
-    const status = statusWithEffects();
+    const status = { ...statusWithEffects(), activeGenerationId: null };
     const restore = vi.fn(async () => ({ ok: true as const, result: fixtureRestore() }));
     await renderReady({
       status: async () => ({ ok: true, result: status }),
@@ -556,6 +703,35 @@ describe('workspace shell', () => {
 
     expect(await screen.findByText('NoActiveDeployment')).toBeInTheDocument();
     expect(screen.getByText(/nothing was restored or changed/i)).toBeInTheDocument();
+    expect(restore).toHaveBeenCalledTimes(1);
+  });
+
+  it('reloads authoritative status and lets pending disable Restore after it fails', async () => {
+    const user = userEvent.setup();
+    const status = statusWithEffects();
+    const refreshed = {
+      ...status,
+      pending: { ...fixtureOperation(), phase: 'applying' as const },
+    };
+    const statusCall = vi.fn<WorkspaceTransport['status']>();
+    statusCall
+      .mockResolvedValueOnce({ ok: true as const, result: status })
+      .mockResolvedValueOnce({ ok: true as const, result: refreshed });
+    const restore = vi.fn(async () => ({
+      ok: false as const,
+      error: { code: 'RecoveryConflict' as const },
+    }));
+    await renderReady({ status: statusCall, restore });
+
+    const button = screen.getByRole('button', { name: /Restore deployment/ });
+    expect(button).toBeEnabled();
+    await user.click(button);
+
+    expect(await screen.findByText(/Restore not started: RecoveryConflict/)).toBeInTheDocument();
+    await waitFor(() => expect(statusCall).toHaveBeenCalledTimes(2));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Restore deployment/ })).toBeDisabled();
+    });
     expect(restore).toHaveBeenCalledTimes(1);
   });
 

@@ -1,9 +1,9 @@
 /**
  * Ordering check for progress hints.
  *
- * Hints are per operation and strictly monotonic. A duplicate or a gap means
- * delivery was interrupted, so the caller must reload authoritative
- * `status`/`operation`; it must never infer completion or retry a write.
+ * Hints are monotonic per operation. A duplicate or gap means delivery was
+ * interrupted, so the caller reloads authoritative state and never infers
+ * completion or retries a write. The app resets this baseline per write.
  */
 
 import type { Id, Progress } from './wire';

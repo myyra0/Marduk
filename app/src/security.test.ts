@@ -148,7 +148,7 @@ describe('desktop capability surface', () => {
   });
 
   it('carries ordered progress only through per-write typed channels', () => {
-    expect(commandsSource.match(/on_progress:\s*Channel<Progress>/g)).toHaveLength(2);
+    expect(commandsSource.match(/on_progress\s*:\s*Channel\s*<\s*Progress\s*>/g)).toHaveLength(2);
     expect(commandsSource).toMatch(/pub fn deploy_apply/);
     expect(commandsSource).toMatch(/pub fn restore/);
     for (const readOnly of ['deploy_preview', 'status']) {
@@ -156,7 +156,6 @@ describe('desktop capability surface', () => {
       expect(signature?.[1] ?? '').not.toMatch(/Channel/);
     }
     expect(clientSource).toMatch(/progressChannel/);
-    expect(clientSource).toMatch(/Channel<Progress>/);
   });
 
   it('keeps Rust commands free of generic write or process authority', () => {

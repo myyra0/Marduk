@@ -146,9 +146,8 @@ pub fn deploy_preview(at_revision: String, state: State<'_, DesktopState>) -> En
     ))
 }
 
-// Ordered progress is delivered only on deploy/restore channels, keyed by
-// operation and sequence. The effect port is not connected yet, so the channel
-// stays unused; clients still reload `status`/`operation` on gaps or reconnect.
+// Progress channels exist on writes only. Until the effect port emits, they
+// stay unused; clients reload authoritative state on gaps or reconnect.
 #[tauri::command(async)]
 pub fn deploy_apply(
     plan_id: String,

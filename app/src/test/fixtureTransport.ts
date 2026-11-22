@@ -51,7 +51,7 @@ export const fixturePreview = (): Preview => fixtureResult(previewFixture, parse
 export const fixtureOperation = (): Operation => fixtureResult(operationFixture, parseOperation);
 export const fixtureRestore = (): RestoreResult =>
   fixtureResult(restoreFixture, parseRestoreResult);
-export const fixtureProgress = (): Progress => fixtureResult(progressFixture, parseProgress);
+export const fixtureProgress = (): Progress => parseProgress(progressFixture, 'progress');
 
 function reordered(members: Member[], memberIds: readonly string[]): Member[] {
   const byId = new Map(members.map((member) => [member.id, member]));

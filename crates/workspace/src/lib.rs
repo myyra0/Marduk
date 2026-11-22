@@ -1167,7 +1167,10 @@ mod wire_fixture {
             ("operation.json", ok(operation_fixture())),
             ("prepared.json", ok(prepared_fixture())),
             ("preview.json", ok(preview_fixture())),
-            ("progress.json", ok(progress_fixture())),
+            (
+                "progress.json",
+                serde_json::to_value(progress_fixture()).unwrap(),
+            ),
             (
                 "restore-no-active.json",
                 ok(RestoreResult::NoActiveDeployment {

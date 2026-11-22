@@ -153,8 +153,9 @@ describe('Tauri transport', () => {
 
     await transport.deployApply('9007199254740997', (event) => received.push(event), faults);
 
-    channel.onmessage?.((progressFixture as any).result);
-    channel.onmessage?.({ ...(progressFixture as any).result, phase: 'sideways' });
+    const payload = progressFixture as Progress;
+    channel.onmessage?.(payload);
+    channel.onmessage?.({ ...payload, phase: 'sideways' } as unknown as Progress);
 
     expect(received).toEqual([
       {

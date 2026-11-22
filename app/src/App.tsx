@@ -35,6 +35,7 @@ export function App({ transport }: Props) {
   const [importName, setImportName] = useState('');
   const [review, setReview] = useState<Preview | null>(null);
   const [reviewError, setReviewError] = useState<WireError | null>(null);
+  const [reviewInvalidated, setReviewInvalidated] = useState(false);
   const [operationState, setOperationState] = useState<Operation | null>(null);
   const [restoreNoActive, setRestoreNoActive] = useState(false);
   const [progressHint, setProgressHint] = useState<Progress | null>(null);
@@ -60,6 +61,9 @@ export function App({ transport }: Props) {
         if (!mounted.current) return null;
         if (envelope.ok) {
           setState({ kind: 'ready', status: envelope.result, stale: false });
+          if (envelope.result.activeGenerationId !== null) {
+            setRestoreNoActive(false);
+          }
           setNotice(announce);
           return envelope.result;
         }
@@ -107,10 +111,7 @@ export function App({ transport }: Props) {
     [transport],
   );
 
-  /**
-   * Progress is delivery ordering, not state. A gap or duplicate reloads
-   * `status`/`operation`; it never retries the write or claims completion.
-   */
+  /** A gap or duplicate reloads authoritative state; it never retries the write. */
   const onProgress = useCallback(
     (hint: Progress) => {
       if (!mounted.current) return;
@@ -142,30 +143,37 @@ export function App({ transport }: Props) {
     void refresh();
   }, [refresh]);
 
+  type PerformOptions<T> = {
+    apply?: (result: T) => void | Promise<void>;
+    reject?: (error: WireError) => void;
+    rejectNotice?: (error: WireError) => string;
+    refreshOnReject?: (error: WireError) => string;
+  };
+
   async function perform<T>(
-    action: () => Promise<Envelope<T>>,
-    apply: (result: T) => void,
+    action: () => Promise<Envelope<T> | null>,
+    options: PerformOptions<T>,
   ): Promise<void> {
     setBusy(true);
     setNotice(null);
     try {
       const envelope = await action();
-      if (!mounted.current) return;
+      if (!mounted.current || envelope === null) return;
       if (envelope.ok) {
-        apply(envelope.result);
-      } else {
-        // A plan bound to another revision is dead; a stage change invalidates
-        // the archive as well. Neither may survive as an enabled Apply.
-        if (envelope.error.code === 'StalePlan' || envelope.error.code === 'StageChanged') {
-          setPrepared(null);
-        }
-        setNotice(`Not applied: ${describeBlocker(envelope.error)}`);
+        await options.apply?.(envelope.result);
+        return;
+      }
+      options.reject?.(envelope.error);
+      setNotice(
+        options.rejectNotice?.(envelope.error) ?? `Not applied: ${describeBlocker(envelope.error)}`,
+      );
+      if (options.refreshOnReject !== undefined) {
+        await refresh(options.refreshOnReject(envelope.error));
       }
     } catch (error) {
-      if (mounted.current) {
-        setNotice(describeFailure(error));
-        void refresh('Connection lost; authoritative state reloaded. No write was retried.');
-      }
+      if (!mounted.current) return;
+      setNotice(describeFailure(error));
+      await refresh('Connection lost; authoritative state reloaded. No write was retried.');
     } finally {
       if (mounted.current) setBusy(false);
     }
@@ -197,6 +205,7 @@ export function App({ transport }: Props) {
 
   const profileId = status?.profile.id;
   const profileRevision = status?.profile.revision;
+  const installationId = status?.installation?.id;
   useEffect(() => {
     setPrepared((current) => {
       if (current === null) return null;
@@ -206,11 +215,13 @@ export function App({ transport }: Props) {
     });
     setReview((current) => {
       if (current === null) return null;
-      return current.profileId === profileId && current.revision === profileRevision
+      return current.profileId === profileId &&
+        current.revision === profileRevision &&
+        current.installationId === installationId
         ? current
         : null;
     });
-  }, [profileId, profileRevision]);
+  }, [profileId, profileRevision, installationId]);
 
   const preparedIsCurrent =
     prepared !== null &&
@@ -222,7 +233,8 @@ export function App({ transport }: Props) {
     review !== null &&
     status !== null &&
     review.profileId === status.profile.id &&
-    review.revision === status.profile.revision;
+    review.revision === status.profile.revision &&
+    review.installationId === status.installation?.id;
 
   const canApplyDeployment =
     !blocked &&
@@ -234,34 +246,30 @@ export function App({ transport }: Props) {
     pending === null;
 
   async function chooseInstallation() {
-    setBusy(true);
-    setNotice(null);
-    try {
-      const picked = await transport.pickInstallation();
-      if (!mounted.current) return;
-      if (!picked.ok) {
-        setNotice(describeBlocker(picked.error));
-        return;
-      }
-      if (picked.result === null) {
-        setNotice('Installation selection cancelled.');
-        return;
-      }
-      const setup = await transport.setup(picked.result.selectionId);
-      if (!mounted.current) return;
-      if (!setup.ok) {
-        setNotice(describeBlocker(setup.error));
-        return;
-      }
-      setState({ kind: 'ready', status: setup.result, stale: false });
-      setPrepared(null);
-      setReview(null);
-      setNotice(null);
-    } catch (error) {
-      if (mounted.current) setNotice(describeFailure(error));
-    } finally {
-      if (mounted.current) setBusy(false);
-    }
+    await perform(
+      async () => {
+        const picked = await transport.pickInstallation();
+        if (!mounted.current) return null;
+        if (!picked.ok) {
+          setNotice(describeBlocker(picked.error));
+          return null;
+        }
+        if (picked.result === null) {
+          setNotice('Installation selection cancelled.');
+          return null;
+        }
+        return transport.setup(picked.result.selectionId);
+      },
+      {
+        apply: (next) => {
+          setState({ kind: 'ready', status: next, stale: false });
+          setPrepared(null);
+          setReview(null);
+          setReviewInvalidated(false);
+        },
+        rejectNotice: (error) => describeBlocker(error),
+      },
+    );
   }
 
   async function previewImport(current: WorkspaceStatus) {
@@ -272,37 +280,30 @@ export function App({ transport }: Props) {
       setNotice('Enter a mod name before previewing an archive.');
       return;
     }
-    setBusy(true);
-    setNotice(null);
     setPrepared(null);
-    try {
-      const picked = await transport.pickZip();
-      if (!mounted.current) return;
-      if (!picked.ok) {
-        setNotice(describeBlocker(picked.error));
-        return;
-      }
-      if (picked.result === null) {
-        setNotice('Archive selection cancelled.');
-        return;
-      }
-      const preview = await transport.importPreview(
-        picked.result.selectionId,
-        importName.trim(),
-        current.profile.revision,
-      );
-      if (!mounted.current) return;
-      if (!preview.ok) {
-        setNotice(describeBlocker(preview.error));
-        return;
-      }
-      setPrepared(preview.result);
-      setNotice(null);
-    } catch (error) {
-      if (mounted.current) setNotice(describeFailure(error));
-    } finally {
-      if (mounted.current) setBusy(false);
-    }
+    await perform(
+      async () => {
+        const picked = await transport.pickZip();
+        if (!mounted.current) return null;
+        if (!picked.ok) {
+          setNotice(describeBlocker(picked.error));
+          return null;
+        }
+        if (picked.result === null) {
+          setNotice('Archive selection cancelled.');
+          return null;
+        }
+        return transport.importPreview(
+          picked.result.selectionId,
+          importName.trim(),
+          current.profile.revision,
+        );
+      },
+      {
+        apply: (preview) => setPrepared(preview),
+        rejectNotice: (error) => describeBlocker(error),
+      },
+    );
   }
 
   async function applyImport() {
@@ -317,9 +318,18 @@ export function App({ transport }: Props) {
     }
     await perform(
       () => transport.importApply(prepared.id),
-      (snapshot) => {
-        applySnapshot(snapshot);
-        setPrepared(null);
+      {
+        apply: (snapshot) => {
+          applySnapshot(snapshot);
+          setPrepared(null);
+        },
+        // A plan tied to another revision is dead, as is the staged archive
+        // after a stage change; neither may stay behind an enabled Apply.
+        reject: (error) => {
+          if (error.code === 'StalePlan' || error.code === 'StageChanged') {
+            setPrepared(null);
+          }
+        },
       },
     );
   }
@@ -327,97 +337,79 @@ export function App({ transport }: Props) {
   async function reorder(memberIds: Id[]) {
     if (status === null) return;
     const revision: Revision = status.profile.revision;
-    await perform(() => transport.order(revision, memberIds), applySnapshot);
+    await perform(() => transport.order(revision, memberIds), { apply: applySnapshot });
   }
 
   async function reviewDeployment() {
     if (status === null) return;
-    setBusy(true);
-    setNotice(null);
     setReview(null);
     setReviewError(null);
-    try {
-      const envelope = await transport.deployPreview(status.profile.revision);
-      if (!mounted.current) return;
-      if (envelope.ok) {
-        setReview(envelope.result);
-      } else {
-        setReviewError(envelope.error);
-        setNotice(`Deployment preview blocked: ${describeBlocker(envelope.error)}`);
-      }
-    } catch (error) {
-      if (mounted.current) setNotice(describeFailure(error));
-    } finally {
-      if (mounted.current) setBusy(false);
-    }
+    setReviewInvalidated(false);
+    await perform(
+      () => transport.deployPreview(status.profile.revision),
+      {
+        apply: (next) => setReview(next),
+        reject: setReviewError,
+        rejectNotice: (error) => `Deployment preview blocked: ${describeBlocker(error)}`,
+      },
+    );
   }
 
   async function applyDeployment() {
     if (!canApplyDeployment || review === null || review.id === null) return;
     const planId = review.id;
-    setBusy(true);
-    setNotice(null);
-    // A new operation starts a new delivery baseline; a prior gap stays visible
-    // until this request replaces it.
+    // Each write gets a fresh delivery baseline; a prior gap or fault must not
+    // affect this operation.
+    stream.current = new ProgressStream();
     setProgressHint(null);
     setProgressIssue(null);
     setRestoreNoActive(false);
-    try {
-      const envelope = await transport.deployApply(planId, onProgress, onProgressFault);
-      if (!mounted.current) return;
-      if (envelope.ok) {
-        operationRef.current = envelope.result;
-        setOperationState(envelope.result);
-        setReview(null);
-        await refresh('Deployment accepted; authoritative state reloaded.');
-      } else {
-        if (envelope.error.code === 'StalePlan') {
+    await perform(
+      () => transport.deployApply(planId, onProgress, onProgressFault),
+      {
+        apply: async (operation) => {
+          operationRef.current = operation;
+          setOperationState(operation);
           setReview(null);
-        }
-        setNotice(`Not applied: ${describeBlocker(envelope.error)}`);
-      }
-    } catch {
-      if (mounted.current) {
-        setNotice('Connection lost; authoritative state reloaded. No write was retried.');
-        await refresh('Connection lost; authoritative state reloaded. No write was retried.');
-      }
-    } finally {
-      if (mounted.current) setBusy(false);
-    }
+          setReviewInvalidated(false);
+          await refresh('Deployment accepted; authoritative state reloaded.');
+        },
+        reject: () => {
+          setReview(null);
+          setReviewInvalidated(true);
+        },
+        refreshOnReject: (error) =>
+          `Not applied: ${describeBlocker(error)}; authoritative state reloaded.`,
+      },
+    );
   }
 
   async function restoreDeployment() {
     if (!restoreAvailable || blocked || pending !== null) return;
-    setBusy(true);
-    setNotice(null);
+    stream.current = new ProgressStream();
     setRestoreNoActive(false);
     setProgressHint(null);
     setProgressIssue(null);
-    try {
-      const envelope = await transport.restore(onProgress, onProgressFault);
-      if (!mounted.current) return;
-      if (envelope.ok) {
-        if (envelope.result.outcome === 'operation') {
-          operationRef.current = envelope.result.operation;
-          setOperationState(envelope.result.operation);
-        } else {
-          setRestoreNoActive(true);
-        }
-        await refresh();
-      } else if (envelope.error.code === 'NoActiveDeployment') {
-        setRestoreNoActive(true);
-        await refresh();
-      } else {
-        setNotice(`Restore not started: ${describeBlocker(envelope.error)}`);
-      }
-    } catch {
-      if (mounted.current) {
-        setNotice('Connection lost; authoritative state reloaded. No write was retried.');
-        await refresh('Connection lost; authoritative state reloaded. No write was retried.');
-      }
-    } finally {
-      if (mounted.current) setBusy(false);
-    }
+    await perform(
+      () => transport.restore(onProgress, onProgressFault),
+      {
+        apply: async (result) => {
+          if (result.outcome === 'operation') {
+            operationRef.current = result.operation;
+            setOperationState(result.operation);
+          } else {
+            setRestoreNoActive(true);
+          }
+          await refresh();
+        },
+        reject: (error) => {
+          if (error.code === 'NoActiveDeployment') setRestoreNoActive(true);
+        },
+        rejectNotice: (error) => `Restore not started: ${describeBlocker(error)}`,
+        refreshOnReject: (error) =>
+          `Restore not started: ${describeBlocker(error)}; authoritative state reloaded.`,
+      },
+    );
   }
 
   async function reconnect() {
@@ -507,8 +499,8 @@ export function App({ transport }: Props) {
             <AvailabilityRow label="Deploy" availability={status.availability.deploy} />
             <AvailabilityRow label="Restore" availability={status.availability.restore} />
             <p className="hint">
-              Blocked operations stay disabled. No native effect or durability port is connected
-              here, so Apply and Restore cannot run.
+              Blocked operations stay disabled. Apply and Restore need a native effect port that is
+              not connected yet.
             </p>
           </section>
 
@@ -588,9 +580,7 @@ export function App({ transport }: Props) {
               </button>
             </div>
             <p className="hint">
-              Review reads the exact profile revision and shows the winner, target, candidates and
-              original-backup need. Apply sends only the reviewed plan ID, and only while
-              authoritative availability permits it.
+              Review the current revision before applying. Apply sends only the reviewed plan ID.
             </p>
 
             {reviewError !== null && (
@@ -685,6 +675,12 @@ export function App({ transport }: Props) {
               </div>
             )}
 
+            {reviewInvalidated && (
+              <p className="hint">
+                The review is no longer valid; review the deployment again before applying.
+              </p>
+            )}
+
             {review === null && deployBlocker !== null && (
               <p>
                 <span className="badge badge--blocked">Apply unavailable</span>{' '}
@@ -725,8 +721,7 @@ export function App({ transport }: Props) {
               </p>
             )}
             <p className="hint">
-              Restore acts only on the recorded generation; a changed configured path cannot
-              retarget it. It is never retried automatically.
+              Restore targets the recorded generation only and is never retried automatically.
             </p>
           </section>
 
@@ -751,9 +746,8 @@ export function App({ transport }: Props) {
                 <OperationSummary operation={operationState} title="Authoritative operation" />
               )}
               <p className="hint">
-                Progress events are delivery hints only. Completion and conflicts come from
-                authoritative status. No Cancel control is offered once a public write may have
-                started.
+                Progress is a delivery hint; completion and conflicts come from status. A started
+                write cannot be cancelled here.
               </p>
             </section>
           )}
@@ -765,8 +759,7 @@ export function App({ transport }: Props) {
               {status.activeGenerationId === null ? 'none' : <code>{status.activeGenerationId}</code>}
             </p>
             <p className="hint">
-              Recovery conflicts are shown from authoritative status; they never claim a restore
-              succeeded.
+              Conflicts come from authoritative status; nothing here claims a restore succeeded.
             </p>
           </section>
         </>

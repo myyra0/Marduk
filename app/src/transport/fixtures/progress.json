@@ -1,8 +1,5 @@
 {
-  "ok": true,
-  "result": {
-    "operationId": "9223372036854775801",
-    "phase": "applying",
-    "sequence": "9007199254741009"
-  }
+  "operationId": "9223372036854775801",
+  "phase": "applying",
+  "sequence": "9007199254741009"
 }

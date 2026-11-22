@@ -67,15 +67,18 @@ describe('Rust-generated wire fixtures', () => {
       ok: true,
       result: { outcome: 'noActiveDeployment', code: 'NoActiveDeployment' },
     });
+  });
 
-    const progress = parseEnvelope(progressFixture, parseProgress);
-    expect(progress).toEqual({
-      ok: true,
-      result: {
-        operationId: '9223372036854775801',
-        sequence: '9007199254741009',
-        phase: 'applying',
-      },
+  it('parses the bare progress channel payload', () => {
+    expect(progressFixture).toEqual({
+      operationId: '9223372036854775801',
+      sequence: '9007199254741009',
+      phase: 'applying',
+    });
+    expect(parseProgress(progressFixture)).toEqual({
+      operationId: '9223372036854775801',
+      sequence: '9007199254741009',
+      phase: 'applying',
     });
   });
 
