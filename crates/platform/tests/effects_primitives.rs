@@ -105,6 +105,69 @@ fn publish_refuses_an_existing_target_and_leaves_it_intact() {
     assert_eq!(fingerprint_path(&stage_path).unwrap(), staged);
 }
 
+/// A target that denies attribute writes must fail the exchange before either
+/// name moves. The read handle still works, so a preview can admit the file;
+/// only the timestamp authority is withheld.
+#[cfg(windows)]
+#[test]
+fn replace_refuses_a_denied_attribute_write_before_moving_anything() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::process::Command;
+    use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
+
+    let directory = tempfile::tempdir().unwrap();
+    let stage_directory = directory.path().join("stage-directory");
+    let target_directory = directory.path().join("target-directory");
+    fs::create_dir(&stage_directory).unwrap();
+    fs::create_dir(&target_directory).unwrap();
+    let stage_path = stage_directory.join("stage");
+    let target_path = target_directory.join("leaf");
+    fs::write(&stage_path, STAGED).unwrap();
+    fs::write(&target_path, ORIGINAL).unwrap();
+
+    let acl = |arguments: &[&str]| {
+        Command::new("icacls")
+            .arg(&target_path)
+            .args(arguments)
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    if !acl(&["/deny", "*S-1-1-0:(WA)"]) {
+        eprintln!("skipped: this environment cannot deny FILE_WRITE_ATTRIBUTES");
+        return;
+    }
+    if std::fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .open(&target_path)
+        .is_ok()
+    {
+        assert!(acl(&["/remove:d", "*S-1-1-0"]));
+        eprintln!("skipped: an ordinary token still holds FILE_WRITE_ATTRIBUTES");
+        return;
+    }
+
+    let stage = open_directory(&stage_directory).unwrap();
+    let target = open_directory(&target_directory).unwrap();
+    let result = replace(
+        &stage,
+        "stage",
+        &target,
+        "leaf",
+        &stage_path,
+        &target_path,
+        &stage_path,
+    );
+    assert!(result.is_err(), "a denied attribute write must fail");
+    assert_eq!(fs::read(&target_path).unwrap(), ORIGINAL);
+    assert_eq!(fs::read(&stage_path).unwrap(), STAGED);
+    assert!(!stage_directory.join("displaced").exists(), "no name moved");
+
+    assert!(acl(&["/remove:d", "*S-1-1-0"]));
+}
+
+/// NTFS tunneling gives a rename into a just-vacated name the removed entry's
+/// creation time; `replace` restores the staged birth time after its renames,
+/// so identity must still match field for field.
 #[test]
 fn replace_retains_the_displaced_file_and_keeps_the_staged_object() {
     let directory = tempfile::tempdir().unwrap();
