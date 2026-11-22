@@ -318,6 +318,12 @@ fn refuse_widened_dacl(mask: u32) {
             sid_len as usize,
         );
     }
+    // `InitializeAcl` leaves AceCount at zero; an ACL with no ACEs grants
+    // nothing and would make the guard a no-op. Record the one ACE we built.
+    unsafe {
+        (*acl.as_mut_ptr().cast::<ACL>()).AceCount = 1;
+        (*acl.as_mut_ptr().cast::<ACL>()).AclSize = acl_len as u16;
+    }
     let path: Vec<u16> = source.as_os_str().encode_wide().chain([0]).collect();
     assert_eq!(
         unsafe {
@@ -333,6 +339,46 @@ fn refuse_widened_dacl(mask: u32) {
         },
         0,
         "could not widen the source DACL"
+    );
+
+    let mut owner: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut group: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut dacl: *mut windows_sys::Win32::Security::ACL = std::ptr::null_mut();
+    let mut sacl: *mut windows_sys::Win32::Security::ACL = std::ptr::null_mut();
+    let mut sd: *mut std::ffi::c_void = std::ptr::null_mut();
+    let path: Vec<u16> = source.as_os_str().encode_wide().chain([0]).collect();
+    assert_eq!(
+        unsafe {
+            windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW(
+                path.as_ptr(),
+                windows_sys::Win32::Security::Authorization::SE_FILE_OBJECT,
+                windows_sys::Win32::Security::DACL_SECURITY_INFORMATION,
+                &mut owner,
+                &mut group,
+                &mut dacl,
+                &mut sacl,
+                &mut sd,
+            )
+        },
+        0,
+        "could not read the source DACL back"
+    );
+    assert!(!dacl.is_null(), "the source DACL is absent");
+    assert_eq!(
+        unsafe { (*dacl).AceCount },
+        1,
+        "the source DACL must contain exactly one ACE"
+    );
+    let mut ace_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    assert_ne!(
+        unsafe { windows_sys::Win32::Security::GetAce(dacl, 0, &mut ace_ptr) },
+        0
+    );
+    let ace = unsafe { &*(ace_ptr.cast::<windows_sys::Win32::Security::ACCESS_ALLOWED_ACE>()) };
+    assert_ne!(
+        ace.Mask & mask,
+        0,
+        "the read-back ACE must carry the write bits under test"
     );
 
     let error =
