@@ -225,8 +225,8 @@ fn volume_qualification_reads_the_opened_root() {
     {
         match filesystem_name(directory.path()).as_deref() {
             Some(name) if name.eq_ignore_ascii_case("NTFS") => assert!(
-                !volume_qualified(directory.path()),
-                "NTFS alone is not deploy-level qualification; the gate stays closed"
+                volume_qualified(directory.path()),
+                "the record proves NTFS composition"
             ),
             Some(name) => {
                 // exFAT/FAT32/ReFS volumes cannot be constructed portably here.

@@ -202,7 +202,7 @@ pub const PROOFS: &[Proof] = &[
         layer: Layer::Catalog,
         witnesses: &["windows_catalog_stages_a_payload_beside_its_root_pin"],
         date: "2026-11-22",
-        revision: "pending",
+        revision: "62b9b94b",
     },
     Proof {
         capability: Capability::LibraryStaging,
@@ -324,7 +324,7 @@ pub const PROOFS: &[Proof] = &[
         layer: Layer::Composition,
         witnesses: &["qualified_native_round_trip_retains_backups_and_restores_the_original_tree"],
         date: "2026-11-22",
-        revision: "pending",
+        revision: "62b9b94b",
     },
     Proof {
         capability: Capability::NativeEffects,

@@ -2593,16 +2593,25 @@ mod root {
         };
         use windows_sys::Win32::Storage::FileSystem::{FILE_ALL_ACCESS, FILE_GENERIC_READ};
 
-        /// A 4-byte-aligned local SID with one subauthority.
-        fn sid(subauth: u32) -> Vec<u32> {
-            let mut words = vec![0u32; 3];
+        /// A 4-byte-aligned SID in the NT authority with the given
+        /// subauthorities.
+        fn sid_nt(subauths: &[u32]) -> Vec<u32> {
+            let length = 8 + subauths.len() * 4;
+            let mut words = vec![0u32; length.div_ceil(size_of::<u32>())];
             let bytes =
-                unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), 12) };
+                unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), length) };
             bytes[0] = 1; // SID_REVISION
-            bytes[1] = 1; // one subauthority
+            bytes[1] = subauths.len() as u8;
             bytes[7] = 5; // SECURITY_NT_AUTHORITY, big-endian
-            bytes[8..12].copy_from_slice(&subauth.to_le_bytes());
+            for (index, subauth) in subauths.iter().enumerate() {
+                bytes[8 + index * 4..12 + index * 4].copy_from_slice(&subauth.to_le_bytes());
+            }
             words
+        }
+
+        /// A one-subauthority NT SID, such as `18` for Local System.
+        fn sid(subauth: u32) -> Vec<u32> {
+            sid_nt(&[subauth])
         }
 
         /// `slack` extra words are allocated inside `AclSize`, so the stored
@@ -2706,11 +2715,16 @@ mod root {
         #[test]
         fn changed_owner_hashes_differently() {
             let group = sid(18);
+            let system = sid(18);
+            // BUILTIN\Administrators, the elevated token's default owner. It is
+            // a different well-known SID from Local System, so the comparison
+            // cannot resolve to one owner through the token.
+            let administrators = sid_nt(&[32, 544]);
             let user = sid(544);
             let acl = acl(&[(0, FILE_ALL_ACCESS, &user)], 0);
 
-            let mut first = descriptor(&sid(18), &group, &acl);
-            let mut second = descriptor(&sid(544), &group, &acl);
+            let mut first = descriptor(&system, &group, &acl);
+            let mut second = descriptor(&administrators, &group, &acl);
             assert_ne!(digest(&mut first), digest(&mut second));
         }
     }
