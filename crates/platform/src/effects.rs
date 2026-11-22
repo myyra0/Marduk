@@ -24,25 +24,61 @@ pub fn directory_identity(path: &std::path::Path) -> Result<RootIdentity, RootEr
 
 /// Open a verified directory handle. The handle pins the directory; callers use
 /// it for handle-relative effects.
+#[cfg(target_os = "linux")]
 pub fn open_directory(path: &std::path::Path) -> Result<File, RootError> {
     crate::native::open_directory(path)
 }
 
+/// Open a directory handle for the Win32 effect paths. A directory needs backup
+/// semantics to be opened as a handle.
+#[cfg(windows)]
+pub fn open_directory(path: &std::path::Path) -> Result<File, RootError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .map_err(|_| RootError::TargetUnavailable)
+}
+
 /// Open an existing regular file without following a final link.
+#[cfg(target_os = "linux")]
 pub fn open_file(path: &std::path::Path) -> Result<File, RootError> {
     crate::native::open_file(path)
+}
+
+#[cfg(windows)]
+pub fn open_file(path: &std::path::Path) -> Result<File, RootError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|_| RootError::TargetUnavailable)
 }
 
 /// Flush a directory namespace change to stable storage. Windows has no
 /// documented ordinary-token directory barrier and reports the configuration
 /// unsupported.
+#[cfg(target_os = "linux")]
 pub fn sync_directory(path: &std::path::Path) -> Result<(), RootError> {
     crate::native::sync_directory(path)
 }
 
+#[cfg(windows)]
+pub fn sync_directory(_path: &std::path::Path) -> Result<(), RootError> {
+    Err(RootError::UnsupportedTarget(
+        marduk_core::root_identity::UnsupportedReason::Configuration,
+    ))
+}
+
 /// Move `stage_dir/stage_name` onto `target_dir/leaf` only when the target name
 /// is absent. An existing target is never replaced.
-#[cfg_attr(not(windows), allow(unused_variables))]
+#[allow(unused_variables)]
 pub fn publish(
     stage_dir: &File,
     stage_name: &str,
@@ -70,7 +106,7 @@ pub fn publish(
 /// Exchange `stage_dir/stage_name` with `target_dir/leaf`, so the target name
 /// holds the staged bytes and the stage slot holds the actually displaced file.
 /// A missing target fails the exchange; bytes are never discarded.
-#[cfg_attr(not(windows), allow(unused_variables))]
+#[allow(unused_variables)]
 pub fn replace(
     stage_dir: &File,
     stage_name: &str,
@@ -98,7 +134,7 @@ pub fn replace(
 
 /// Move the existing target at `target_dir/leaf` into `displaced_dir` without
 /// replacing anything there. The target's bytes are preserved, not deleted.
-#[cfg_attr(not(windows), allow(unused_variables))]
+#[allow(unused_variables)]
 pub fn detach(
     target_dir: &File,
     leaf: &str,
