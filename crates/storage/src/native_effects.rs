@@ -234,9 +234,7 @@ impl NativeEffects {
     /// immediately before the call while the original handle stays open and
     /// keeps denying delete sharing. Reopening the parent here would release
     /// that pin and admit replacement. The re-proof-to-syscall window is the
-    /// accepted final-window substitution; Windows deploy cannot run yet
-    /// because the durability barrier refuses every configuration, so this
-    /// branch is not witnessed until Windows deploy is qualified.
+    /// accepted final-window substitution.
     fn effect_directory(
         target_directory: File,
         target_path: &Path,
@@ -803,20 +801,22 @@ impl NativeEffects {
         for name in ["stage", "displaced", "original", "step"] {
             let path = directory.join(name);
             if fs::symlink_metadata(&path).is_ok() {
-                let file = effects::open_file(&path)?;
-                file.sync_all().map_err(|_| RootError::Io)?;
+                effects::sync_file(&path)?;
             }
         }
         if let Observation::Regular(_) = self.observe_bound(&step.spec.target) {
-            let file = effects::open_file(&self.target_path(&step.spec.target))?;
-            file.sync_all().map_err(|_| RootError::Io)?;
+            effects::sync_file(&self.target_path(&step.spec.target))?;
         }
         self.sync_directory_chain(&directory)?;
         // The changed target parent is part of the barrier. A failed
         // re-resolution or open must not leave the effect reported durable.
         let resolved = self.resolved(&step.spec.target)?;
         let target_directory = resolved.parent_dir()?;
-        target_directory.sync_all().map_err(|_| RootError::Io)?;
+        let target_path = self.target_path(&step.spec.target);
+        effects::sync_bound_directory(
+            &target_directory,
+            target_path.parent().ok_or(RootError::TargetUnavailable)?,
+        )?;
         Ok(())
     }
 }
@@ -1027,12 +1027,10 @@ impl CopyEffects for NativeEffects {
         if current != *observed {
             return BarrierOutcome::Ambiguous(current);
         }
-        if cfg!(windows) {
-            // No documented non-admin Windows namespace barrier is qualified.
-            return BarrierOutcome::Unavailable(RootError::UnsupportedTarget(
-                UnsupportedReason::Configuration,
-            ));
-        }
+        // Windows flushes the staged file and the changed parent directory with
+        // the standard calls and re-observes; it does not claim that a power cut
+        // leaves the namespace recoverable (ADR 0004). A flush failure is
+        // `Unavailable`; changed evidence is `Ambiguous`, never `Durable`.
         if let Err(error) = self.sync_effect(step) {
             return BarrierOutcome::Unavailable(error);
         }

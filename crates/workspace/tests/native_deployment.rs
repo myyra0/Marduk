@@ -1,18 +1,20 @@
 //! End-to-end native deployment through the workspace's synthetic proof lane.
 //!
 //! The installation and library are disposable trees under `TMPDIR`. Run with
-//! `--ignored` and a `TMPDIR` on tmpfs or Btrfs.
-
-#![cfg(target_os = "linux")]
+//! `--ignored` and a `TMPDIR` on a qualified volume (tmpfs or Btrfs on Linux,
+//! NTFS on Windows).
 
 #[allow(dead_code)]
 #[path = "../../archive/tests/fixtures/mod.rs"]
 mod zip_fixture;
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::ffi::CString;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -36,7 +38,9 @@ const OUTSIDE: &[u8] = b"user\n";
 // The admitted original and the staged payload deliberately differ in every
 // scoped metadata field Restore must reproduce, so equal fingerprints on
 // identical fixtures cannot stand in for preservation.
+#[cfg(unix)]
 const ORIGINAL_MODE: u32 = 0o640;
+#[cfg(unix)]
 const STAGED_MODE: u32 = 0o600;
 const ORIGINAL_MTIME: (u64, u32) = (1_500_000_000, 123_456_789);
 const STAGED_MTIME: (u64, u32) = (1_600_000_000, 987_654_321);
@@ -45,6 +49,7 @@ fn stamped((seconds, nanos): (u64, u32)) -> SystemTime {
     UNIX_EPOCH + Duration::new(seconds, nanos)
 }
 
+#[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
@@ -55,10 +60,12 @@ fn set_mtime(path: &Path, time: SystemTime) {
         .unwrap();
 }
 
+#[cfg(unix)]
 fn mode_of(path: &Path) -> u32 {
     fs::metadata(path).unwrap().permissions().mode() & 0o7777
 }
 
+#[cfg(unix)]
 fn mtime_of(path: &Path) -> (u64, u32) {
     let modified = fs::metadata(path)
         .unwrap()
@@ -69,11 +76,13 @@ fn mtime_of(path: &Path) -> (u64, u32) {
     (modified.as_secs(), modified.subsec_nanos())
 }
 
+#[cfg(unix)]
 fn owner_of(path: &Path) -> (u32, u32) {
     let metadata = fs::metadata(path).unwrap();
     (metadata.uid(), metadata.gid())
 }
 
+#[cfg(unix)]
 fn set_xattr(path: &Path, name: &std::ffi::CStr, value: &[u8]) -> std::io::Result<()> {
     let path = CString::new(path.as_os_str().as_bytes()).unwrap();
     let result = unsafe {
@@ -150,6 +159,7 @@ impl Fixture {
         fs::write(game.join("Data/outside-plan.txt"), OUTSIDE).unwrap();
         // The install target carries metadata the staged payload does not.
         let winner = game.join("Data/textures/winner.dds");
+        #[cfg(unix)]
         set_mode(&winner, ORIGINAL_MODE);
         set_mtime(&winner, stamped(ORIGINAL_MTIME));
         let initial = tree(&game);
@@ -239,6 +249,7 @@ impl Fixture {
 
     /// Replace the app-data root with a link the effect probe refuses. Open
     /// handles keep working; only a new port asks for the volume class.
+    #[cfg(unix)]
     fn make_root_unqualified(&self) -> PathBuf {
         let real = self.temp.path().join("app-real");
         fs::rename(&self.app, &real).unwrap();
@@ -266,8 +277,10 @@ fn qualified_native_round_trip_retains_backups_and_restores_the_original_tree() 
     // the copy must carry the payload's mode and time, and Restore must bring
     // back the original's. Both values are asserted exactly below.
     let staged_winner = fixture.staged_winner();
+    #[cfg(unix)]
     set_mode(&staged_winner, STAGED_MODE);
     set_mtime(&staged_winner, stamped(STAGED_MTIME));
+    #[cfg(unix)]
     eprintln!(
         "metadata before apply: target mode {:04o} mtime {:?} uid/gid {:?}; \
          staged mode {:04o} mtime {:?}",
@@ -277,6 +290,7 @@ fn qualified_native_round_trip_retains_backups_and_restores_the_original_tree() 
         mode_of(&staged_winner),
         mtime_of(&staged_winner),
     );
+    #[cfg(unix)]
     assert_ne!(ORIGINAL_MODE, STAGED_MODE);
     assert_ne!(ORIGINAL_MTIME, STAGED_MTIME);
 
@@ -307,23 +321,26 @@ fn qualified_native_round_trip_retains_backups_and_restores_the_original_tree() 
     // mask a byte failure, and vice versa. The target now carries the staged
     // payload's mode, uid/gid, mtime and bytes, not the displaced original's.
     assert_eq!(fs::read(&deployed_winner).unwrap(), POST);
-    assert_eq!(
-        mode_of(&deployed_winner),
-        STAGED_MODE,
-        "apply publishes the staged payload's mode"
-    );
-    assert_eq!(
-        mtime_of(&deployed_winner),
-        STAGED_MTIME,
-        "apply publishes the staged payload's mtime"
-    );
-    assert_eq!(owner_of(&deployed_winner), owner_of(&staged_winner));
-    eprintln!(
-        "metadata after apply: mode {:04o} mtime {:?} uid/gid {:?}",
-        mode_of(&deployed_winner),
-        mtime_of(&deployed_winner),
-        owner_of(&deployed_winner),
-    );
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            mode_of(&deployed_winner),
+            STAGED_MODE,
+            "apply publishes the staged payload's mode"
+        );
+        assert_eq!(
+            mtime_of(&deployed_winner),
+            STAGED_MTIME,
+            "apply publishes the staged payload's mtime"
+        );
+        assert_eq!(owner_of(&deployed_winner), owner_of(&staged_winner));
+        eprintln!(
+            "metadata after apply: mode {:04o} mtime {:?} uid/gid {:?}",
+            mode_of(&deployed_winner),
+            mtime_of(&deployed_winner),
+            owner_of(&deployed_winner),
+        );
+    }
 
     // The status ref for the replaced ordinal must name the actually displaced
     // object, not only the pre-image copy. The sealed retain location is the
@@ -359,20 +376,23 @@ fn qualified_native_round_trip_retains_backups_and_restores_the_original_tree() 
         BASE,
         "the actually displaced object is retained with its original bytes"
     );
-    assert_eq!(
-        mode_of(&sealed),
-        ORIGINAL_MODE,
-        "the retained displaced original keeps its mode"
-    );
-    assert_eq!(
-        mtime_of(&sealed),
-        ORIGINAL_MTIME,
-        "the retained displaced original keeps its mtime"
-    );
-    assert_eq!(
-        owner_of(&sealed),
-        owner_of(&fixture.game.join("Data/textures/winner.dds"))
-    );
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            mode_of(&sealed),
+            ORIGINAL_MODE,
+            "the retained displaced original keeps its mode"
+        );
+        assert_eq!(
+            mtime_of(&sealed),
+            ORIGINAL_MTIME,
+            "the retained displaced original keeps its mtime"
+        );
+        assert_eq!(
+            owner_of(&sealed),
+            owner_of(&fixture.game.join("Data/textures/winner.dds"))
+        );
+    }
 
     // Each intent's original backup is the exact pre-deploy artifact; a new
     // file has no original slot.
@@ -433,22 +453,25 @@ fn qualified_native_round_trip_retains_backups_and_restores_the_original_tree() 
     // deployed object's: the two differ on both axes.
     let restored_winner = fixture.game.join("Data/textures/winner.dds");
     assert_eq!(fs::read(&restored_winner).unwrap(), BASE);
-    assert_eq!(
-        mode_of(&restored_winner),
-        ORIGINAL_MODE,
-        "restore brings back the original mode"
-    );
-    assert_eq!(
-        mtime_of(&restored_winner),
-        ORIGINAL_MTIME,
-        "restore brings back the original mtime"
-    );
-    eprintln!(
-        "metadata after restore: mode {:04o} mtime {:?} uid/gid {:?}",
-        mode_of(&restored_winner),
-        mtime_of(&restored_winner),
-        owner_of(&restored_winner),
-    );
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            mode_of(&restored_winner),
+            ORIGINAL_MODE,
+            "restore brings back the original mode"
+        );
+        assert_eq!(
+            mtime_of(&restored_winner),
+            ORIGINAL_MTIME,
+            "restore brings back the original mtime"
+        );
+        eprintln!(
+            "metadata after restore: mode {:04o} mtime {:?} uid/gid {:?}",
+            mode_of(&restored_winner),
+            mtime_of(&restored_winner),
+            owner_of(&restored_winner),
+        );
+    }
 
     // Restore consumes the object it displaced into its own sealed retain
     // location; its status ref must resolve to the deployed bytes.
@@ -489,6 +512,7 @@ fn qualified_native_round_trip_retains_backups_and_restores_the_original_tree() 
     assert_eq!(tree(&fixture.game), fixture.initial);
 }
 
+#[cfg(unix)]
 #[test]
 #[ignore = "requires TMPDIR on tmpfs or Btrfs"]
 fn visible_xattr_on_an_original_is_refused_before_any_write() {
@@ -546,6 +570,7 @@ fn visible_xattr_on_an_original_is_refused_before_any_write() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 #[ignore = "requires TMPDIR on tmpfs or Btrfs"]
 fn unqualified_root_answers_a_claimed_plan_and_pending_restore() {
@@ -591,6 +616,7 @@ fn unqualified_root_answers_a_claimed_plan_and_pending_restore() {
     assert!(matches!(operation.kind, Kind::Restore));
 }
 
+#[cfg(unix)]
 #[test]
 #[ignore = "requires TMPDIR on tmpfs or Btrfs"]
 fn clean_unqualified_root_answers_before_opening_a_native_port() {
@@ -611,6 +637,7 @@ fn clean_unqualified_root_answers_before_opening_a_native_port() {
     assert!(fixture.workspace.proof_recover_pending().unwrap().is_none());
 }
 
+#[cfg(unix)]
 #[test]
 #[ignore = "requires TMPDIR on tmpfs or Btrfs"]
 fn dispatch_deploy_and_restore_through_the_whole_composition() {
@@ -719,6 +746,7 @@ fn dispatch_deploy_and_restore_through_the_whole_composition() {
     assert_eq!(tree(&fixture.game), fixture.initial);
 }
 
+#[cfg(unix)]
 #[test]
 #[ignore = "requires TMPDIR on tmpfs or Btrfs"]
 fn unqualified_installation_root_keeps_client_deploy_and_restore_refused() {

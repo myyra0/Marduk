@@ -590,6 +590,13 @@ export function App({ transport }: Props) {
             <AvailabilityRow label="Import staging" availability={status.availability.import} />
             <AvailabilityRow label="Deploy" availability={status.availability.deploy} />
             <AvailabilityRow label="Restore" availability={status.availability.restore} />
+            {deployAvailable && isWindowsPlatform() && (
+              <p className="hint" role="note">
+                On Windows, writes use standard Windows flushing. An interrupted deploy may leave
+                the game folder needing review; Marduk reports what it found rather than claiming
+                success.
+              </p>
+            )}
             {effectsBlocker !== null && (
               <p className="hint">
                 Blocked operations stay disabled. <code>{describeBlocker(effectsBlocker)}</code>
@@ -867,6 +874,12 @@ export function App({ transport }: Props) {
       )}
     </main>
   );
+}
+
+// The desktop shell runs on Windows and Linux; the user-agent check only picks
+// which platform note to show. It is not a capability decision.
+function isWindowsPlatform(): boolean {
+  return /Windows/i.test(navigator.userAgent);
 }
 
 function AvailabilityRow({ label, availability }: { label: string; availability: Availability }) {

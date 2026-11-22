@@ -122,6 +122,48 @@ describe('workspace shell', () => {
     expect(screen.queryByText(/native effect port/)).not.toBeInTheDocument();
   });
 
+  it('tells Windows users about standard flushing when deploy is available', async () => {
+    const userAgent = vi
+      .spyOn(window.navigator, 'userAgent', 'get')
+      .mockReturnValue('Mozilla/5.0 (Windows NT 10.0; Win64; x64)');
+    try {
+      await renderReady({ status: async () => ({ ok: true, result: statusWithEffects() }) });
+
+      expect(screen.getByRole('note')).toHaveTextContent(/standard Windows flushing/i);
+      expect(screen.getByRole('note')).toHaveTextContent(/interrupted deploy/i);
+    } finally {
+      userAgent.mockRestore();
+    }
+  });
+
+  it('hides the Windows flushing note on Linux', async () => {
+    const userAgent = vi
+      .spyOn(window.navigator, 'userAgent', 'get')
+      .mockReturnValue('Mozilla/5.0 (X11; Linux x86_64)');
+    try {
+      await renderReady({ status: async () => ({ ok: true, result: statusWithEffects() }) });
+
+      expect(screen.queryByRole('note')).not.toBeInTheDocument();
+      expect(screen.queryByText(/standard Windows flushing/i)).not.toBeInTheDocument();
+    } finally {
+      userAgent.mockRestore();
+    }
+  });
+
+  it('hides the Windows flushing note when deploy is blocked', async () => {
+    const userAgent = vi
+      .spyOn(window.navigator, 'userAgent', 'get')
+      .mockReturnValue('Mozilla/5.0 (Windows NT 10.0; Win64; x64)');
+    try {
+      await renderReady();
+
+      expect(screen.queryByRole('note')).not.toBeInTheDocument();
+      expect(screen.queryByText(/standard Windows flushing/i)).not.toBeInTheDocument();
+    } finally {
+      userAgent.mockRestore();
+    }
+  });
+
   it('shows the recorded pending operation and retained recovery state', async () => {
     await renderReady();
 

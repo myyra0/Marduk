@@ -1160,8 +1160,8 @@ fn phase(phase: Phase) -> &'static str {
 /// The availability record answers for the installation root's volume class: a
 /// `NativeEffects`/`Deploy` proof at the composition rung or above. The
 /// client-visible rung is recorded after the first real run, so it cannot be a
-/// precondition here; crash evidence is deferred work. Windows has no proof on
-/// NTFS and stays refused. There is no runtime override.
+/// precondition here; crash evidence is deferred work. There is no runtime
+/// override.
 fn native_effects_gate(installation_root: Option<&Path>) -> Result<(), WireError> {
     match installation_root {
         Some(root) if marduk_platform::deploy_volume_qualified(root) => Ok(()),
