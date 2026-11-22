@@ -1014,6 +1014,10 @@ fn mixed_case_archive_target_merges_with_the_existing_spelling() {
         BASE,
         "restore brings back the pre-deploy bytes"
     );
+    // On a case-insensitive filesystem `Data/Textures` and `Data/textures` are
+    // the same directory, so this can only assert anything on a case-sensitive
+    // one. The duplicate-path assertion above already runs everywhere.
+    #[cfg(unix)]
     assert!(
         !fixture.game.join("Data/Textures").exists(),
         "restore must not leave the archive spelling on disk"
