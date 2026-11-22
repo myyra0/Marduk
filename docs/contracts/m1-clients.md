@@ -1,6 +1,6 @@
 # M1-U01: desktop and CLI contract
 
-**Status:** Proposed transport/interaction contract, not implemented. It covers the single M1 workflow only, not the future headless protocol or a visual layout. [Core resolution](m1-file-resolution.md), [ZIP/library](m1-zip-library.md), [native roots](m1-root-verification.md), and [recovery](m1-recovery.md) own behavior and effects.
+**Status:** Partially implemented transport/interaction contract. The shared workspace, CLI and Tauri shell exist; client-visible Deploy Preview, Deploy Apply and Restore remain closed behind the C1 gate (`UnsupportedTarget`/`Configuration`). It covers the single M1 workflow only, not the future headless protocol or a visual layout. [Core resolution](m1-file-resolution.md), [ZIP/library](m1-zip-library.md), [native roots](m1-root-verification.md), and [recovery](m1-recovery.md) own behavior and effects.
 
 ## Shared operations, not separate engines
 
@@ -17,7 +17,7 @@ One catalog location is shared by the CLI and the desktop shell. `marduk-workspa
   - macOS: `$HOME/Library/Application Support/com.marduk.desktop`.
 - The catalog and journal are `<root>/catalog.sqlite3`; earlier paths such as `.../marduk` are not read or migrated.
 
-Phase B must set the Tauri bundle identifier to `com.marduk.desktop` and pass `app.path().app_data_dir()` to `Workspace::open`, so `app_data_dir()` resolves to this same root. Environment variables are read only as the base data directory; tests isolate them, product code never adds a second override.
+Phase B fixes the Tauri bundle identifier to `com.marduk.desktop`, and the desktop shell calls `marduk_workspace::app_data_root()` once and passes the result to `Workspace::open`. Tauri's own resolver is not a second authority. Environment variables are read only as the base data directory; tests isolate them, product code never adds a second override.
 
 | Operation | CLI proposal | Request and authoritative result |
 |---|---|---|

@@ -33,9 +33,9 @@ Linux root tokens include the mount view ID reported by `statx` (`STATX_MNT_ID`)
 | `replaced_root_is_not_a_retry_target` | Same recorded path now names a new directory/volume; reopen returns `TargetUnavailable`, not `Absent`; outside and replacement sentinels unchanged. |
 | `symlink_or_junction_component_is_refused` | An otherwise valid target traverses a link into `outside/`; both Linux symlink and Windows junction cases refuse this path. Exercise actual native mechanism where supported and record skipped cases. |
 | `existing_original_with_unsupported_metadata_is_refused` | Unsupported object or unpreservable metadata is reported before creating a game stage file or signing off the plan. |
-| `btrfs_reopened_snapshot_is_not_original_root` | Under Btrfs a different subvolume/snapshot may keep the same inode numbers. A recorded root cannot be reopened against that substitute; the separate library/game subvolume arrangement with the original bound root remains valid. |
+| `btrfs_reopened_snapshot_is_not_original_root` | **Not run.** Under Btrfs a different subvolume/snapshot may keep the same inode numbers. A recorded root cannot be reopened against that substitute; the separate library/game subvolume arrangement with the original bound root remains valid. |
 
-Future command: `cargo test -p marduk-platform --test root_contract`. Record kernel/OS, actual filesystem/driver, mount/subvolume layout, and exact skips. A pass never substitutes for tested native publication or power-loss recovery.
+Future command: `cargo test -p marduk-platform --test root_contract`. Record kernel/OS, actual filesystem/driver, mount/subvolume layout, and exact skips. A pass never substitutes for tested native publication or power-loss recovery. The Btrfs snapshot row above has no recorded run: it stays `not run` and is not a pass.
 
 ## M1 metadata scope (approved 2026-11-22)
 

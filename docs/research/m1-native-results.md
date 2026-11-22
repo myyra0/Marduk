@@ -2,7 +2,7 @@
 
 Runtime evidence from 2026-11-22 (IST), code commit `29e587d`, base `ebd9e07`. Task 6 native-adapter rows were re-tested at `101b4f7` (recovery fix `7feb64b`). `not run` is never a pass. No power-cut or VM evidence exists.
 
-Close-out 2026-11-22: the Task 5 gate blocked native wiring; a later Task 5 continuation connected private-library staging on the two volume classes with runtime evidence (Linux Btrfs and Linux tmpfs); see [Qualified library staging](#qualified-library-staging-connected-2026-11-22). Native game-directory preview, Apply and Restore are now connected in the workspace proof lane on qualified volumes (Task 6), but client `dispatch` still refuses them behind the closed C1 gate. `not run` rows stay `not run`.
+Close-out 2026-11-22: the Task 5 gate blocked native wiring; a later Task 5 continuation connected private-library staging on the two Linux volume classes with runtime evidence (Btrfs and tmpfs), and the Windows staging adapter is implemented and witnessed on NTFS while its product gate stays closed; see [Qualified library staging](#qualified-library-staging-connected-2026-11-22). Native game-directory preview, Apply and Restore are connected in the workspace proof lane on the two Linux volume classes (Task 6), but client `dispatch` still refuses them behind the closed C1 gate. `not run` rows stay `not run`.
 
 Environment: Linux 7.3.5-1-cachyos, x86-64, rustc 1.100.0, uid 1000 with `CapEff: 0` (ordinary user, no elevated token). tmpfs scratch: `/tmp` `rw,noatime,inode64,huge=advise`, fsid `b6b575e7…`, mount view 74, no Btrfs tree. Btrfs scratch: `/home` on `/dev/nvme0n1p2[/@home]` `rw,noatime,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/@home`, fsid `b68b24bc…`, view 61, tree 257. All fixtures are synthetic files under a disposable parent; no game, external root or elevated operation was touched.
 
@@ -52,10 +52,10 @@ The Task 5 gate blocked native library wiring at that revision: `Catalog::open` 
 ### Qualified library staging (connected 2026-11-22)
 
 Tested at commit `a2250e9`, base `252ce26`.
-Continuation of Task 5 after the 2026-11-22 ruling. `Catalog::open` now selects native staging only when `marduk_platform::library_volume_qualified` reports a volume class with recorded runtime evidence: **Linux Btrfs** and **Linux tmpfs**. The predicate reads the observed private library root with the crate's existing `fstatfs` path (`crates/platform/src/linux.rs`), not a `statfs` type string. Refused and staying `StageUnavailable`:
+Continuation of Task 5 after the 2026-11-22 ruling. `Catalog::open` now selects native staging only when `marduk_platform::library_volume_qualified` reports a volume class with recorded runtime evidence: **Linux Btrfs** and **Linux tmpfs**. The predicate reads the observed private library root with the crate's existing `fstatfs` path (`crates/platform/src/linux.rs`), not a `statfs` type string. The catalog refuses with `StageUnavailable`:
 
 - Linux ext4 and every other unrecognised magic, including `FUSE` (ntfs-3g) and `ntfs3`.
-- Windows/native NTFS: `library_volume_qualified` is `false` and `StagingTree::open` is `Unsupported(Configuration)`.
+- Windows product availability: the staging adapter is implemented and witnessed on native NTFS (below), but `library_volume_qualified` and `effects_volume_qualified` stay `false`, so catalog imports and deploys remain disconnected.
 - A qualified volume whose private boundary will not bind: a redirected root or `revisions/`, an owner or mount mismatch, or a two-subvolume/`EXDEV` layout with no evidence. `NativeStage::open` refusal is final; it is never retried through a weaker adapter.
 
 Wired: private staging (private archive snapshot, admitted member set, hashed payload under `revisions/<id>/`, `sync_revisions` before the receipt) and catalog publication of a prepared import into the library (SQLite membership only, after native re-observation). Separate from library staging, Task 6 connected the native copy adapter for game-directory preview, Apply and Restore in the workspace `proof_*` lane on qualified volumes; client `dispatch` refuses `deploy_preview`, `deploy_apply` and `restore` with `UnsupportedTarget`/`Configuration`. No client-visible native write is unlocked, and no power-cut claim exists.
@@ -74,12 +74,12 @@ Wired: private staging (private archive snapshot, admitted member set, hashed pa
 
 The runtime evidence behind the accepted magic set is the tmpfs/Btrfs effect table at the top of this document plus the catalog staging witnesses above. No ext4 or native NTFS catalog run exists; those cells stay `not run`.
 
-Windows private staging is still refused by `library_volume_qualified` (`false`) and `effects_volume_qualified` (`false`); the two gates did not move. The staging adapter itself was re-run on NTFS after the 2026-11-22 review fixes:
+Windows product availability stays closed: `library_volume_qualified` and `effects_volume_qualified` are `false`, and deploy-level NTFS rows remain `not run`. The private staging adapter itself is implemented and was re-run on NTFS after the 2026-11-22 review fixes:
 
 - Tree: `7bcd2c1` plus the staging review fix. VM: Windows 10 `DESKTOP-4NP2KM5`, `rustc 1.100.0`. Scratch volume `C:` reported `File System Name : NTFS` (`fsutil fsinfo volumeinfo C:`).
 - `cargo test -p marduk-platform --test library_staging_witnesses -- --nocapture` → `running 8 tests`, `test result: ok. 8 passed; 0 failed`, including `reobserve_refuses_an_added_payload_file`.
 - Privacy was asserted by an independent `GetKernelObjectSecurity` DACL scan (not the adapter's `private_dacl`) for `revisions/<id>`, `payload/`, `payload/textures/` and `payload/textures/synthetic.dds`: protected DACL, owner equal to the token's default owner, owner-only ACEs, the object ACE plus the inherit-only descendant ACE on every directory, and exactly one non-inherit-only ACE on the file. `icacls` showed `BUILTIN\Administrators:(F)` plus `BUILTIN\Administrators:(OI)(CI)(IO)(F)` on the revision and `BUILTIN\Administrators:(F)` on the file; the SSH token is elevated, so Administrators is the token owner.
-- The redirect witnesses took `symlink_dir` (logged by `link_directory`), not the `mklink /J` fallback; the junction branch was not exercised in this run.
+- The redirect witnesses took the `symlink_dir` branch (logged by `link_directory`), not the `mklink /J` fallback, under the elevated SSH token; the junction branch is unexercised. That is an evidence gap, not a pass.
 - `cargo test --workspace --locked` on the VM → exit 0, no failures. Linux `TMPDIR=/tmp cargo test --workspace --locked`, `cargo fmt --all -- --check`, `cargo build --workspace` and the MSVC-target `cargo check -p marduk-platform --all-targets --target x86_64-pc-windows-msvc` also passed.
 
 Deploy-level NTFS rows remain `not run`; only the private staging adapter is evidenced here.
@@ -102,7 +102,7 @@ Base `8110c38`. `NativeStage` now keeps every archive and payload effect on the 
 - `MARDUK_M1_BTRFS_SCRATCH=/var/tmp cargo test -p marduk-platform --test library_boundary` — 8 witnesses ignored without `--ignored` (none pass silently); with `--ignored --test-threads=1`, 8 passed. (The suite has since grown to 10 witnesses; the qualified re-run records 10 passed.)
 - New witnesses redirect a staged revision after its handle was opened and require `StageChanged`/`StageUnavailable` from `reobserve` and `reclaim` with the redirect target untouched and the original revision retained.
 - `TMPDIR=/tmp cargo test -p marduk-platform`, `TMPDIR=/tmp cargo test -p marduk-storage`, `cargo fmt --all -- --check`, `cargo build --workspace --locked`, `TMPDIR=/tmp cargo test --workspace --locked` — passed.
-- Windows compile check passed; Windows/NTFS staging remains `Unsupported(Configuration)`. `Catalog::open` connects native staging on qualified Linux volumes only (see above). Apply/Restore status is stated once in the Task 6 section below.
+- Windows compile check passed; the NTFS staging capability is implemented and witnessed at the adapter layer below, while product availability stays closed. `Catalog::open` connects native staging on qualified Linux volumes only (see above). Apply/Restore status is stated once in the Task 6 section below.
 
 **Known limitation (accepted by the 2026-11-22 user ruling):** On Linux and Windows, a same-privilege process can substitute the parent or leaf between the final live-handle check and the syscall. The [R02 contract](../contracts/m1-recovery.md#native-seam-that-r03-must-qualify) requires post-effect reobservation to detect divergence, retention of actually displaced bytes, and refusal to retry automatically on divergence. It does not claim prevention. A syscall error is not evidence of no change.
 
@@ -175,9 +175,6 @@ under recovery, and proves a second recovery does not reapply.
   for Restore before opening the native port, so a claimed replay reports its
   recorded status and a clean root reports `NoActiveDeployment` instead of
   `UnsupportedTarget`.
-- Windows `replace` now returns `UnsupportedTarget(Configuration)`; it never
-  passes the stage path as both replacement and backup. Windows remains
-  unqualified for every native effect and no NTFS runtime row exists.
 - `resolved_inputs` inserts a manifest only for a published revision: an unknown
   revision is omitted (`MissingManifest` can fire) and a published revision with
   no rows is an empty manifest.
@@ -226,7 +223,7 @@ exists yet; `not run` is never a pass, and qualification stays closed.
 |---|---|---|---|---|
 | `effects::copy_file` | `CREATE_NEW` destination, data stream, attributes, creation/access/last-write times, owner/group/DACL, `FlushFileBuffers`; an occupied destination maps to `CopyError::DestinationExists` (conflict), a lock to `CopyError::Sharing` (retryable `Io`), and only unreproducible metadata to `Unsupported(Metadata)`; a source DACL that grants write (concrete bits, `GENERIC_WRITE`, `GENERIC_ALL`, or fail-closed `MAXIMUM_ALLOWED`) to a principal other than the current user or the SYSTEM/Administrators baseline is refused before it reaches the private area, including inherited grants, and every post-create failure removes the partial file | `effects_primitives::copy_preserves_bytes_and_last_write_time_and_refuses_existing`, `copy_refuses_concrete_file_write_data_in_source_dacl`, `copy_refuses_generic_write_in_source_dacl` and `copy_refuses_generic_all_in_source_dacl` passed 2026-11-22 (Linux) | not run | — |
 | `effects::publish` | one `MoveFileExW` with flags `0` (no `MOVEFILE_REPLACE_EXISTING`, no `MOVEFILE_COPY_ALLOWED`); an existing target fails and is left intact | `effects_primitives::publish_refuses_an_existing_target_and_leaves_it_intact` passed 2026-11-22 | not run | — |
-| `effects::replace` | exchange by three no-replace renames (target → `<operation>/displaced`, stage → target, displaced → retain); the canonical intermediate is the slot `evidence_for`, `prepare` and `sync_effect` already inspect, and a cut after the first rename resumes from it; the staged object's file id, creation time, attributes and DACL are preserved, so the public target fingerprints as the sealed staged artifact; a failure returns an error, never `Ok` | `effects_primitives::replace_retains_the_displaced_file_and_keeps_the_staged_object` and `interrupted_replace_keeps_the_canonical_displaced_slot_and_resumes` passed 2026-11-22 | not run | — |
+| `effects::replace` | exchange by two no-replace renames in production (target → `<operation>/displaced`, stage → target); a caller that retains at a different path adds a third rename from that slot; a cut after the first rename leaves the canonical `displaced` slot plus the staged object and resumes from that shape, which `evidence_for`, `prepare` and `sync_effect` inspect; the staged object's file id, creation time, attributes and DACL are preserved, so the public target fingerprints as the sealed staged artifact; a failure returns an error, never `Ok` | `effects_primitives::replace_retains_the_displaced_file_and_keeps_the_staged_object` and `interrupted_replace_keeps_the_canonical_displaced_slot_and_resumes` passed 2026-11-22 | not run | — |
 | `effects::detach` | one no-replace rename into the retain slot; an occupied slot fails, unknown bytes are never replaced | `effects_primitives::detach_preserves_an_unknown_file` passed 2026-11-22 | not run | — |
 | `effects::sync_directory` | `FlushFileBuffers` on a directory handle opened with `FILE_FLAG_BACKUP_SEMANTICS`; not a namespace or power-cut barrier | `effects_primitives::sync_directory_succeeds_on_a_real_directory` passed 2026-11-22 | not run | not claimed |
 | `effects::volume_qualified` | `false` on Windows until deploy-level evidence exists. The NTFS probe (from `GetVolumeInformationByHandleW` on the opened root) is kept for the private staging lane; NTFS alone is not qualification | `effects_primitives::volume_qualification_reads_the_opened_root` passed 2026-11-22 (refusal branch) | not run | — |
@@ -234,13 +231,14 @@ exists yet; `not run` is never a pass, and qualification stays closed.
 Design note: `ReplaceFileW` is deliberately not used. It merges the replaced
 file's creation time and DACL into the replacement, so the resulting public file
 would not match the sealed staged `Fingerprint` (identity includes the creation
-time; metadata includes the owner/group/DACL digest). The three-rename exchange
-moves the staged object itself, which keeps every witnessed field. The target
-name is absent between the first two moves, so this is not an atomic exchange;
-every failed step returns an error and the caller must re-observe. The
-intermediate is `<operation>/displaced`, not a name derived beside the stage, so
-the adapter's leftover guard, evidence scan and directory sync all see the
-displaced bytes after a cut.
+time; metadata includes the owner/group/DACL digest). The exchange renames the
+staged object itself, which keeps every witnessed field. The target name is
+absent between the two production moves, so this is not an atomic exchange;
+every failed step returns an error and the caller must re-observe. A caller that
+retains the displaced object at a different path performs one additional
+no-replace rename. The intermediate is `<operation>/displaced`, not a name
+derived beside the stage, so the adapter's leftover guard, evidence scan and
+directory sync all see the displaced bytes after a cut.
 
 The six file-level primitives passed hosted `windows-2025` at `eb39be0` on real
 NTFS (the run that exposed and then verified the tunneling fix). That is

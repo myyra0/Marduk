@@ -6,7 +6,7 @@
 
 Use one in-process reader for this slice, no extractor fallback chain, filename repair, or direct write into a game directory. Keep each revision in a private library directory already named for its allocated ID. It is invisible to clients until one SQLite transaction publishes the revision and profile membership. There is no directory rename to a public mod-name path, and replacing an installed mod never rewrites its old bytes. Retain all published revisions in M1; safe eviction is not part of the first slice.
 
-Candidate dependencies to freeze at C0: [`zip` 9.5.1](https://github.com/zip-rs/zip2/blob/v9.5.1/Cargo.toml) with defaults disabled and `deflate-flate2-zlib-rs`; [`rusqlite` 0.41.1](https://github.com/rusqlite/rusqlite/blob/v0.41.1/Cargo.toml) on native targets with defaults disabled and `bundled`. Both manifests declare MIT; these versions imply a minimum Rust compiler of 1.89 for this pair, not necessarily for the workspace as a whole. The manifests and APIs were inspected, not built. Resolve the exact workspace toolchain, advisory check and lockfile separately.
+Candidate dependencies are frozen in the workspace manifests (`crates/archive/Cargo.toml`, `crates/storage/Cargo.toml`, `Cargo.lock`), which are the authority for exact versions and features; do not restate pins here. Both declare MIT; compiler and toolchain expectations are decided by `rust-toolchain.toml` and the lockfile, not restated here. The manifests and APIs were inspected; resolve the exact advisory check separately.
 
 ## Archive interface
 
