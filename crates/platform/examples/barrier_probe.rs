@@ -26,13 +26,16 @@ fn main() {
     let directory = std::path::PathBuf::from(directory);
     let target = directory.join(&name);
     std::fs::create_dir_all(&directory).expect("create probe directory");
+    let flush_parent = std::env::args().nth(4).as_deref() != Some("noflush");
 
     {
         let mut file = std::fs::File::create(&target).expect("create payload");
         file.write_all(contents.as_bytes()).expect("write payload");
         file.sync_all().expect("flush payload");
     }
-    marduk_platform::effects::sync_directory(&directory).expect("flush directory");
+    if flush_parent {
+        marduk_platform::effects::sync_directory(&directory).expect("flush directory");
+    }
 
     println!("CHECKPOINT");
     use std::io::Write as _;
