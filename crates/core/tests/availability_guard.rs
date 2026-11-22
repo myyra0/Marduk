@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use marduk_core::qualification::{
-    Capability, Layer, NARROWED, Os, PROOFS, Proof, Route, VolumeClass, available, missing_witness,
+    available, missing_witness, Capability, Layer, Os, Proof, Route, VolumeClass, NARROWED, PROOFS,
 };
 
 const EVIDENCE: &str = "docs/research/m1-native-results.md";
@@ -29,6 +29,9 @@ const EVIDENCE: &str = "docs/research/m1-native-results.md";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Status {
     Ran,
+    /// Every run the cell records failed. A record that proves this
+    /// configuration contradicts it, so it can never satisfy a proof.
+    Failed,
     Unrun,
     NotApplicable,
     /// A recorded decision that narrows the guarantee. It is deliberately not
@@ -36,15 +39,52 @@ enum Status {
     Narrowed,
 }
 
-/// One evidence cell: where it is, what it says, and the revisions it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    Passed,
+    Failed,
+}
+
+/// One run in a cell: the revision(s) it names and whether it passed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Run {
+    revisions: Vec<String>,
+    outcome: Outcome,
+}
+
+/// One evidence cell: where it is, what it says, and the runs it records.
 ///
-/// A pass satisfies a proof only when the cell names the proof's revision; a
-/// revision in unrelated prose is not evidence for this configuration.
+/// A pass satisfies a proof only for the exact revision that run names, so a
+/// later pass cannot vouch for an earlier failure in the same cell.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Cell {
     line: usize,
     status: Status,
-    revisions: Vec<String>,
+    runs: Vec<Run>,
+}
+
+impl Cell {
+    /// Revisions a passing run names. A revision that also appears in a failed
+    /// run is never a pass, even if another run in the cell passed.
+    fn passed_revisions(&self) -> Vec<&str> {
+        self.runs
+            .iter()
+            .filter(|run| run.outcome == Outcome::Passed)
+            .flat_map(|run| run.revisions.iter().map(String::as_str))
+            .filter(|revision| {
+                !self.runs.iter().any(|run| {
+                    run.outcome == Outcome::Failed
+                        && run.revisions.iter().any(|failed| failed == revision)
+                })
+            })
+            .collect()
+    }
+
+    fn proves(&self, revision: &str) -> bool {
+        self.passed_revisions()
+            .iter()
+            .any(|passed| *passed == revision)
+    }
 }
 
 fn repo_root() -> PathBuf {
@@ -235,26 +275,76 @@ fn strip_note(cell: &str) -> &str {
     }
 }
 
-fn parse_status(line: usize, witness: &str, cell: &str) -> Status {
-    let cell = strip_note(cell);
-    let lowered = cell.to_ascii_lowercase();
-    if lowered.starts_with("ran") {
-        assert!(
-            lowered.contains("passed"),
-            "{EVIDENCE}:{line}: `{witness}` cell says {cell:?} without a pass"
-        );
-        return Status::Ran;
-    }
+fn parse_cell(line: usize, witness: &str, cell: &str) -> Cell {
+    let stripped = strip_note(cell);
+    let lowered = stripped.to_ascii_lowercase();
     if lowered.starts_with("not run") {
-        return Status::Unrun;
+        return Cell {
+            line,
+            status: Status::Unrun,
+            runs: Vec::new(),
+        };
     }
     if lowered.starts_with("narrowed") {
-        return Status::Narrowed;
+        return Cell {
+            line,
+            status: Status::Narrowed,
+            runs: Vec::new(),
+        };
     }
-    if matches!(cell, "N/A" | "—" | "-" | "") {
-        return Status::NotApplicable;
+    if matches!(stripped, "N/A" | "—" | "-" | "") {
+        return Cell {
+            line,
+            status: Status::NotApplicable,
+            runs: Vec::new(),
+        };
     }
-    panic!("{EVIDENCE}:{line}: unrecognised evidence cell {cell:?} for `{witness}`");
+    let runs = runs(line, witness, cell);
+    assert!(
+        !runs.is_empty(),
+        "{EVIDENCE}:{line}: unrecognised evidence cell {cell:?} for `{witness}`"
+    );
+    let status = if runs.iter().any(|run| run.outcome == Outcome::Passed) {
+        Status::Ran
+    } else {
+        Status::Failed
+    };
+    Cell { line, status, runs }
+}
+
+/// Parse each `;`-separated run separately: its revision and its outcome must
+/// stay paired, because a pass at one revision says nothing about another.
+fn runs(line: usize, witness: &str, cell: &str) -> Vec<Run> {
+    cell.split(';')
+        .filter_map(|segment| {
+            let segment = strip_note(segment).trim();
+            let lowered = segment.to_ascii_lowercase();
+            let names_a_run = lowered
+                .split(|character: char| !character.is_alphanumeric())
+                .any(|word| word == "ran");
+            if !names_a_run {
+                return None;
+            }
+            let passed = lowered.contains("passed");
+            let failed = lowered.contains("failed");
+            assert!(
+                !(passed && failed),
+                "{EVIDENCE}:{line}: `{witness}` run {segment:?} records both a pass and a failure"
+            );
+            assert!(
+                passed || failed,
+                "{EVIDENCE}:{line}: `{witness}` run {segment:?} has no outcome"
+            );
+            Some(Run {
+                revisions: revisions(segment),
+                outcome: if passed {
+                    Outcome::Passed
+                } else {
+                    Outcome::Failed
+                },
+            })
+        })
+        .collect()
 }
 
 /// Revisions named in a cell. Evidence writes them as a hex token, usually
@@ -270,15 +360,6 @@ fn revisions(cell: &str) -> Vec<String> {
         })
         .map(str::to_owned)
         .collect()
-}
-
-fn parse_cell(line: usize, witness: &str, cell: &str) -> Cell {
-    let status = parse_status(line, witness, cell);
-    Cell {
-        line,
-        status,
-        revisions: revisions(strip_note(cell)),
-    }
 }
 
 fn observed_cells(text: &str) -> BTreeMap<(String, Os, VolumeClass), Cell> {
@@ -525,18 +606,16 @@ fn the_record_and_the_evidence_document_agree() {
                 cell.status
             );
             assert!(
-                cell.revisions
-                    .iter()
-                    .any(|revision| revision == proof.revision),
+                cell.proves(proof.revision),
                 "availability record claims {} {} on {}/{} at revision `{}`, but {EVIDENCE}:{} \
-                 records `{witness}` at {:?}",
+                 records `{witness}` runs as {:?}",
                 proof.layer,
                 proof.capability,
                 proof.os,
                 proof.volume,
                 proof.revision,
                 cell.line,
-                cell.revisions
+                cell.runs
             );
         }
     }
@@ -555,6 +634,23 @@ fn the_record_and_the_evidence_document_agree() {
             .copied()
             .filter(|proof| proof.os == *os && proof.volume == *volume)
             .collect();
+        // A failed run at a revision the record proves is a contradiction, even
+        // when another run in the same cell passed at a different revision.
+        for run in cell
+            .runs
+            .iter()
+            .filter(|run| run.outcome == Outcome::Failed)
+        {
+            for revision in &run.revisions {
+                assert!(
+                    !here.iter().any(|proof| proof.revision == revision),
+                    "{EVIDENCE}:{} records `{witness}` as failed on {os} {volume} at revision \
+                     `{revision}`, which the availability record proves; correct the row or \
+                     withdraw the proof",
+                    cell.line
+                );
+            }
+        }
         match cell.status {
             Status::Ran => {
                 assert!(
@@ -564,13 +660,14 @@ fn the_record_and_the_evidence_document_agree() {
                      or correct the row",
                     cell.line
                 );
+                let passed = cell.passed_revisions();
                 assert!(
-                    !cell.revisions.is_empty(),
+                    !passed.is_empty(),
                     "{EVIDENCE}:{} records `{witness}` as ran and passed on {os} {volume} \
                      without naming a revision",
                     cell.line
                 );
-                for revision in &cell.revisions {
+                for revision in passed {
                     assert!(
                         here.iter().any(|proof| proof.revision == revision),
                         "{EVIDENCE}:{} records `{witness}` as passed on {os} {volume} at \
@@ -580,7 +677,7 @@ fn the_record_and_the_evidence_document_agree() {
                     );
                 }
             }
-            Status::Unrun | Status::NotApplicable | Status::Narrowed => assert!(
+            Status::Failed | Status::Unrun | Status::NotApplicable | Status::Narrowed => assert!(
                 here.is_empty(),
                 "the availability record proves `{witness}` on {os} {volume}, but {EVIDENCE}:{} \
                  does not record a pass for it; run the test or withdraw the proof",
@@ -588,6 +685,23 @@ fn the_record_and_the_evidence_document_agree() {
             ),
         }
     }
+}
+
+#[test]
+fn a_pass_at_another_revision_does_not_satisfy_a_failed_run() {
+    let cell = parse_cell(
+        1,
+        "witness",
+        "ran 2026-11-22 at `a0a0a0a`, failed; \
+         ran 2026-11-23 at `b0b0b0b`, passed",
+    );
+    assert_eq!(cell.status, Status::Ran);
+    assert!(
+        !cell.proves("a0a0a0a"),
+        "a later pass must not vouch for the earlier failure"
+    );
+    assert!(cell.proves("b0b0b0b"));
+    assert_eq!(cell.passed_revisions(), ["b0b0b0b"]);
 }
 
 #[test]
