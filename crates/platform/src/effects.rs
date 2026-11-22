@@ -43,7 +43,10 @@
 //!   DACL into the replacement, so the public target would no longer carry the
 //!   sealed staged fingerprint. NTFS tunneling would also give each object the
 //!   creation time of the name it lands on, so both birth times are captured
-//!   before the moves and restored, then re-read, before success is reported.
+//!   through handles bound before the moves and restored through those same
+//!   handles, then re-read, before success is reported. A denied attribute write
+//!   therefore fails before any public name changes, including for a read-only
+//!   original.
 //!   Every failed step returns an error and the caller must re-observe; a failed
 //!   exchange is never reported as a no-op.
 //! - `detach` is one no-replace rename into the retain slot. Unknown bytes in
@@ -278,22 +281,31 @@ pub fn replace(
             if !resume {
                 return Err(RootError::Io);
             }
-            let staged_creation = creation_time(stage_path)?;
-            let displaced_creation = creation_time(&displaced)?;
+            // Bind the timestamp authority while both objects still have the
+            // names they were observed under. A denied attribute write must
+            // fail here, before any public name moves.
+            let displaced_file = timestamp_authority(&displaced)?;
+            let staged_file = timestamp_authority(stage_path)?;
+            let staged_creation = creation_time(&staged_file)?;
+            let displaced_creation = creation_time(&displaced_file)?;
             move_path_noreplace(stage_path, target_path).map_err(|_| RootError::Io)?;
             if displaced.as_path() != retain_path {
                 move_path_noreplace(&displaced, retain_path).map_err(|_| RootError::Io)?;
             }
-            restore_creation_time(target_path, staged_creation)?;
-            restore_creation_time(retain_path, displaced_creation)?;
+            restore_creation_time(&staged_file, staged_creation)?;
+            restore_creation_time(&displaced_file, displaced_creation)?;
             return Ok(());
         }
         // NTFS tunneling re-applies the creation time of a name removed within
         // the last ~15 s to the next object added under it, including a rename.
         // Both renames below land on a name this exchange just vacated, so the
-        // births are captured first and restored afterwards.
-        let staged_creation = creation_time(stage_path)?;
-        let displaced_creation = creation_time(target_path)?;
+        // births are captured first and restored afterwards. The handles that
+        // apply them are bound before the moves: a read-only or attribute-denying
+        // original must fail before the game folder changes, not after.
+        let displaced_file = timestamp_authority(target_path)?;
+        let staged_file = timestamp_authority(stage_path)?;
+        let staged_creation = creation_time(&staged_file)?;
+        let displaced_creation = creation_time(&displaced_file)?;
         // 1. Retain the expected target under a name that must be absent.
         move_path_noreplace(target_path, &displaced).map_err(|_| RootError::Io)?;
         // 2. Publish the staged object with its identity and metadata intact.
@@ -302,8 +314,8 @@ pub fn replace(
         if displaced.as_path() != retain_path {
             move_path_noreplace(&displaced, retain_path).map_err(|_| RootError::Io)?;
         }
-        restore_creation_time(target_path, staged_creation)?;
-        restore_creation_time(retain_path, displaced_creation)?;
+        restore_creation_time(&staged_file, staged_creation)?;
+        restore_creation_time(&displaced_file, displaced_creation)?;
         Ok(())
     }
 }
@@ -782,16 +794,32 @@ fn wide(path: &std::path::Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain([0]).collect()
 }
 
-/// Creation time of an existing object in FILETIME 100 ns units.
+/// Open the timestamp-write authority for an object without following a final
+/// link. Binding this handle before a rename keeps the authority across the
+/// rename and makes a denial fail before any public name changes.
 #[cfg(windows)]
-fn creation_time(path: &std::path::Path) -> Result<i64, RootError> {
+fn timestamp_authority(path: &std::path::Path) -> Result<File, RootError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES,
+    };
+
+    std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|_| RootError::Io)
+}
+
+/// Creation time of a bound object in FILETIME 100 ns units.
+#[cfg(windows)]
+fn creation_time(file: &File) -> Result<i64, RootError> {
     use std::mem::size_of;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
     };
 
-    let file = open_file(path)?;
     let mut basic = FILE_BASIC_INFO::default();
     if unsafe {
         GetFileInformationByHandleEx(
@@ -807,23 +835,16 @@ fn creation_time(path: &std::path::Path) -> Result<i64, RootError> {
     Ok(basic.CreationTime)
 }
 
-/// Rewrite an object's creation time and prove the write took effect.
+/// Rewrite a bound object's creation time and prove the write took effect.
 #[cfg(windows)]
-fn restore_creation_time(path: &std::path::Path, expected: i64) -> Result<(), RootError> {
+fn restore_creation_time(file: &File, expected: i64) -> Result<(), RootError> {
     use std::mem::size_of;
-    use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_BASIC_INFO, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES,
-        FileBasicInfo, GetFileInformationByHandleEx, SetFileTime,
+        FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx, SetFileTime,
     };
 
-    let file = std::fs::OpenOptions::new()
-        .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-        .map_err(|_| RootError::Io)?;
     // Null access/write pointers leave those times unchanged.
     let creation = FILETIME {
         dwLowDateTime: expected as u32,

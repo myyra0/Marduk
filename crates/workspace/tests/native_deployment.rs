@@ -1021,7 +1021,7 @@ fn mixed_case_archive_target_merges_with_the_existing_spelling() {
 }
 
 #[test]
-#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+#[ignore = "requires a qualified volume: tmpfs or Btrfs on Linux, NTFS on Windows"]
 fn read_only_original_deploys_and_restores() {
     let mut fixture = Fixture::new();
     fixture.setup();
@@ -1044,6 +1044,41 @@ fn read_only_original_deploys_and_restores() {
         operation.blocker
     );
     assert_eq!(tree(&fixture.game)["Data/textures/winner.dds"], POST);
+
+    // The retained copy is the actually displaced read-only original. Its
+    // bytes must be readable after the moves, not just present at a slot.
+    let replaced = preview
+        .files
+        .iter()
+        .position(|file| file.needs_backup)
+        .expect("a replaced file");
+    let displaced = operation
+        .retained
+        .iter()
+        .find(|retained| {
+            retained.ordinal == replaced as u32
+                && matches!(retained.direction, Direction::Forward)
+                && matches!(retained.slot, Slot::Displaced)
+        })
+        .expect("status names the actually displaced object");
+    assert_eq!(displaced.operation_id, operation.id);
+    let forward = fixture
+        .app
+        .join("effects/ops")
+        .join(operation.id.to_string())
+        .join(replaced.to_string())
+        .join("forward");
+    let sealed = if forward.join("displaced").exists() {
+        forward.join("displaced")
+    } else {
+        forward.join("stage")
+    };
+    assert_eq!(
+        fs::read(&sealed).unwrap(),
+        BASE,
+        "the retained read-only original is readable"
+    );
+    assert!(is_read_only(&sealed));
 
     let restore = fixture.workspace.proof_restore().unwrap();
     let RestoreResult::Operation { operation } = restore else {
