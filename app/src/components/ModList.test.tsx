@@ -29,6 +29,20 @@ describe('ModList keyboard order', () => {
     expect(list).toHaveAttribute('aria-activedescendant', `member-${second.id}`);
   });
 
+  it('focuses the listbox when a row is clicked so Alt+Arrow reorders it', async () => {
+    const user = userEvent.setup();
+    const onReorder = vi.fn();
+    render(<ModList members={members} onReorder={onReorder} />);
+    const list = screen.getByRole('listbox');
+
+    await user.click(screen.getByRole('option', { name: new RegExp(first.displayName) }));
+    expect(list).toHaveFocus();
+
+    await user.keyboard('{Alt>}{ArrowDown}{/Alt}');
+    expect(onReorder).toHaveBeenCalledTimes(1);
+    expect(onReorder).toHaveBeenCalledWith([second.id, first.id]);
+  });
+
   it('does not reorder when only the selection moves', async () => {
     const user = userEvent.setup();
     const onReorder = vi.fn();

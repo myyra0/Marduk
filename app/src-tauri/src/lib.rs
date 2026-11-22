@@ -5,7 +5,6 @@
 //! Tauri's application data directory for the frozen bundle identifier.
 
 mod commands;
-mod selection;
 
 use tauri::Manager;
 

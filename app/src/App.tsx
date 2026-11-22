@@ -16,7 +16,7 @@ import type {
 
 type StatusState =
   | { kind: 'loading' }
-  | { kind: 'ready'; status: WorkspaceStatus }
+  | { kind: 'ready'; status: WorkspaceStatus; stale: boolean }
   | { kind: 'failed'; message: string };
 
 type Props = {
@@ -44,12 +44,14 @@ export function App({ transport }: Props) {
       const envelope = await transport.status();
       if (!mounted.current) return;
       if (envelope.ok) {
-        setState({ kind: 'ready', status: envelope.result });
+        setState({ kind: 'ready', status: envelope.result, stale: false });
         setNotice(null);
       } else {
         const message = describeBlocker(envelope.error);
         setState((previous) =>
-          previous.kind === 'ready' ? previous : { kind: 'failed', message },
+          previous.kind === 'ready'
+            ? { ...previous, stale: true }
+            : { kind: 'failed', message },
         );
         setNotice(message);
       }
@@ -57,7 +59,9 @@ export function App({ transport }: Props) {
       if (!mounted.current) return;
       const message = describeFailure(error);
       setState((previous) =>
-        previous.kind === 'ready' ? previous : { kind: 'failed', message },
+        previous.kind === 'ready'
+          ? { ...previous, stale: true }
+          : { kind: 'failed', message },
       );
       setNotice(message);
     } finally {
@@ -81,6 +85,11 @@ export function App({ transport }: Props) {
       if (envelope.ok) {
         apply(envelope.result);
       } else {
+        // A plan bound to another revision is dead; a stage change invalidates
+        // the archive as well. Neither may survive as an enabled Apply.
+        if (envelope.error.code === 'StalePlan' || envelope.error.code === 'StageChanged') {
+          setPrepared(null);
+        }
         setNotice(`Not applied: ${describeBlocker(envelope.error)}`);
       }
     } catch (error) {
@@ -90,15 +99,35 @@ export function App({ transport }: Props) {
     }
   }
 
-  const status = state.kind === 'ready' ? state.status : null;
+  const ready = state.kind === 'ready' ? state : null;
+  const status = ready?.status ?? null;
+  const statusStale = ready?.stale ?? false;
+  const blocked = busy || statusStale;
 
   function applySnapshot(snapshot: Snapshot) {
     setState((previous) =>
       previous.kind === 'ready'
-        ? { kind: 'ready', status: { ...previous.status, profile: snapshot } }
+        ? { ...previous, status: { ...previous.status, profile: snapshot } }
         : previous,
     );
   }
+
+  const profileId = status?.profile.id;
+  const profileRevision = status?.profile.revision;
+  useEffect(() => {
+    setPrepared((current) => {
+      if (current === null) return null;
+      return current.profileId === profileId && current.expectedRevision === profileRevision
+        ? current
+        : null;
+    });
+  }, [profileId, profileRevision]);
+
+  const preparedIsCurrent =
+    prepared !== null &&
+    status !== null &&
+    prepared.profileId === status.profile.id &&
+    prepared.expectedRevision === status.profile.revision;
 
   async function chooseInstallation() {
     setBusy(true);
@@ -120,7 +149,7 @@ export function App({ transport }: Props) {
         setNotice(describeBlocker(setup.error));
         return;
       }
-      setState({ kind: 'ready', status: setup.result });
+      setState({ kind: 'ready', status: setup.result, stale: false });
       setPrepared(null);
       setNotice(null);
     } catch (error) {
@@ -140,6 +169,7 @@ export function App({ transport }: Props) {
     }
     setBusy(true);
     setNotice(null);
+    setPrepared(null);
     try {
       const picked = await transport.pickZip();
       if (!mounted.current) return;
@@ -171,7 +201,15 @@ export function App({ transport }: Props) {
   }
 
   async function applyImport() {
-    if (prepared === null) return;
+    if (prepared === null || status === null) return;
+    if (
+      prepared.profileId !== status.profile.id ||
+      prepared.expectedRevision !== status.profile.revision
+    ) {
+      setPrepared(null);
+      setNotice('The profile changed; preview the archive again before applying.');
+      return;
+    }
     await perform(
       () => transport.importApply(prepared.id),
       (snapshot) => {
@@ -215,6 +253,13 @@ export function App({ transport }: Props) {
 
       {state.kind === 'loading' && <p className="muted">Loading authoritative status…</p>}
 
+      {status !== null && statusStale && (
+        <p className="hint">
+          The last status refresh failed, so this is the previous authoritative state. Mutating
+          actions stay disabled until a refresh succeeds.
+        </p>
+      )}
+
       {status !== null && (
         <>
           <section className="panel">
@@ -230,7 +275,11 @@ export function App({ transport }: Props) {
                   </>
                 )}
               </div>
-              <button type="button" onClick={() => void chooseInstallation()} disabled={busy}>
+              <button
+                type="button"
+                onClick={() => void chooseInstallation()}
+                disabled={blocked}
+              >
                 Choose game folder…
               </button>
             </div>
@@ -243,8 +292,8 @@ export function App({ transport }: Props) {
             <AvailabilityRow label="Deploy" availability={status.availability.deploy} />
             <AvailabilityRow label="Restore" availability={status.availability.restore} />
             <p className="hint">
-              Blocked operations stay disabled. Review, Apply and Restore are wired in the
-              workspace console.
+              Blocked operations stay disabled. Deployment review, Apply, Restore, ordered progress
+              and reconnect recovery are not wired in this scaffold.
             </p>
           </section>
 
@@ -253,7 +302,11 @@ export function App({ transport }: Props) {
               <h2>Profile {status.profile.id}</h2>
               <code className="muted">revision {status.profile.revision}</code>
             </div>
-            <ModList members={status.profile.members} disabled={busy} onReorder={(ids) => void reorder(ids)} />
+            <ModList
+              members={status.profile.members}
+              disabled={blocked}
+              onReorder={(ids) => void reorder(ids)}
+            />
           </section>
 
           <section className="panel">
@@ -266,13 +319,13 @@ export function App({ transport }: Props) {
                     <input
                       value={importName}
                       onChange={(event) => setImportName(event.target.value)}
-                      disabled={busy}
+                      disabled={blocked}
                     />
                   </label>
                   <button
                     type="button"
                     onClick={() => void previewImport(status)}
-                    disabled={busy}
+                    disabled={blocked}
                   >
                     Preview ZIP…
                   </button>
@@ -290,7 +343,11 @@ export function App({ transport }: Props) {
                         </li>
                       ))}
                     </ul>
-                    <button type="button" onClick={() => void applyImport()} disabled={busy}>
+                    <button
+                      type="button"
+                      onClick={() => void applyImport()}
+                      disabled={blocked || !preparedIsCurrent}
+                    >
                       Apply import
                     </button>
                   </div>
@@ -351,6 +408,16 @@ function PendingOperation({ operation }: { operation: Operation }) {
           <span className="badge badge--blocked">Blocked</span>{' '}
           <code>{describeBlocker(operation.blocker)}</code>
         </p>
+      )}
+      {operation.retained.length > 0 && (
+        <ul className="retained">
+          {operation.retained.map((entry) => (
+            <li key={`${entry.operationId}-${entry.ordinal}-${entry.direction}-${entry.slot}`}>
+              retained <code>{entry.operationId}</code> · ordinal {entry.ordinal} ·{' '}
+              {entry.direction} · {entry.slot}
+            </li>
+          ))}
+        </ul>
       )}
       <p className="hint">Recorded work is reported only. Nothing is retried automatically.</p>
     </section>

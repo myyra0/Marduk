@@ -11,6 +11,11 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+mod selection;
+
+pub use selection::{Purpose, Selection, SelectionId};
+use selection::{SelectionStore, Source};
+
 use marduk_core::deployment::{DeployError, OperationKind, OperationStatus, Phase};
 use marduk_core::ids::{MemberId, ProfileId, ProfileRevision};
 use marduk_core::import::NamedProfile;
@@ -424,6 +429,7 @@ pub enum RestoreResult {
 pub struct Workspace {
     catalog: Catalog,
     journal: OperationJournal,
+    selections: SelectionStore,
 }
 
 impl Workspace {
@@ -431,7 +437,22 @@ impl Workspace {
     pub fn open(app_data: &Path) -> Result<Self, WireError> {
         let catalog = Catalog::open(app_data).map_err(import_error)?;
         let journal = OperationJournal::open(app_data).map_err(deploy_error)?;
-        Ok(Self { catalog, journal })
+        Ok(Self {
+            catalog,
+            journal,
+            selections: SelectionStore::new(),
+        })
+    }
+
+    /// Record one native picker result and mint the only handle the renderer
+    /// may see. Archive inputs are opened now, so a later command consumes the
+    /// exact file that was selected instead of reopening a pathname.
+    pub fn remember_selection(
+        &mut self,
+        purpose: Purpose,
+        path: PathBuf,
+    ) -> Result<SelectionId, WireError> {
+        self.selections.insert(purpose, path)
     }
 
     /// Dispatch one request. One result per invocation.
@@ -446,7 +467,7 @@ impl Workspace {
         match request.op {
             Op::Setup => {
                 let args: SetupArgs = decode(request.args)?;
-                self.setup(args)?;
+                self.setup(args.selection()?)?;
                 self.status_value()
             }
             Op::Status => {
@@ -455,7 +476,11 @@ impl Workspace {
             }
             Op::ImportPreview => {
                 let args: ImportPreviewArgs = decode(request.args)?;
-                Ok(json(self.import_preview(args)?)?)
+                Ok(json(self.import_preview(
+                    args.selection()?,
+                    args.name,
+                    args.at_revision,
+                )?)?)
             }
             Op::ImportApply => {
                 let args: ImportApplyArgs = decode(request.args)?;
@@ -486,16 +511,22 @@ impl Workspace {
         }
     }
 
-    fn setup(&mut self, args: SetupArgs) -> Result<(), WireError> {
-        if args.game_dir.is_empty() {
+    fn setup(&mut self, selection: Selection) -> Result<(), WireError> {
+        let path = match selection {
+            Selection::CliPath(path) => path,
+            Selection::Desktop(id) => match self.selections.take(id, Purpose::Installation)? {
+                Source::Installation(path) => path,
+                Source::Archive(_) => return Err(WireError::new(Code::InvalidRequest)),
+            },
+        };
+        if path.as_os_str().is_empty() {
             return Err(WireError::new(Code::InvalidRequest));
         }
-        let selection = Path::new(&args.game_dir);
         // The locator is durable, so resolve it once and use that exact path
         // for both the bind and the journal record. A relative path must never
         // become the stored location.
         let selection =
-            std::path::absolute(selection).map_err(|_| WireError::new(Code::InvalidPath))?;
+            std::path::absolute(&path).map_err(|_| WireError::new(Code::InvalidPath))?;
         let binding = marduk_platform::bind_installation(&selection, &skyrim_se::LAYOUT)
             .map_err(root_error)?;
         let (installation, data) = binding.identities();
@@ -573,15 +604,24 @@ impl Workspace {
         })
     }
 
-    fn import_preview(&mut self, args: ImportPreviewArgs) -> Result<Prepared, WireError> {
-        let revision = parse_revision(&args.at_revision)?;
-        let input = File::open(&args.zip).map_err(|_| WireError::new(Code::Io))?;
+    fn import_preview(
+        &mut self,
+        selection: Selection,
+        name: String,
+        at_revision: String,
+    ) -> Result<Prepared, WireError> {
+        let revision = parse_revision(&at_revision)?;
+        let input = match selection {
+            Selection::CliPath(path) => File::open(&path).map_err(|_| WireError::new(Code::Io))?,
+            Selection::Desktop(id) => match self.selections.take(id, Purpose::Archive)? {
+                Source::Archive(file) => file,
+                Source::Installation(_) => return Err(WireError::new(Code::InvalidRequest)),
+            },
+        };
         let plan = BeginImport {
             profile: profile(),
             expected_revision: revision,
-            target: ImportTarget::Append {
-                display_name: args.name,
-            },
+            target: ImportTarget::Append { display_name: name },
         };
         let prepared = self
             .catalog
@@ -621,10 +661,25 @@ impl Workspace {
     }
 }
 
+/// CLI names a path, the desktop shell names a handle. Requiring exactly one
+/// keeps a renderer-supplied path out of the desktop request entirely.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SetupArgs {
-    game_dir: String,
+    #[serde(default)]
+    game_dir: Option<String>,
+    #[serde(default)]
+    selection_id: Option<String>,
+}
+
+impl SetupArgs {
+    fn selection(&self) -> Result<Selection, WireError> {
+        match (&self.game_dir, &self.selection_id) {
+            (Some(path), None) if !path.is_empty() => Ok(Selection::CliPath(PathBuf::from(path))),
+            (None, Some(id)) => Ok(Selection::Desktop(SelectionId::parse(id)?)),
+            _ => Err(WireError::new(Code::InvalidRequest)),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -634,9 +689,22 @@ struct NoArgs {}
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ImportPreviewArgs {
-    zip: String,
+    #[serde(default)]
+    zip: Option<String>,
+    #[serde(default)]
+    selection_id: Option<String>,
     name: String,
     at_revision: String,
+}
+
+impl ImportPreviewArgs {
+    fn selection(&self) -> Result<Selection, WireError> {
+        match (&self.zip, &self.selection_id) {
+            (Some(path), None) if !path.is_empty() => Ok(Selection::CliPath(PathBuf::from(path))),
+            (None, Some(id)) => Ok(Selection::Desktop(SelectionId::parse(id)?)),
+            _ => Err(WireError::new(Code::InvalidRequest)),
+        }
+    }
 }
 
 #[derive(Deserialize)]

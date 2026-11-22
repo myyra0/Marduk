@@ -4,6 +4,11 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   plugins: [react()],
   clearScreen: false,
+  // Dev-only nonce that the frozen dev CSP allows, so Vite can inject its
+  // styles and React refresh without `unsafe-inline`.
+  html: {
+    cspNonce: 'marduk-dev',
+  },
   server: {
     host: '127.0.0.1',
     port: 1420,

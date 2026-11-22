@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use marduk_workspace::{
-    Code, Envelope, Member, Op, Request, Snapshot, WireError, Workspace, WorkspaceStatus,
+    Code, Envelope, Member, Op, Purpose, Request, Snapshot, WireError, Workspace, WorkspaceStatus,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -242,6 +242,84 @@ fn operation_read_reports_unknown_without_writes() {
     })));
     assert_eq!(code(&error), "UnknownOperation");
     assert_eq!(fixture.status()["pending"], Value::Null);
+}
+
+#[test]
+fn desktop_setup_consumes_one_opaque_handle() {
+    let mut fixture = Fixture::new();
+    let id = fixture
+        .workspace
+        .remember_selection(Purpose::Installation, fixture.game.clone())
+        .unwrap();
+
+    let status = expect_ok(fixture.send(json!({
+        "op": "setup",
+        "args": { "selectionId": id.to_string() },
+    })));
+    assert_eq!(
+        status["installation"]["label"],
+        json!("Skyrim Special Edition")
+    );
+
+    // The same handle is dead after one use, and a raw path is never a handle.
+    let error = expect_error(fixture.send(json!({
+        "op": "setup",
+        "args": { "selectionId": id.to_string() },
+    })));
+    assert_eq!(code(&error), "InvalidRequest");
+    let error = expect_error(fixture.send(json!({
+        "op": "setup",
+        "args": { "selectionId": fixture.game.to_str().unwrap() },
+    })));
+    assert_eq!(code(&error), "InvalidRequest");
+}
+
+#[test]
+fn desktop_import_preview_consumes_the_opened_archive_handle() {
+    let mut fixture = Fixture::new();
+    fixture.setup();
+    let zip = scratch_file(fixture.temp.path(), "selected.zip");
+    let id = fixture
+        .workspace
+        .remember_selection(Purpose::Archive, zip)
+        .unwrap();
+
+    let error = expect_error(fixture.send(json!({
+        "op": "import_preview",
+        "args": {
+            "selectionId": id.to_string(),
+            "name": "Example",
+            "atRevision": "0",
+        },
+    })));
+    // The selection was consumed and reached the import stage; a replayed
+    // handle cannot be resolved again.
+    assert_eq!(code(&error), "StageUnavailable");
+    let error = expect_error(fixture.send(json!({
+        "op": "import_preview",
+        "args": {
+            "selectionId": id.to_string(),
+            "name": "Example",
+            "atRevision": "0",
+        },
+    })));
+    assert_eq!(code(&error), "InvalidRequest");
+}
+
+#[test]
+fn a_selection_handle_is_bound_to_its_purpose() {
+    let mut fixture = Fixture::new();
+    let zip = scratch_file(fixture.temp.path(), "selected.zip");
+    let id = fixture
+        .workspace
+        .remember_selection(Purpose::Archive, zip)
+        .unwrap();
+
+    let error = expect_error(fixture.send(json!({
+        "op": "setup",
+        "args": { "selectionId": id.to_string() },
+    })));
+    assert_eq!(code(&error), "InvalidRequest");
 }
 
 #[test]

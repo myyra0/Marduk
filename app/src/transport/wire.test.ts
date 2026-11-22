@@ -92,89 +92,110 @@ describe('Rust-generated wire fixtures', () => {
   });
 
   it('refuses invalid DTOs instead of coercing them', () => {
-    const cases: Array<[string, unknown]> = [
+    type Parser = (value: unknown, field: string) => unknown;
+    const cases: Array<[string, unknown, Parser]> = [
       [
         'numeric member id',
         draft(statusFixture, (value) => {
           value.result.profile.members[0].id = 9007199254740993;
         }),
+        parseWorkspaceStatus,
       ],
       [
         'leading zero',
         draft(statusFixture, (value) => {
           value.result.profile.members[0].id = '09007199254740993';
         }),
+        parseWorkspaceStatus,
       ],
       [
         'above i64::MAX',
         draft(statusFixture, (value) => {
           value.result.profile.revision = '9223372036854775808';
         }),
+        parseWorkspaceStatus,
       ],
       [
         'negative revision',
         draft(statusFixture, (value) => {
           value.result.profile.revision = '-1';
         }),
+        parseWorkspaceStatus,
       ],
       [
         'missing installedId',
         draft(statusFixture, (value) => {
           delete value.result.profile.members[0].installedId;
         }),
+        parseWorkspaceStatus,
       ],
       [
         'blocked without a blocker',
         draft(statusFixture, (value) => {
           delete value.result.availability.deploy.blocker;
         }),
+        parseWorkspaceStatus,
       ],
       [
         'available with a blocker',
         draft(statusFixture, (value) => {
           value.result.availability.target.blocker = { code: 'Busy' };
         }),
+        parseWorkspaceStatus,
       ],
       [
         'missing activeGenerationId',
         draft(statusFixture, (value) => {
           delete value.result.activeGenerationId;
         }),
+        parseWorkspaceStatus,
       ],
       [
-        'unknown phase',
+        'unknown operation phase',
         draft(operationFixture, (value) => {
           value.result.phase = 'sideways';
         }),
+        parseOperation,
+      ],
+      [
+        'unknown pending phase',
+        draft(statusFixture, (value) => {
+          value.result.pending.phase = 'sideways';
+        }),
+        parseWorkspaceStatus,
       ],
       [
         'fractional ordinal',
         draft(statusFixture, (value) => {
           value.result.pending.retained[0].ordinal = 1.5;
         }),
+        parseWorkspaceStatus,
       ],
       [
         'unknown error code',
         draft(errorStalePlan, (value) => {
           value.error.code = 'SomethingElse';
         }),
+        () => null,
       ],
       [
         'unknown detail shape',
         draft(errorInvalidPath, (value) => {
           value.error.detail = { path: '/home/user/secret' };
         }),
+        () => null,
       ],
       [
         'success envelope carrying an error',
         draft(statusFixture, (value) => {
           value.error = { code: 'Busy' };
         }),
+        parseWorkspaceStatus,
       ],
     ];
 
-    for (const [name, value] of cases) {
-      expect(() => parseEnvelope(value, parseWorkspaceStatus), name).toThrow(WireFormatError);
+    for (const [name, value, parse] of cases) {
+      expect(() => parseEnvelope(value, parse), name).toThrow(WireFormatError);
     }
   });
 });

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import type { Id, Member } from '../transport/wire';
 
@@ -17,6 +17,7 @@ type Props = {
  */
 export function ModList({ members, disabled = false, onReorder }: Props) {
   const [selectedId, setSelectedId] = useState<Id | null>(null);
+  const list = useRef<HTMLUListElement>(null);
   const selected = members.find((member) => member.id === selectedId) ?? members[0];
   const selectedIndex = selected === undefined ? -1 : members.indexOf(selected);
 
@@ -32,6 +33,13 @@ export function ModList({ members, disabled = false, onReorder }: Props) {
     if (member !== undefined) {
       setSelectedId(member.id);
     }
+  }
+
+  // A pointer selection must also move keyboard focus to the list, so the
+  // next Alt+Arrow applies to the row the user just clicked.
+  function selectFromPointer(id: Id) {
+    setSelectedId(id);
+    list.current?.focus();
   }
 
   function move(delta: number) {
@@ -69,6 +77,7 @@ export function ModList({ members, disabled = false, onReorder }: Props) {
         <span>High priority</span>
       </div>
       <ul
+        ref={list}
         role="listbox"
         aria-label="Mod order, low priority to high priority"
         aria-activedescendant={selected === undefined ? undefined : `member-${selected.id}`}
@@ -82,7 +91,7 @@ export function ModList({ members, disabled = false, onReorder }: Props) {
             role="option"
             aria-selected={member.id === selected?.id}
             className={member.id === selected?.id ? 'mod-row mod-row--selected' : 'mod-row'}
-            onClick={() => setSelectedId(member.id)}
+            onClick={() => selectFromPointer(member.id)}
           >
             <span className="mod-row__index">{index + 1}</span>
             <span className="mod-row__name">{member.displayName}</span>

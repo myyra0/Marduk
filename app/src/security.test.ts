@@ -20,6 +20,17 @@ function matches(source: string, pattern: RegExp, group = 1): string[] {
   return [...source.matchAll(pattern)].map((match) => match[group]);
 }
 
+function directives(csp: string): Map<string, string[]> {
+  const parsed = new Map<string, string[]>();
+  for (const part of csp.split(';')) {
+    const trimmed = part.trim();
+    if (trimmed.length === 0) continue;
+    const [name, ...sources] = trimmed.split(/\s+/);
+    parsed.set(name, sources);
+  }
+  return parsed;
+}
+
 const clientSource = read('src/transport/client.ts');
 const tsCommands = matches(
   clientSource.match(/export const COMMANDS = \[([\s\S]*?)\] as const/)?.[1] ?? '',
@@ -105,14 +116,42 @@ describe('desktop capability surface', () => {
   it('uses the frozen CSP and bundle identifier', () => {
     expect(config.identifier).toBe('com.marduk.desktop');
     expect(config.app.security.csp).toBe(FROZEN_CSP);
-    expect(config.app.security.devCsp).toContain('http://localhost:1420');
-    expect(config.app.security.devCsp).not.toContain('*');
     expect(config.app.withGlobalTauri).toBeUndefined();
+  });
+
+  it('keeps the dev CSP to the frozen policy plus dev origins only', () => {
+    const dev = config.app.security.devCsp;
+    expect(dev).not.toMatch(/unsafe-inline|unsafe-eval|\*/);
+
+    const frozen = directives(FROZEN_CSP);
+    const development = directives(dev);
+    expect([...development.keys()]).toEqual([...frozen.keys()]);
+
+    const allowedExtras = new Set([
+      'http://localhost:1420',
+      'ws://localhost:1420',
+      "'nonce-marduk-dev'",
+    ]);
+    for (const [name, sources] of frozen) {
+      const devSources = development.get(name) ?? [];
+      for (const source of sources) {
+        expect(devSources, `${name} ${source}`).toContain(source);
+      }
+      for (const source of devSources) {
+        if (!sources.includes(source)) {
+          expect(allowedExtras, `${name} ${source}`).toContain(source);
+        }
+      }
+    }
+    expect(dev).toContain('http://localhost:1420');
+    expect(dev).toContain('ws://localhost:1420');
   });
 
   it('keeps Rust commands free of generic write or process authority', () => {
     expect(commandsSource).not.toMatch(/std::fs::|std::process|Command::new|OpenOptions/);
-    expect(read('src-tauri/src/selection.rs')).not.toMatch(/std::fs::|std::process|Command::new/);
+    // The desktop commands carry opaque handles only; paths stay in Rust.
+    expect(commandsSource).not.toMatch(/"gameDir"\s*:|"zip"\s*:/);
+    expect(commandsSource).toMatch(/"selectionId"/);
     expect(clientSource).not.toMatch(/(^|\n)\s*export\s+(async\s+)?function\s+(invoke|send|call)\b/);
     expect(clientSource).not.toMatch(/@tauri-apps\/plugin-(fs|shell|http|dialog)/);
   });
