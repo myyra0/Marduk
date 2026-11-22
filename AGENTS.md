@@ -88,9 +88,11 @@ Use `subagent-driven-development` for approved, ready execution packets. One top
 
 | Role | Model — all at `high` | Assignment |
 |---|---|---|
-| `architect`, `escalation` | GPT-6.2 Sol (`MODEL_SOL`; `openai/gpt-6.2-sol`) | Architecture, shared contracts, risk-intensive acceptance tests, recovery and trust decisions, final whole-branch review; escalation implementer after two failed cycles on the same task |
-| `orchestrator`, `worker-standard` | DeepSeek V4.1 Flash 1017 (`MODEL_DEEPSEEK`; `opencode-go/deepseek-v4.1-flash`) | Session controller, integration, moderate multi-module implementation, routine independent review, simple planner-owned tests |
-| `worker-simple` | Beam Free (`MODEL_BEAM`; `opencode-go/beam-free`) | Very small, bounded implementation and mechanical checks when the approved brief and tests decide the behavior |
+| `architect`, `escalation` | GPT-6.2 Sol (`MODEL_SOL`; `openai/gpt-6.2-sol#high`) | Architecture, shared contracts, risk-intensive acceptance tests, recovery and trust decisions, final whole-branch review; escalation implementer after two failed cycles on the same task |
+| `orchestrator`, `worker-standard` | DeepSeek V4.1 Flash 1017 (`MODEL_DEEPSEEK`; `opencode-go/deepseek-v4.1-flash#high`) | Session controller, integration, moderate multi-module implementation, routine independent review, simple planner-owned tests |
+| `worker-simple` | Beam Free (`MODEL_BEAM`; `opencode-go/beam-free#high`) | Very small, bounded implementation and mechanical checks when the approved brief and tests decide the behavior |
+
+Every subagent dispatch must use the `#high` variant of the exact model ID shown above. A base ID without `#high` is a preflight failure: do not dispatch it, and do not substitute a different model or effort silently. The orchestrator records the exact dispatched model string in the ledger.
 
 Tier order is Beam for very small bounded work, DeepSeek for orchestration and moderate work, Sol for architecture and risk and as the escalation implementer.
 
