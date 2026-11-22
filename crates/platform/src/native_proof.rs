@@ -1005,11 +1005,14 @@ impl DeploymentInputs for ProofSession {
 }
 
 fn copy_file(source: &Path, destination: &Path) -> Result<(), DeployError> {
+    use fsops::CopyError;
     fsops::copy_file(source, destination)
         .map(|_| ())
         .map_err(|error| match error {
-            RootError::TargetUnavailable => DeployError::TargetUnavailable,
-            RootError::UnsupportedTarget(_) => DeployError::UnsupportedTarget,
-            _ => DeployError::Io,
+            CopyError::DestinationExists => DeployError::RecoveryConflict,
+            CopyError::Sharing => DeployError::Io,
+            CopyError::Unsupported(_) => DeployError::UnsupportedTarget,
+            CopyError::TargetUnavailable => DeployError::TargetUnavailable,
+            CopyError::Io => DeployError::Io,
         })
 }

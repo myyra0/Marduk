@@ -240,15 +240,26 @@ impl NativeEffects {
     ) -> Evidence {
         let directory = self.op_dir(op.get(), ordinal, direction);
         let stage_observation = artifact(&directory.join("stage"));
+        let displaced = artifact(&directory.join("displaced"));
         let (stage, retained) = if exchange {
+            // A completed exchange leaves the displaced object in the stage
+            // alias; an exchange cut between its renames leaves it in the
+            // canonical intermediate instead. Both are the retained slot.
             match &stage_observation {
                 Artifact::Regular(actual) if staged == Some(actual) => {
-                    (Artifact::Regular(actual.clone()), Artifact::Absent)
+                    (Artifact::Regular(actual.clone()), displaced)
                 }
-                other => (Artifact::Absent, other.clone()),
+                other => (
+                    Artifact::Absent,
+                    if displaced == Artifact::Absent {
+                        other.clone()
+                    } else {
+                        displaced
+                    },
+                ),
             }
         } else {
-            (stage_observation, artifact(&directory.join("displaced")))
+            (stage_observation, displaced)
         };
         Evidence {
             target: self.observe_bound(target),
@@ -504,8 +515,16 @@ impl NativeEffects {
                 ),
                 Err(error) => return EffectOutcome::Unavailable(error),
             };
-        if self.observe_bound(target) != Observation::Regular(expected.clone())
-            || artifact(&stage_path) != Artifact::Regular(staged_fingerprint.clone())
+        // A cut after the first rename leaves the target absent, the staged
+        // bytes still in the stage slot and the displaced original in the
+        // canonical intermediate. That exact shape is resumed, not treated as a
+        // missing pre-image.
+        let resuming = self.observe_bound(target) == Observation::Absent
+            && artifact(&stage_path) == Artifact::Regular(staged_fingerprint.clone())
+            && artifact(&self.backup_path(retain)) == Artifact::Regular(expected.clone());
+        if !resuming
+            && (self.observe_bound(target) != Observation::Regular(expected.clone())
+                || artifact(&stage_path) != Artifact::Regular(staged_fingerprint.clone()))
         {
             return EffectOutcome::Conflict(self.evidence_for(
                 target,
@@ -527,8 +546,9 @@ impl NativeEffects {
             Err(error) => return EffectOutcome::Unavailable(error),
         };
 
-        // The exchange alias puts the actually displaced file in the stage
-        // slot; that slot is the canonical retain evidence.
+        // The exchange alias starts in the canonical `displaced` slot and, on
+        // success, moves the displaced object into the stage alias. Both names
+        // are observed as retained evidence by `evidence_for`.
         self.trace(ProofEvent::PublicEffect);
         let result = effects::replace(
             &stage_dir,
@@ -698,9 +718,10 @@ impl NativeEffects {
     }
 
     /// Flush an operation directory and every ancestor up to the resolved
-    /// app-owned root. A new entry is only durable once its parent directory is.
-    /// The caller's spelling of the root may be relative or redirected; the
-    /// bound comes from the pinned handle, so a mismatch never walks to `/`.
+    /// app-owned root. This fsyncs each directory entry; on Windows it reports
+    /// `FlushFileBuffers` only, which is not a documented namespace barrier. The
+    /// caller's spelling of the root may be relative or redirected; the bound
+    /// comes from the pinned handle, so a mismatch never walks to `/`.
     fn sync_directory_chain(&mut self, directory: &Path) -> Result<(), RootError> {
         effects::sync_directory(directory)?;
         self.trace(ProofEvent::Synced(directory.to_path_buf()));
@@ -843,8 +864,18 @@ impl CopyEffects for NativeEffects {
         };
 
         let displaced = self.op_dir(op.get(), ordinal, direction).join("displaced");
-        if artifact(&displaced) != Artifact::Absent {
-            return Err(DeployError::RecoveryConflict);
+        // An exchange owns this slot as its intermediate. A residual there is
+        // only a resumable cut when it is the sealed pre-image; any other bytes
+        // are a foreign artifact.
+        let displaced_observation = artifact(&displaced);
+        if displaced_observation != Artifact::Absent {
+            let expected_displaced = match (&intent.pre, &staged) {
+                (PreState::Regular(fingerprint), Some(_)) => Artifact::Regular(fingerprint.clone()),
+                _ => Artifact::Absent,
+            };
+            if displaced_observation != expected_displaced {
+                return Err(DeployError::RecoveryConflict);
+            }
         }
         if staged.is_some() {
             let stage_directory = self.op_dir(op.get(), ordinal, direction);
@@ -1122,11 +1153,14 @@ fn map_root(error: RootError) -> DeployError {
     }
 }
 
-fn copy_error(error: RootError) -> DeployError {
+fn copy_error(error: marduk_platform::effects::CopyError) -> DeployError {
+    use marduk_platform::effects::CopyError;
     match error {
-        RootError::TargetUnavailable => DeployError::TargetUnavailable,
-        RootError::UnsupportedTarget(_) => DeployError::UnsupportedTarget,
-        _ => DeployError::Io,
+        CopyError::DestinationExists => DeployError::RecoveryConflict,
+        CopyError::Sharing => DeployError::Io,
+        CopyError::Unsupported(_) => DeployError::UnsupportedTarget,
+        CopyError::TargetUnavailable => DeployError::TargetUnavailable,
+        CopyError::Io => DeployError::Io,
     }
 }
 

@@ -12,9 +12,11 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use marduk_core::root_identity::RootError;
+#[cfg(windows)]
+use marduk_core::root_identity::UnsupportedReason;
 use marduk_platform::effects::{
-    copy_file, detach, fingerprint_path, open_directory, publish, replace, sync_directory,
-    volume_qualified,
+    CopyError, copy_file, detach, fingerprint_path, open_directory, publish, replace,
+    sync_directory, volume_qualified,
 };
 
 const STAGED: &[u8] = b"staged bytes\n";
@@ -57,11 +59,23 @@ fn copy_preserves_bytes_and_last_write_time_and_refuses_existing() {
     );
 
     let error = copy_file(&source, &destination).expect_err("an existing destination is refused");
-    assert!(
-        matches!(error, RootError::UnsupportedTarget(_)),
-        "unexpected refusal {error:?}"
+    assert_eq!(
+        error,
+        CopyError::DestinationExists,
+        "an existing destination is a conflict, not a metadata refusal"
     );
     assert_eq!(fs::read(&destination).unwrap(), STAGED);
+
+    #[cfg(windows)]
+    {
+        // Creation and access times are copied for restore fidelity; the copy
+        // is a new object with its own file id and change time.
+        assert_eq!(
+            creation_time(&destination),
+            creation_time(&source),
+            "the copy must carry the source's birth time"
+        );
+    }
 }
 
 #[test]
@@ -211,20 +225,195 @@ fn volume_qualification_reads_the_opened_root() {
     {
         match filesystem_name(directory.path()).as_deref() {
             Some(name) if name.eq_ignore_ascii_case("NTFS") => assert!(
-                volume_qualified(directory.path()),
-                "an NTFS root must be qualified"
+                !volume_qualified(directory.path()),
+                "NTFS alone is not deploy-level qualification; the gate stays closed"
             ),
             Some(name) => {
                 // exFAT/FAT32/ReFS volumes cannot be constructed portably here.
-                eprintln!(
-                    "skipped: the temporary directory is on {name}, not NTFS; \
-                     no non-NTFS volume can be constructed on this host"
-                );
+                eprintln!("the temporary directory is on {name}, not NTFS");
                 assert!(!volume_qualified(directory.path()));
             }
             None => panic!("the temporary directory has no readable volume name"),
         }
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn copy_refuses_a_source_dacl_that_grants_write_to_another_principal() {
+    use std::mem::{offset_of, size_of};
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, CreateWellKnownSid,
+        DACL_SECURITY_INFORMATION, InitializeAcl, WinWorldSid,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_GENERIC_WRITE};
+
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const DELETE: u32 = 0x0001_0000;
+
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source");
+    let destination = directory.path().join("destination");
+    fs::write(&source, STAGED).unwrap();
+
+    let mut sid = [0u8; 68];
+    let mut sid_len = sid.len() as u32;
+    assert_ne!(
+        unsafe {
+            CreateWellKnownSid(
+                WinWorldSid,
+                std::ptr::null_mut(),
+                sid.as_mut_ptr().cast(),
+                &mut sid_len,
+            )
+        },
+        0,
+        "could not build the Everyone SID"
+    );
+    let ace_size = offset_of!(ACCESS_ALLOWED_ACE, SidStart) + sid_len as usize;
+    let acl_len = size_of::<ACL>() + ace_size;
+    let mut acl = vec![0u8; acl_len];
+    assert_ne!(
+        unsafe { InitializeAcl(acl.as_mut_ptr().cast(), acl_len as u32, ACL_REVISION) },
+        0
+    );
+    let ace = unsafe { acl.as_mut_ptr().add(size_of::<ACL>()) };
+    unsafe {
+        let header = ace.cast::<ACE_HEADER>();
+        (*header).AceType = ACCESS_ALLOWED_ACE_TYPE;
+        (*header).AceFlags = 0;
+        (*header).AceSize = ace_size as u16;
+        let allowed = ace.cast::<ACCESS_ALLOWED_ACE>();
+        (*allowed).Mask = FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE;
+        std::ptr::copy_nonoverlapping(
+            sid.as_ptr(),
+            ace.add(offset_of!(ACCESS_ALLOWED_ACE, SidStart)),
+            sid_len as usize,
+        );
+    }
+    let path: Vec<u16> = source.as_os_str().encode_wide().chain([0]).collect();
+    assert_eq!(
+        unsafe {
+            SetNamedSecurityInfoW(
+                path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                acl.as_ptr().cast(),
+                std::ptr::null_mut(),
+            )
+        },
+        0,
+        "could not widen the source DACL"
+    );
+
+    let error =
+        copy_file(&source, &destination).expect_err("a widened source DACL must be refused");
+    assert_eq!(error, CopyError::Unsupported(UnsupportedReason::Metadata));
+    assert!(
+        !destination.exists(),
+        "a refused copy must leave no artifact in the private effect area"
+    );
+    assert_eq!(fs::read(&source).unwrap(), STAGED);
+}
+
+#[cfg(windows)]
+#[test]
+fn interrupted_replace_keeps_the_canonical_displaced_slot_and_resumes() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    let directory = tempfile::tempdir().unwrap();
+    let stage_directory = directory.path().join("stage-directory");
+    let target_directory = directory.path().join("target-directory");
+    fs::create_dir(&stage_directory).unwrap();
+    fs::create_dir(&target_directory).unwrap();
+    let stage_path = stage_directory.join("stage");
+    let displaced_path = stage_directory.join("displaced");
+    let target_path = target_directory.join("leaf");
+    let stage = open_directory(&stage_directory).unwrap();
+    let target = open_directory(&target_directory).unwrap();
+
+    fs::write(&stage_path, STAGED).unwrap();
+    set_modified(&stage_path, modified());
+    fs::write(&target_path, ORIGINAL).unwrap();
+    set_modified(&target_path, modified() - Duration::from_secs(60));
+    let staged = fingerprint_path(&stage_path).unwrap();
+    let original = fingerprint_path(&target_path).unwrap();
+
+    // Deny delete sharing on the stage so rename 1 succeeds and rename 2 fails.
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(&stage_path)
+        .unwrap();
+    assert!(
+        replace(
+            &stage,
+            "stage",
+            &target,
+            "leaf",
+            &stage_path,
+            &target_path,
+            &stage_path,
+        )
+        .is_err(),
+        "the held stage must interrupt the exchange after the first rename"
+    );
+    assert!(!target_path.exists());
+    assert_eq!(fs::read(&stage_path).unwrap(), STAGED);
+    assert_eq!(fs::read(&displaced_path).unwrap(), ORIGINAL);
+    assert_eq!(
+        fingerprint_path(&displaced_path).unwrap(),
+        original,
+        "the displaced bytes must be visible in the canonical retained slot"
+    );
+    sync_directory(&stage_directory).unwrap();
+    drop(held);
+
+    // The same call now resumes the interrupted exchange to its final shape.
+    replace(
+        &stage,
+        "stage",
+        &target,
+        "leaf",
+        &stage_path,
+        &target_path,
+        &stage_path,
+    )
+    .expect("a retry must complete the interrupted exchange");
+    assert_eq!(fs::read(&target_path).unwrap(), STAGED);
+    assert_eq!(fingerprint_path(&target_path).unwrap(), staged);
+    assert_eq!(fs::read(&stage_path).unwrap(), ORIGINAL);
+    assert_eq!(fingerprint_path(&stage_path).unwrap(), original);
+    assert!(!displaced_path.exists());
+}
+
+#[cfg(windows)]
+fn creation_time(path: &Path) -> i64 {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
+    };
+
+    let file = File::open(path).unwrap();
+    let mut basic = FILE_BASIC_INFO::default();
+    assert_ne!(
+        unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileBasicInfo,
+                (&mut basic as *mut FILE_BASIC_INFO).cast(),
+                size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        },
+        0
+    );
+    basic.CreationTime
 }
 
 #[cfg(windows)]

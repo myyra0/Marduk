@@ -821,6 +821,9 @@ mod root {
 
     /// Whether the opened root lives on an NTFS volume. The decision reads the
     /// volume that owns the handle, never the path spelling.
+    // Kept for the evidence lane: NTFS is a necessary but not sufficient
+    // condition for a future deploy-level qualification.
+    #[allow(dead_code)]
     pub(crate) fn volume_is_ntfs(path: &Path) -> bool {
         let Some(text) = path.to_str() else {
             return false;
@@ -1505,11 +1508,11 @@ pub(crate) fn library_volume_qualified(_root: &Path) -> bool {
     false
 }
 
-/// Native effect writes are qualified on NTFS only. The filesystem name is read
-/// from the opened root's volume, so an exFAT, FAT32, ReFS or unknown volume is
-/// refused without trusting the path spelling. The runtime gate for these
-/// primitives is the hosted Windows CI job; see
-/// `docs/research/m1-native-results.md`.
-pub(crate) fn effects_volume_qualified(root: &Path) -> bool {
-    root::volume_is_ntfs(root)
+/// Native effect writes stay unqualified on Windows. The six file-level
+/// primitives pass the hosted `windows-2025` CI job, but that is primitive-level
+/// evidence only: no deploy-level NTFS rows exist, and the durability barrier
+/// remains `Unavailable`. `volume_is_ntfs` is kept for that evidence lane and
+/// for a future deploy-level gate; being on NTFS is not qualification.
+pub(crate) fn effects_volume_qualified(_root: &Path) -> bool {
+    false
 }

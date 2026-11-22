@@ -16,11 +16,17 @@
 //! ## Windows guarantees
 //!
 //! - `copy_file` creates the destination with `CREATE_NEW`, copies the data
-//!   stream, applies the source's attributes, last-write time, owner, group and
-//!   DACL, and calls `FlushFileBuffers` before returning. Birth time, extended
-//!   attributes and alternate data streams are not copied; the caller already
-//!   refused such a source, and a copy is a new object. A destination that
-//!   appears first is refused, never overwritten.
+//!   stream, applies the source's attributes, creation/access/last-write times,
+//!   owner, group and DACL, and calls `FlushFileBuffers` before returning.
+//!   Creation and access times are copied for restore fidelity; the copy is
+//!   still a new object, so its file id and change time differ. Extended
+//!   attributes and alternate data streams are not copied. A source DACL that
+//!   grants write-class access to any principal outside the current user and
+//!   the SYSTEM/Administrators baseline is refused before the descriptor is
+//!   applied, so the private effect area never inherits a grant to another local
+//!   user. A destination that appears first is refused,
+//!   never overwritten, and every post-create failure removes the partial
+//!   artifact.
 //! - `publish` is one `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`, so an
 //!   existing target makes the call fail; the target bytes are untouched. The
 //!   move is refused across volumes (`MOVEFILE_COPY_ALLOWED` is not set).
@@ -51,7 +57,48 @@
 use std::fs::File;
 use std::io;
 
-use marduk_core::root_identity::{Fingerprint, RootError, RootIdentity};
+use marduk_core::root_identity::{Fingerprint, RootError, RootIdentity, UnsupportedReason};
+
+/// Why [`copy_file`] could not produce a complete private copy.
+///
+/// This is deliberately narrower than [`RootError`]: an occupied destination is
+/// a conflict for the caller's fresh inventory, while a transient lock is worth
+/// retrying. Neither means the volume cannot preserve metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyError {
+    /// The destination name already exists; nothing was overwritten.
+    DestinationExists,
+    /// The source or destination was transiently locked; a retry may succeed.
+    Sharing,
+    /// The requested metadata cannot be reproduced on this object.
+    Unsupported(UnsupportedReason),
+    /// The source or an ancestor is unavailable.
+    TargetUnavailable,
+    /// Another operating-system failure.
+    Io,
+}
+
+impl std::fmt::Display for CopyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DestinationExists => formatter.write_str("the destination already exists"),
+            Self::Sharing => formatter.write_str("the source or destination is locked"),
+            Self::Unsupported(reason) => write!(formatter, "unsupported copy metadata: {reason}"),
+            Self::TargetUnavailable => formatter.write_str("the copy source is unavailable"),
+            Self::Io => formatter.write_str("a native copy failed"),
+        }
+    }
+}
+
+impl std::error::Error for CopyError {}
+
+fn copy_root_error(error: RootError) -> CopyError {
+    match error {
+        RootError::TargetUnavailable => CopyError::TargetUnavailable,
+        RootError::UnsupportedTarget(reason) => CopyError::Unsupported(reason),
+        _ => CopyError::Io,
+    }
+}
 
 /// Identity of the verified directory at `path`.
 pub fn directory_identity(path: &std::path::Path) -> Result<RootIdentity, RootError> {
@@ -181,16 +228,42 @@ pub fn replace(
         // The callers name the stage slot as the retain alias, so the exchange
         // needs one distinct intermediate name. `ReplaceFileW` cannot be used:
         // it merges the replaced file's creation time and DACL into the
-        // replacement, which would break the sealed staged fingerprint. A
-        // deterministic operation-owned name keeps the displaced bytes visible
-        // when the exchange is cut between its moves.
+        // replacement, which would break the sealed staged fingerprint. The
+        // adapter's canonical retained slot is `<operation>/displaced`, so the
+        // intermediate is derived from the stage path's file name rather than
+        // appended to it; `evidence_for`, `prepare`'s leftover guard and
+        // `sync_effect` all inspect that name after a cut.
         let displaced = if retain_path == stage_path {
-            let mut name = std::ffi::OsString::from(stage_name);
-            name.push(".displaced");
-            stage_path.with_file_name(name)
+            stage_path.with_file_name("displaced")
         } else {
             retain_path.to_path_buf()
         };
+        // A cut between the renames leaves the target name absent with the
+        // staged bytes in the stage slot and the displaced bytes in the
+        // canonical intermediate. Resume that exact shape instead of demanding
+        // a target that the interrupted exchange already moved away.
+        let target_present = match std::fs::symlink_metadata(target_path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(_) => return Err(RootError::Io),
+        };
+        if !target_present {
+            let resume = displaced.as_path() != stage_path
+                && std::fs::symlink_metadata(stage_path).is_ok()
+                && std::fs::symlink_metadata(&displaced).is_ok();
+            if !resume {
+                return Err(RootError::Io);
+            }
+            let staged_creation = creation_time(stage_path)?;
+            let displaced_creation = creation_time(&displaced)?;
+            move_path_noreplace(stage_path, target_path).map_err(|_| RootError::Io)?;
+            if displaced.as_path() != retain_path {
+                move_path_noreplace(&displaced, retain_path).map_err(|_| RootError::Io)?;
+            }
+            restore_creation_time(target_path, staged_creation)?;
+            restore_creation_time(retain_path, displaced_creation)?;
+            return Ok(());
+        }
         // NTFS tunneling re-applies the creation time of a name removed within
         // the last ~15 s to the next object added under it, including a rename.
         // Both renames below land on a name this exchange just vacated, so the
@@ -259,105 +332,123 @@ pub fn volume_qualified(root: &std::path::Path) -> bool {
 }
 
 /// Copy `source` to a new file at `destination`, preserving the supported
-/// metadata before the durable copy is reported. `create_new` fails instead of
-/// overwriting an object that appeared at the destination.
+/// metadata before the copy is reported. `create_new` fails instead of
+/// overwriting an object that appeared at the destination. On Windows the data
+/// flush is `FlushFileBuffers` on the file handle and is not a claim that the
+/// directory entry survives a power cut.
 #[cfg(target_os = "linux")]
 pub fn copy_file(
     source: &std::path::Path,
     destination: &std::path::Path,
-) -> Result<(u64, [u8; 32]), RootError> {
+) -> Result<(u64, [u8; 32]), CopyError> {
     use sha2::{Digest, Sha256};
     use std::fs::OpenOptions;
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
 
-    let mut input = crate::native::open_file(source)?;
-    let metadata = input.metadata().map_err(|_| RootError::Io)?;
+    let mut input = crate::native::open_file(source).map_err(copy_root_error)?;
+    let metadata = input.metadata().map_err(|_| CopyError::Io)?;
     let mut output = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(destination)
-        .map_err(|_| {
-            RootError::UnsupportedTarget(marduk_core::root_identity::UnsupportedReason::Metadata)
+        .map_err(|error| match error.kind() {
+            io::ErrorKind::AlreadyExists => CopyError::DestinationExists,
+            io::ErrorKind::WouldBlock => CopyError::Sharing,
+            _ => CopyError::Io,
         })?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    let mut len = 0u64;
-    loop {
-        let read = input.read(&mut buffer).map_err(|_| RootError::Io)?;
-        if read == 0 {
-            break;
+    let result = (|| {
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        let mut len = 0u64;
+        loop {
+            let read = input.read(&mut buffer).map_err(|_| CopyError::Io)?;
+            if read == 0 {
+                break;
+            }
+            output
+                .write_all(&buffer[..read])
+                .map_err(|_| CopyError::Io)?;
+            hasher.update(&buffer[..read]);
+            len += read as u64;
         }
-        output
-            .write_all(&buffer[..read])
-            .map_err(|_| RootError::Io)?;
-        hasher.update(&buffer[..read]);
-        len += read as u64;
+        // Scoped metadata: mode, ownership and mtime. Eligibility already
+        // refused links, xattrs, flags and special modes. Metadata lands before
+        // the sync so the reported artifact is the complete copy.
+        let mode = metadata.mode() & 0o7777;
+        if unsafe { libc::fchmod(output.as_raw_fd(), mode as libc::mode_t) } != 0
+            || unsafe { libc::fchown(output.as_raw_fd(), metadata.uid(), metadata.gid()) } != 0
+        {
+            return Err(CopyError::Unsupported(UnsupportedReason::Metadata));
+        }
+        let times = [
+            libc::timespec {
+                tv_sec: metadata.atime(),
+                tv_nsec: metadata.atime_nsec(),
+            },
+            libc::timespec {
+                tv_sec: metadata.mtime(),
+                tv_nsec: metadata.mtime_nsec(),
+            },
+        ];
+        if unsafe { libc::futimens(output.as_raw_fd(), times.as_ptr()) } != 0 {
+            return Err(CopyError::Unsupported(UnsupportedReason::Metadata));
+        }
+        output.sync_all().map_err(|_| CopyError::Io)?;
+        let mut sha256 = [0u8; 32];
+        sha256.copy_from_slice(&hasher.finalize());
+        Ok((len, sha256))
+    })();
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            drop(output);
+            let _ = std::fs::remove_file(destination);
+            Err(error)
+        }
     }
-    // Scoped metadata: mode, ownership and mtime. Eligibility already refused
-    // links, xattrs, flags and special modes. Metadata lands before the sync so
-    // the durable artifact is the complete copy.
-    let mode = metadata.mode() & 0o7777;
-    if unsafe { libc::fchmod(output.as_raw_fd(), mode as libc::mode_t) } != 0
-        || unsafe { libc::fchown(output.as_raw_fd(), metadata.uid(), metadata.gid()) } != 0
-    {
-        return Err(RootError::UnsupportedTarget(
-            marduk_core::root_identity::UnsupportedReason::Metadata,
-        ));
-    }
-    let times = [
-        libc::timespec {
-            tv_sec: metadata.atime(),
-            tv_nsec: metadata.atime_nsec(),
-        },
-        libc::timespec {
-            tv_sec: metadata.mtime(),
-            tv_nsec: metadata.mtime_nsec(),
-        },
-    ];
-    if unsafe { libc::futimens(output.as_raw_fd(), times.as_ptr()) } != 0 {
-        return Err(RootError::UnsupportedTarget(
-            marduk_core::root_identity::UnsupportedReason::Metadata,
-        ));
-    }
-    output.sync_all().map_err(|_| RootError::Io)?;
-    let mut sha256 = [0u8; 32];
-    sha256.copy_from_slice(&hasher.finalize());
-    Ok((len, sha256))
 }
 
-/// A complete copy: data, attributes, last-write time and the owner, group and
-/// DACL witness the caller holds for the source. Birth time, extended
-/// attributes and alternate data streams are not copied. The destination is
-/// created with `CREATE_NEW`; an existing object is refused. If the supported
-/// metadata cannot be reproduced the preparation fails closed with
-/// `UnsupportedTarget(Metadata)` instead of yielding a partial backup.
-/// `FlushFileBuffers` covers this file handle, not the directory entry.
+/// A complete copy: data, attributes, creation/access/last-write times and the
+/// owner, group and DACL witness the caller holds for the source. Creation and
+/// access times are copied so a restored file presents the source's timestamps;
+/// the copy is still a new object, so its file id and change time differ.
+/// Extended attributes and alternate data streams are not copied. The
+/// destination is created with `CREATE_NEW`; an existing object is refused as
+/// [`CopyError::DestinationExists`] and a transient lock as
+/// [`CopyError::Sharing`]. A source DACL that grants write-class access to a
+/// principal outside the current user and the SYSTEM/Administrators baseline is
+/// refused before it can be applied to the private effect area. Every
+/// post-create failure removes the partial
+/// destination before returning. `FlushFileBuffers` covers this file handle, not
+/// the directory entry.
 #[cfg(windows)]
 pub fn copy_file(
     source: &std::path::Path,
     destination: &std::path::Path,
-) -> Result<(u64, [u8; 32]), RootError> {
+) -> Result<(u64, [u8; 32]), CopyError> {
     use sha2::{Digest, Sha256};
     use std::io::{Read, Write};
     use std::mem::size_of;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, GENERIC_WRITE, GetLastError};
+    use windows_sys::Win32::Foundation::{
+        GetLastError, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_INSUFFICIENT_BUFFER,
+        ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, GENERIC_WRITE,
+    };
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetKernelObjectSecurity,
-        OWNER_SECURITY_INFORMATION, SetKernelObjectSecurity,
+        GetKernelObjectSecurity, SetKernelObjectSecurity, DACL_SECURITY_INFORMATION,
+        GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
-        SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER,
+        FileBasicInfo, GetFileInformationByHandleEx, SetFileInformationByHandle,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO, WRITE_DAC, WRITE_OWNER,
     };
 
-    let unsupported =
-        || RootError::UnsupportedTarget(marduk_core::root_identity::UnsupportedReason::Metadata);
+    let unsupported = || CopyError::Unsupported(UnsupportedReason::Metadata);
 
-    let mut input = open_file(source)?;
+    let mut input = open_file(source).map_err(copy_root_error)?;
     let mut basic = FILE_BASIC_INFO::default();
     if unsafe {
         GetFileInformationByHandleEx(
@@ -368,12 +459,10 @@ pub fn copy_file(
         )
     } == 0
     {
-        return Err(RootError::Io);
+        return Err(CopyError::Io);
     }
     if basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(RootError::UnsupportedTarget(
-            marduk_core::root_identity::UnsupportedReason::ObjectKind,
-        ));
+        return Err(CopyError::Unsupported(UnsupportedReason::ObjectKind));
     }
 
     // `SetKernelObjectSecurity` needs WRITE_DAC and WRITE_OWNER, which
@@ -382,91 +471,254 @@ pub fn copy_file(
         .access_mode(GENERIC_WRITE | WRITE_DAC | WRITE_OWNER)
         .create_new(true)
         .open(destination)
-        .map_err(|_| unsupported())?;
+        .map_err(|error| match error.raw_os_error().map(|code| code as u32) {
+            Some(ERROR_FILE_EXISTS | ERROR_ALREADY_EXISTS) => CopyError::DestinationExists,
+            Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION) => CopyError::Sharing,
+            _ => CopyError::Io,
+        })?;
 
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    let mut len = 0u64;
-    loop {
-        let read = input.read(&mut buffer).map_err(|_| RootError::Io)?;
-        if read == 0 {
-            break;
+    let result = (|| {
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        let mut len = 0u64;
+        loop {
+            let read = input.read(&mut buffer).map_err(|_| CopyError::Io)?;
+            if read == 0 {
+                break;
+            }
+            output
+                .write_all(&buffer[..read])
+                .map_err(|_| CopyError::Io)?;
+            hasher.update(&buffer[..read]);
+            len += read as u64;
         }
-        output
-            .write_all(&buffer[..read])
-            .map_err(|_| RootError::Io)?;
-        hasher.update(&buffer[..read]);
-        len += read as u64;
-    }
 
-    // The observed security witness is owner, group and DACL.
-    let requested =
-        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
-    let mut needed = 0u32;
-    if unsafe {
-        GetKernelObjectSecurity(
-            input.as_raw_handle(),
-            requested,
-            std::ptr::null_mut(),
-            0,
-            &mut needed,
-        )
-    } == 0
-        && unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER
-    {
-        return Err(unsupported());
-    }
-    if needed == 0 {
-        return Err(unsupported());
-    }
-    // A security descriptor must be four-byte aligned; `Vec<u32>` supplies that.
-    let mut descriptor = vec![0u32; (needed as usize).div_ceil(size_of::<u32>())];
-    let capacity = needed;
-    if unsafe {
-        GetKernelObjectSecurity(
-            input.as_raw_handle(),
-            requested,
-            descriptor.as_mut_ptr().cast(),
-            needed,
-            &mut needed,
-        )
-    } == 0
-        || needed > capacity
-        || unsafe {
+        // The observed security witness is owner, group and DACL.
+        let requested =
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+        let mut needed = 0u32;
+        if unsafe {
+            GetKernelObjectSecurity(
+                input.as_raw_handle(),
+                requested,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            )
+        } == 0
+            && unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER
+        {
+            return Err(unsupported());
+        }
+        if needed == 0 {
+            return Err(unsupported());
+        }
+        // A security descriptor must be four-byte aligned; `Vec<u32>` supplies that.
+        let mut descriptor = vec![0u32; (needed as usize).div_ceil(size_of::<u32>())];
+        let capacity = needed;
+        if unsafe {
+            GetKernelObjectSecurity(
+                input.as_raw_handle(),
+                requested,
+                descriptor.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        } == 0
+            || needed > capacity
+        {
+            return Err(unsupported());
+        }
+        // Refuse to launder a widened source grant into the private effect
+        // area. Owner and group are still copied; only the DACL is checked.
+        if !source_dacl_grants_only_current_user(descriptor.as_mut_ptr().cast())? {
+            return Err(unsupported());
+        }
+        if unsafe {
             SetKernelObjectSecurity(
                 output.as_raw_handle(),
                 requested,
                 descriptor.as_mut_ptr().cast(),
             )
         } == 0
-    {
-        return Err(unsupported());
-    }
+        {
+            return Err(unsupported());
+        }
 
-    // Attributes and last-write time last, so nothing else can move the
-    // observed values. Creation and access times are left at the new object's
-    // own values; the copy is not the source object.
-    let basic = FILE_BASIC_INFO {
-        LastWriteTime: basic.LastWriteTime,
-        FileAttributes: basic.FileAttributes,
-        ..basic
+        // Times and attributes last, so nothing else can move the observed
+        // values. Creation and access times are intentionally copied for
+        // restore fidelity; the change time is left to the system.
+        let stamp = FILE_BASIC_INFO {
+            CreationTime: basic.CreationTime,
+            LastAccessTime: basic.LastAccessTime,
+            LastWriteTime: basic.LastWriteTime,
+            ChangeTime: 0,
+            FileAttributes: basic.FileAttributes,
+        };
+        if unsafe {
+            SetFileInformationByHandle(
+                output.as_raw_handle(),
+                FileBasicInfo,
+                (&stamp as *const FILE_BASIC_INFO).cast(),
+                size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(unsupported());
+        }
+        output.sync_all().map_err(|_| CopyError::Io)?;
+
+        let mut sha256 = [0u8; 32];
+        sha256.copy_from_slice(&hasher.finalize());
+        Ok((len, sha256))
+    })();
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            drop(output);
+            let _ = std::fs::remove_file(destination);
+            Err(error)
+        }
+    }
+}
+
+/// Whether every write-granting allow ACE in the descriptor belongs to the
+/// current user or the machine's privileged baseline (SYSTEM and
+/// Administrators, which already control the private effect area). A null or
+/// malformed DACL, an ACE class this code cannot parse, and an unavailable token
+/// all fail closed.
+#[cfg(windows)]
+fn source_dacl_grants_only_current_user(
+    descriptor: *mut std::ffi::c_void,
+) -> Result<bool, CopyError> {
+    use std::mem::{offset_of, size_of};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        CreateWellKnownSid, EqualSid, GetAce, GetLengthSid, GetSecurityDescriptorDacl,
+        GetTokenInformation, IsValidAcl, IsValidSid, TokenUser, WinBuiltinAdministratorsSid,
+        WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, INHERIT_ONLY_ACE,
+        SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER,
     };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_APPEND_DATA, FILE_WRITE_DATA, WRITE_DAC, WRITE_OWNER,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+    const SYSTEM_AUDIT_ACE_TYPE: u8 = 2;
+    const SYSTEM_ALARM_ACE_TYPE: u8 = 3;
+    const DELETE: u32 = 0x0001_0000;
+
+    let write_rights = FILE_WRITE_DATA | FILE_APPEND_DATA | WRITE_DAC | WRITE_OWNER | DELETE;
+
+    let mut token: HANDLE = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(CopyError::Io);
+    }
+    let mut needed = 0u32;
+    unsafe {
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+    }
+    let mut buffer = vec![0u32; (needed as usize).div_ceil(size_of::<u32>())];
+    let ok = needed != 0
+        && unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        } != 0;
+    unsafe {
+        CloseHandle(token);
+    }
+    if !ok {
+        return Err(CopyError::Io);
+    }
+    let current = unsafe { (*(buffer.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+    if current.is_null() || unsafe { IsValidSid(current) } == 0 {
+        return Err(CopyError::Io);
+    }
+    let mut system_sid = [0u8; SECURITY_MAX_SID_SIZE as usize];
+    let mut system_len = system_sid.len() as u32;
+    let mut administrators_sid = [0u8; SECURITY_MAX_SID_SIZE as usize];
+    let mut administrators_len = administrators_sid.len() as u32;
     if unsafe {
-        SetFileInformationByHandle(
-            output.as_raw_handle(),
-            FileBasicInfo,
-            (&basic as *const FILE_BASIC_INFO).cast(),
-            size_of::<FILE_BASIC_INFO>() as u32,
+        CreateWellKnownSid(
+            WinLocalSystemSid,
+            std::ptr::null_mut(),
+            system_sid.as_mut_ptr().cast(),
+            &mut system_len,
         )
     } == 0
+        || unsafe {
+            CreateWellKnownSid(
+                WinBuiltinAdministratorsSid,
+                std::ptr::null_mut(),
+                administrators_sid.as_mut_ptr().cast(),
+                &mut administrators_len,
+            )
+        } == 0
     {
-        return Err(unsupported());
+        return Err(CopyError::Io);
     }
-    output.sync_all().map_err(|_| RootError::Io)?;
+    let trusted = |sid: *mut std::ffi::c_void| unsafe {
+        EqualSid(sid, current) != 0
+            || EqualSid(sid, system_sid.as_ptr().cast_mut().cast()) != 0
+            || EqualSid(sid, administrators_sid.as_ptr().cast_mut().cast()) != 0
+    };
 
-    let mut sha256 = [0u8; 32];
-    sha256.copy_from_slice(&hasher.finalize());
-    Ok((len, sha256))
+    let mut present = 0;
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut defaulted = 0;
+    if unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
+        == 0
+    {
+        return Err(CopyError::Io);
+    }
+    // A null DACL grants every principal full control.
+    if present == 0 {
+        return Ok(false);
+    }
+    if dacl.is_null() || unsafe { IsValidAcl(dacl) } == 0 {
+        return Err(CopyError::Io);
+    }
+    let count = unsafe { (*dacl).AceCount };
+    for index in 0..count as u32 {
+        let mut ace: *mut std::ffi::c_void = std::ptr::null_mut();
+        if unsafe { GetAce(dacl, index, &mut ace) } == 0 {
+            return Err(CopyError::Io);
+        }
+        let header = unsafe { &*(ace.cast::<ACE_HEADER>()) };
+        match header.AceType {
+            ACCESS_ALLOWED_ACE_TYPE => {
+                if u32::from(header.AceFlags) & INHERIT_ONLY_ACE != 0 {
+                    continue;
+                }
+                let allowed = unsafe { &*(ace.cast::<ACCESS_ALLOWED_ACE>()) };
+                if allowed.Mask & write_rights == 0 {
+                    continue;
+                }
+                let sid = unsafe {
+                    ace.cast::<u8>()
+                        .add(offset_of!(ACCESS_ALLOWED_ACE, SidStart))
+                        .cast::<std::ffi::c_void>()
+                };
+                if unsafe { GetLengthSid(sid) } == 0 {
+                    return Err(CopyError::Io);
+                }
+                if !trusted(sid) {
+                    return Ok(false);
+                }
+            }
+            ACCESS_DENIED_ACE_TYPE | SYSTEM_AUDIT_ACE_TYPE | SYSTEM_ALARM_ACE_TYPE => {}
+            // An allow class with a different layout may grant the same rights.
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(windows)]
@@ -482,7 +734,7 @@ fn creation_time(path: &std::path::Path) -> Result<i64, RootError> {
     use std::mem::size_of;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
+        FileBasicInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO,
     };
 
     let file = open_file(path)?;
@@ -509,8 +761,8 @@ fn restore_creation_time(path: &std::path::Path, expected: i64) -> Result<(), Ro
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_BASIC_INFO, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES,
-        FileBasicInfo, GetFileInformationByHandleEx, SetFileTime,
+        FileBasicInfo, GetFileInformationByHandleEx, SetFileTime, FILE_BASIC_INFO,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES,
     };
 
     let file = std::fs::OpenOptions::new()

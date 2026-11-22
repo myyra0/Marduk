@@ -204,23 +204,22 @@ substitution limitation in
 the adapter detects divergence after an effect and retains displaced bytes; it
 does not claim prevention.
 
-## Windows native effects (implemented 2026-11-22, runtime not run)
+## Windows native effects (primitive runtime only; deploy-level not run)
 
-The Windows arms of `crates/platform/src/effects.rs` now implement the same
-contract as the Linux arms. This section records only what was actually run:
-`cargo check -p marduk-platform --all-targets --target x86_64-pc-windows-msvc`
-(type-check on a Linux host) and the host's Linux `cargo test -p
-marduk-platform`. No Windows runtime, NTFS volume, or power-cut evidence exists
-yet; `not run` is never a pass.
+The Windows arms of `crates/platform/src/effects.rs` implement the same
+contract as the Linux arms. The six `effects_primitives` witnesses pass on the
+hosted `windows-2025` job at `eb39be0` on real NTFS. That is primitive-level
+evidence: no deploy-level NTFS row, end-to-end adapter run or power-cut evidence
+exists yet; `not run` is never a pass, and qualification stays closed.
 
 | Primitive | Contract implemented | Linux runtime | Hosted `windows-2025` NTFS runtime | Power |
 |---|---|---|---|---|
-| `effects::copy_file` | `CREATE_NEW` destination, data stream, attributes, last-write time, owner/group/DACL, `FlushFileBuffers`; refuses an existing destination and fails closed with `UnsupportedTarget(Metadata)` if the supported metadata cannot be written | `effects_primitives::copy_preserves_bytes_and_last_write_time_and_refuses_existing` passed 2026-11-22 | not run | — |
+| `effects::copy_file` | `CREATE_NEW` destination, data stream, attributes, creation/access/last-write times, owner/group/DACL, `FlushFileBuffers`; an occupied destination maps to `CopyError::DestinationExists` (conflict), a lock to `CopyError::Sharing` (retryable `Io`), and only unreproducible metadata to `Unsupported(Metadata)`; a source DACL that grants write to a principal other than the current user or the SYSTEM/Administrators baseline is refused before it reaches the private area, and every post-create failure removes the partial file | `effects_primitives::copy_preserves_bytes_and_last_write_time_and_refuses_existing` and `copy_refuses_a_source_dacl_that_grants_write_to_another_principal` passed 2026-11-22 | not run | — |
 | `effects::publish` | one `MoveFileExW` with flags `0` (no `MOVEFILE_REPLACE_EXISTING`, no `MOVEFILE_COPY_ALLOWED`); an existing target fails and is left intact | `effects_primitives::publish_refuses_an_existing_target_and_leaves_it_intact` passed 2026-11-22 | not run | — |
-| `effects::replace` | exchange by three no-replace renames (target → retain, stage → target, temporary → retain); the staged object's file id, creation time, attributes and DACL are preserved, so the public target fingerprints as the sealed staged artifact; a failure returns an error, never `Ok` | `effects_primitives::replace_retains_the_displaced_file_and_keeps_the_staged_object` passed 2026-11-22 | not run | — |
+| `effects::replace` | exchange by three no-replace renames (target → `<operation>/displaced`, stage → target, displaced → retain); the canonical intermediate is the slot `evidence_for`, `prepare` and `sync_effect` already inspect, and a cut after the first rename resumes from it; the staged object's file id, creation time, attributes and DACL are preserved, so the public target fingerprints as the sealed staged artifact; a failure returns an error, never `Ok` | `effects_primitives::replace_retains_the_displaced_file_and_keeps_the_staged_object` and `interrupted_replace_keeps_the_canonical_displaced_slot_and_resumes` passed 2026-11-22 | not run | — |
 | `effects::detach` | one no-replace rename into the retain slot; an occupied slot fails, unknown bytes are never replaced | `effects_primitives::detach_preserves_an_unknown_file` passed 2026-11-22 | not run | — |
-| `effects::sync_directory` | `FlushFileBuffers` on a directory handle opened with `FILE_FLAG_BACKUP_SEMANTICS` | `effects_primitives::sync_directory_succeeds_on_a_real_directory` passed 2026-11-22 | not run | not claimed |
-| `effects::volume_qualified` | NTFS only, from `GetVolumeInformationByHandleW` on the opened root's volume; exFAT/FAT32/ReFS/unknown and unreadable roots stay unqualified | `effects_primitives::volume_qualification_reads_the_opened_root` passed 2026-11-22 (refusal branch) | not run | — |
+| `effects::sync_directory` | `FlushFileBuffers` on a directory handle opened with `FILE_FLAG_BACKUP_SEMANTICS`; not a namespace or power-cut barrier | `effects_primitives::sync_directory_succeeds_on_a_real_directory` passed 2026-11-22 | not run | not claimed |
+| `effects::volume_qualified` | `false` on Windows until deploy-level evidence exists. `volume_is_ntfs` (from `GetVolumeInformationByHandleW` on the opened root) is kept for the evidence lane; NTFS alone is not qualification | `effects_primitives::volume_qualification_reads_the_opened_root` passed 2026-11-22 (refusal branch) | not run | — |
 
 Design note: `ReplaceFileW` is deliberately not used. It merges the replaced
 file's creation time and DACL into the replacement, so the resulting public file
@@ -228,7 +227,17 @@ would not match the sealed staged `Fingerprint` (identity includes the creation
 time; metadata includes the owner/group/DACL digest). The three-rename exchange
 moves the staged object itself, which keeps every witnessed field. The target
 name is absent between the first two moves, so this is not an atomic exchange;
-every failed step returns `RootError::Io` and the caller must re-observe.
+every failed step returns an error and the caller must re-observe. The
+intermediate is `<operation>/displaced`, not a name derived beside the stage, so
+the adapter's leftover guard, evidence scan and directory sync all see the
+displaced bytes after a cut.
+
+The six file-level primitives passed hosted `windows-2025` at `eb39be0` on real
+NTFS (the run that exposed and then verified the tunneling fix). That is
+primitive-level evidence only: deploy-level NTFS rows remain `not run`, the
+namespace barrier stays `Unavailable`, and `effects_volume_qualified` therefore
+returns `false` on Windows. Native Apply stays disconnected behind
+`native_effects_gate`.
 
 Windows `native_namespace_survives_claimed_barrier` remains blocked: the
 durability barrier still reports `UnsupportedTarget(Configuration)` because
