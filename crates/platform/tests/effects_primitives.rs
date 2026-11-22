@@ -376,8 +376,39 @@ fn refuse_widened_dacl(mask: u32) {
         0
     );
     let ace = unsafe { &*(ace_ptr.cast::<windows_sys::Win32::Security::ACCESS_ALLOWED_ACE>()) };
+    // Windows expands generic rights when the ACE is stored, so compare the
+    // effective grant, not the literal bit the witness passed in.
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+    const FILE_WRITE_DATA: u32 = 2;
+    const FILE_APPEND_DATA: u32 = 4;
+    const FILE_WRITE_EA: u32 = 16;
+    const FILE_WRITE_ATTRIBUTES: u32 = 256;
+    const FILE_DELETE_CHILD: u32 = 64;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    const WRITE_OWNER: u32 = 0x0008_0000;
+    const DELETE: u32 = 0x0001_0000;
+    let write_rights = FILE_WRITE_DATA
+        | FILE_APPEND_DATA
+        | FILE_WRITE_EA
+        | FILE_WRITE_ATTRIBUTES
+        | FILE_DELETE_CHILD
+        | WRITE_DAC
+        | WRITE_OWNER
+        | DELETE;
+    let mut effective = ace.Mask;
+    if effective & MAXIMUM_ALLOWED != 0 {
+        effective = u32::MAX;
+    }
+    if effective & GENERIC_ALL != 0 {
+        effective |= u32::MAX;
+    }
+    if effective & GENERIC_WRITE != 0 {
+        effective |= windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
+    }
     assert_ne!(
-        ace.Mask & mask,
+        effective & write_rights,
         0,
         "the read-back ACE must carry the write bits under test"
     );
