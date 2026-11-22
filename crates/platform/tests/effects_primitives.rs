@@ -425,6 +425,59 @@ fn refuse_widened_dacl(mask: u32) {
 
 #[cfg(windows)]
 #[test]
+fn staged_copy_preserves_owner_group_dacl_attributes_and_last_write() {
+    use std::os::windows::fs::MetadataExt;
+    use std::process::Command;
+
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
+
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source");
+    let ordinary = directory.path().join("ordinary");
+    let destination = directory.path().join("stage");
+    fs::write(&source, STAGED).unwrap();
+    fs::write(&ordinary, STAGED).unwrap();
+    set_current_user_only_dacl(&source);
+    assert!(
+        Command::new("attrib")
+            .arg("+H")
+            .arg(&source)
+            .status()
+            .unwrap()
+            .success(),
+        "attrib +H must set a non-default attribute"
+    );
+    set_modified(&source, modified());
+
+    let source_fingerprint = fingerprint_path(&source).unwrap();
+    let ordinary_fingerprint = fingerprint_path(&ordinary).unwrap();
+    assert_ne!(
+        source_fingerprint.metadata, ordinary_fingerprint.metadata,
+        "the staged copy must be observed against metadata that actually differs"
+    );
+
+    copy_file(&source, &destination).unwrap();
+    let copy_fingerprint = fingerprint_path(&destination).unwrap();
+    assert_eq!(
+        copy_fingerprint.metadata, source_fingerprint.metadata,
+        "the staged copy carries the source owner, group, DACL, attributes and last-write"
+    );
+    assert_eq!(fs::read(&destination).unwrap(), STAGED);
+    let copied = fs::metadata(&destination).unwrap();
+    assert_eq!(
+        copied.file_attributes() & FILE_ATTRIBUTE_HIDDEN,
+        FILE_ATTRIBUTE_HIDDEN
+    );
+    assert_ne!(copied.file_attributes() & FILE_ATTRIBUTE_ARCHIVE, 0);
+    assert_eq!(
+        copied.last_write_time(),
+        fs::metadata(&source).unwrap().last_write_time()
+    );
+}
+
+#[cfg(windows)]
+#[test]
 fn copy_succeeds_for_an_inherited_current_user_only_dacl() {
     let directory = tempfile::tempdir().unwrap();
     let parent = directory.path().join("parent");

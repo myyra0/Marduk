@@ -10,8 +10,12 @@
 mod zip_fixture;
 
 use std::collections::BTreeMap;
+use std::ffi::CString;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use marduk_core::deployment::PlanId;
 use marduk_core::ids::ProfileRevision;
@@ -28,6 +32,65 @@ const BASE: &[u8] = b"base\n";
 const POST: &[u8] = b"b\n";
 const ONLY: &[u8] = b"only-a\n";
 const OUTSIDE: &[u8] = b"user\n";
+
+// The admitted original and the staged payload deliberately differ in every
+// scoped metadata field Restore must reproduce, so equal fingerprints on
+// identical fixtures cannot stand in for preservation.
+const ORIGINAL_MODE: u32 = 0o640;
+const STAGED_MODE: u32 = 0o600;
+const ORIGINAL_MTIME: (u64, u32) = (1_500_000_000, 123_456_789);
+const STAGED_MTIME: (u64, u32) = (1_600_000_000, 987_654_321);
+
+fn stamped((seconds, nanos): (u64, u32)) -> SystemTime {
+    UNIX_EPOCH + Duration::new(seconds, nanos)
+}
+
+fn set_mode(path: &Path, mode: u32) {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+fn set_mtime(path: &Path, time: SystemTime) {
+    let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_times(fs::FileTimes::new().set_modified(time))
+        .unwrap();
+}
+
+fn mode_of(path: &Path) -> u32 {
+    fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+fn mtime_of(path: &Path) -> (u64, u32) {
+    let modified = fs::metadata(path)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(UNIX_EPOCH)
+        .unwrap();
+    (modified.as_secs(), modified.subsec_nanos())
+}
+
+fn owner_of(path: &Path) -> (u32, u32) {
+    let metadata = fs::metadata(path).unwrap();
+    (metadata.uid(), metadata.gid())
+}
+
+fn set_xattr(path: &Path, name: &std::ffi::CStr, value: &[u8]) -> std::io::Result<()> {
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let result = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
 
 fn expect_ok(envelope: Envelope<Value>) -> Value {
     match envelope {
@@ -85,6 +148,10 @@ impl Fixture {
         fs::write(game.join("Data/textures/winner.dds"), BASE).unwrap();
         fs::write(game.join("Data/textures/untouched.txt"), b"keep\n").unwrap();
         fs::write(game.join("Data/outside-plan.txt"), OUTSIDE).unwrap();
+        // The install target carries metadata the staged payload does not.
+        let winner = game.join("Data/textures/winner.dds");
+        set_mode(&winner, ORIGINAL_MODE);
+        set_mtime(&winner, stamped(ORIGINAL_MTIME));
         let initial = tree(&game);
         let workspace = Workspace::open(&app).unwrap();
         Self {
@@ -123,6 +190,19 @@ impl Fixture {
     /// committed operation.
     fn apply_one(&mut self) -> (PlanId, Operation) {
         self.setup();
+        let (revision, _) = self.import_and_order();
+        let preview = self
+            .workspace
+            .proof_preview_deployment(ProfileRevision::new(revision))
+            .unwrap();
+        let plan = PlanId::try_from_u64(preview.id.as_ref().unwrap().parse().unwrap()).unwrap();
+        let operation = self.workspace.proof_apply_deployment(plan).unwrap();
+        (plan, operation)
+    }
+
+    /// Import the native pair and order its member, returning the new revision
+    /// and the imported snapshot.
+    fn import_and_order(&mut self) -> (u64, Value) {
         let zip = self.zip();
         let prepared = expect_ok(self.send(json!({
             "op": "import_preview",
@@ -144,13 +224,17 @@ impl Fixture {
             },
         })));
         let revision: u64 = ordered["revision"].as_str().unwrap().parse().unwrap();
-        let preview = self
-            .workspace
-            .proof_preview_deployment(ProfileRevision::new(revision))
-            .unwrap();
-        let plan = PlanId::try_from_u64(preview.id.as_ref().unwrap().parse().unwrap()).unwrap();
-        let operation = self.workspace.proof_apply_deployment(plan).unwrap();
-        (plan, operation)
+        (revision, imported)
+    }
+
+    /// The single imported revision's payload for `textures/winner.dds`.
+    fn staged_winner(&self) -> PathBuf {
+        let revisions: Vec<PathBuf> = fs::read_dir(self.app.join("revisions"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(revisions.len(), 1, "one imported revision");
+        revisions[0].join("payload/textures/winner.dds")
     }
 
     /// Replace the app-data root with a link the effect probe refuses. Open
@@ -174,29 +258,26 @@ fn qualified_native_round_trip_retains_backups_and_restores_the_original_tree() 
     assert_eq!(status["availability"]["deploy"]["available"], json!(false));
     assert_eq!(status["availability"]["restore"]["available"], json!(false));
 
-    let zip = fixture.zip();
-    let prepared = expect_ok(fixture.send(json!({
-        "op": "import_preview",
-        "args": {
-            "zip": zip.to_str().unwrap(),
-            "name": "Native pair",
-            "atRevision": "0",
-        },
-    })));
-    let imported = expect_ok(fixture.send(json!({
-        "op": "import_apply",
-        "args": { "importId": prepared["id"] },
-    })));
+    let (revision, imported) = fixture.import_and_order();
     assert_eq!(imported["members"].as_array().unwrap().len(), 1);
 
-    let ordered = expect_ok(fixture.send(json!({
-        "op": "order",
-        "args": {
-            "atRevision": imported["revision"],
-            "memberIds": [imported["members"][0]["id"].as_str().unwrap()],
-        },
-    })));
-    let revision: u64 = ordered["revision"].as_str().unwrap().parse().unwrap();
+    // Give the staged payload metadata that differs from the install target:
+    // the copy must carry the payload's mode and time, and Restore must bring
+    // back the original's. Both values are asserted exactly below.
+    let staged_winner = fixture.staged_winner();
+    set_mode(&staged_winner, STAGED_MODE);
+    set_mtime(&staged_winner, stamped(STAGED_MTIME));
+    eprintln!(
+        "metadata before apply: target mode {:04o} mtime {:?} uid/gid {:?}; \
+         staged mode {:04o} mtime {:?}",
+        mode_of(&fixture.game.join("Data/textures/winner.dds")),
+        mtime_of(&fixture.game.join("Data/textures/winner.dds")),
+        owner_of(&fixture.game.join("Data/textures/winner.dds")),
+        mode_of(&staged_winner),
+        mtime_of(&staged_winner),
+    );
+    assert_ne!(ORIGINAL_MODE, STAGED_MODE);
+    assert_ne!(ORIGINAL_MTIME, STAGED_MTIME);
 
     let preview = fixture
         .workspace
@@ -214,11 +295,34 @@ fn qualified_native_round_trip_retains_backups_and_restores_the_original_tree() 
     let operation_id: u64 = operation.id.parse().unwrap();
     let generation = operation.generation_id.clone().expect("generation");
 
+    let deployed_winner = fixture.game.join("Data/textures/winner.dds");
     let after = tree(&fixture.game);
     assert_eq!(after["Data/textures/winner.dds"], POST);
     assert_eq!(after["Data/textures/a-only.dds"], ONLY);
     assert_eq!(after["Data/textures/untouched.txt"], b"keep\n");
     assert_eq!(after["Data/outside-plan.txt"], OUTSIDE);
+
+    // Bytes and scoped metadata together: a metadata-only comparison cannot
+    // mask a byte failure, and vice versa. The target now carries the staged
+    // payload's mode, uid/gid, mtime and bytes, not the displaced original's.
+    assert_eq!(fs::read(&deployed_winner).unwrap(), POST);
+    assert_eq!(
+        mode_of(&deployed_winner),
+        STAGED_MODE,
+        "apply publishes the staged payload's mode"
+    );
+    assert_eq!(
+        mtime_of(&deployed_winner),
+        STAGED_MTIME,
+        "apply publishes the staged payload's mtime"
+    );
+    assert_eq!(owner_of(&deployed_winner), owner_of(&staged_winner));
+    eprintln!(
+        "metadata after apply: mode {:04o} mtime {:?} uid/gid {:?}",
+        mode_of(&deployed_winner),
+        mtime_of(&deployed_winner),
+        owner_of(&deployed_winner),
+    );
 
     // The status ref for the replaced ordinal must name the actually displaced
     // object, not only the pre-image copy. The sealed retain location is the
@@ -253,6 +357,20 @@ fn qualified_native_round_trip_retains_backups_and_restores_the_original_tree() 
         fs::read(&sealed).unwrap(),
         BASE,
         "the actually displaced object is retained with its original bytes"
+    );
+    assert_eq!(
+        mode_of(&sealed),
+        ORIGINAL_MODE,
+        "the retained displaced original keeps its mode"
+    );
+    assert_eq!(
+        mtime_of(&sealed),
+        ORIGINAL_MTIME,
+        "the retained displaced original keeps its mtime"
+    );
+    assert_eq!(
+        owner_of(&sealed),
+        owner_of(&fixture.game.join("Data/textures/winner.dds"))
     );
 
     // Each intent's original backup is the exact pre-deploy artifact; a new
@@ -310,6 +428,27 @@ fn qualified_native_round_trip_retains_backups_and_restores_the_original_tree() 
 
     assert_eq!(tree(&fixture.game), fixture.initial);
 
+    // Restore publishes the original's bytes and scoped metadata, not the
+    // deployed object's: the two differ on both axes.
+    let restored_winner = fixture.game.join("Data/textures/winner.dds");
+    assert_eq!(fs::read(&restored_winner).unwrap(), BASE);
+    assert_eq!(
+        mode_of(&restored_winner),
+        ORIGINAL_MODE,
+        "restore brings back the original mode"
+    );
+    assert_eq!(
+        mtime_of(&restored_winner),
+        ORIGINAL_MTIME,
+        "restore brings back the original mtime"
+    );
+    eprintln!(
+        "metadata after restore: mode {:04o} mtime {:?} uid/gid {:?}",
+        mode_of(&restored_winner),
+        mtime_of(&restored_winner),
+        owner_of(&restored_winner),
+    );
+
     // Restore consumes the object it displaced into its own sealed retain
     // location; its status ref must resolve to the deployed bytes.
     let restore_id: u64 = operation.id.parse().unwrap();
@@ -347,6 +486,63 @@ fn qualified_native_round_trip_retains_backups_and_restores_the_original_tree() 
         RestoreResult::NoActiveDeployment { code } if code == Code::NoActiveDeployment
     ));
     assert_eq!(tree(&fixture.game), fixture.initial);
+}
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn visible_xattr_on_an_original_is_refused_before_any_write() {
+    let mut fixture = Fixture::new();
+    fixture.setup();
+    let winner = fixture.game.join("Data/textures/winner.dds");
+
+    match set_xattr(&winner, c"user.marduk", b"x") {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EOPNOTSUPP) | Some(libc::EPERM)
+            ) =>
+        {
+            eprintln!("not run: this scratch filesystem refuses user xattrs: {error}");
+            return;
+        }
+        Err(error) => panic!("setting a test xattr failed: {error}"),
+    }
+
+    let (revision, _) = fixture.import_and_order();
+    let error = fixture
+        .workspace
+        .proof_preview_deployment(ProfileRevision::new(revision))
+        .expect_err("a visible xattr on the original is outside the admitted metadata set");
+    assert_eq!(error.code, Code::UnsupportedTarget);
+    // The composed API does not carry the platform `Metadata` reason through
+    // `DeployError`; the typed code is the refusal this layer promises.
+    assert_eq!(error.detail, None);
+
+    // No game stage, operation directory, byte or metadata change: eligibility
+    // refused before any write.
+    assert_eq!(tree(&fixture.game), fixture.initial);
+    assert_eq!(mode_of(&winner), ORIGINAL_MODE);
+    assert_eq!(mtime_of(&winner), ORIGINAL_MTIME);
+    let ops = fixture.app.join("effects/ops");
+    assert!(
+        !ops.exists() || fs::read_dir(&ops).unwrap().next().is_none(),
+        "a refused preview creates no operation-owned directory"
+    );
+
+    // `trusted.*` is excluded by the contract as unobserved, and only a
+    // privileged process can attach it; an ordinary run cannot exercise what an
+    // unprivileged probe would do. Record the refusal of the attempt, not a pass.
+    match set_xattr(&winner, c"trusted.marduk", b"x") {
+        Ok(()) => eprintln!(
+            "not run: this environment can attach trusted.*; the unprivileged probe case \
+             was not exercised"
+        ),
+        Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+            eprintln!("not run: trusted.* requires CAP_SYS_ADMIN for an ordinary user: {error}")
+        }
+        Err(error) => panic!("unexpected trusted.* probe failure: {error}"),
+    }
 }
 
 #[test]

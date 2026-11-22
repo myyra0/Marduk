@@ -416,6 +416,7 @@ name = "marduk-workspace"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "libc",
  "marduk-core",
  "marduk-games",
  "marduk-platform",
