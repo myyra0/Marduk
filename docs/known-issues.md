@@ -7,13 +7,6 @@ Last reviewed: 2026-11-22, at the commit recorded in `docs/research/m1-native-re
 
 ## Open defects
 
-**A mod file changed after import can still be previewed and applied.**
-`crates/storage/src/native_effects.rs` (`source`) fingerprints the live payload instead of the digest recorded in
-the catalog. Change a staged payload between import and deploy and the deploy applies the changed bytes. Affects
-anyone whose library files are modified outside Marduk (sync tools, another process, a bad copy). Closing it means
-resolving the catalogued winner and comparing its stored length and digest before sealing and staging, with a
-witness that mutates a payload after import and expects a typed refusal.
-
 **A displaced file can stop being flagged as unresolved.**
 `crates/storage/src/operation_journal.rs` (`write_readable_slot`) decides blocking from the latest observation only.
 A slot that was positively reported as displaced, then briefly unreadable, then readable again, clears the unresolved
@@ -26,16 +19,6 @@ and alternate slots.
 slot is occupied, even if the stage is unreadable or holds an unexpected object. A matching target and displaced
 fingerprint can then settle cleanly without accounting for every slot. Closing it means classifying both occupied
 slots explicitly and refusing a clean settle unless all of them are positively accounted for.
-
-**A read-only original can fail after the public write on Windows.**
-`crates/platform/src/effects.rs` still reopens the retained original with `FILE_WRITE_ATTRIBUTES` after the moves. An
-original that is readable for preview but denies that right fails *after* the game folder has changed. Closing it
-means binding and proving timestamp-write authority before publishing, or dropping the post-move write entirely, with
-a witness under an ordinary NTFS token.
-
-**One evidence row names the wrong revision.**
-`docs/research/m1-native-results.md:485` attributes the new flush sequence to `62b9b94b`, which still contained the
-file flushes that were later removed. It should name the commit that carries the current sequence.
 
 ## Known residual, documented rather than fixed
 

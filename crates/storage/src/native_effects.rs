@@ -34,7 +34,7 @@ use marduk_core::root_identity::{
 use marduk_core::targets::{RelativePath, TargetFile};
 use marduk_platform::effects;
 use marduk_platform::{GateError, InstallationBinding, WriterGate, WriterGuard};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 /// A test seam for observing the order of private durability work relative to
 /// public effects. Recording is off unless a test asks for it.
@@ -243,6 +243,56 @@ impl NativeEffects {
             return Err(RootError::OutsideBoundary);
         }
         Ok(resolved)
+    }
+
+    /// Open the pinned catalog read-only and re-prove the leaf after SQLite
+    /// follows the pathname.
+    fn catalog_connection(&self) -> Result<Connection, DeployError> {
+        let path = self
+            .catalog
+            .path(&self.root_handle)
+            .map_err(|_| DeployError::Io)?;
+        let connection = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|_| DeployError::Io)?;
+        self.catalog
+            .verify(&self.root_handle)
+            .map_err(|_| DeployError::Io)?;
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(|_| DeployError::Io)?;
+        Ok(connection)
+    }
+
+    /// The catalogued row for one installed revision entry. The path may be
+    /// stored under a different case than the merged target spelling, so the
+    /// lookup folds case exactly as payload path resolution does.
+    fn catalogued_source(
+        &self,
+        installed: InstalledRevisionId,
+        path: &RelativePath,
+    ) -> Result<(RelativePath, u64, [u8; 32]), DeployError> {
+        let connection = self.catalog_connection()?;
+        let revision = i64::try_from(installed.get()).map_err(|_| DeployError::StalePlan)?;
+        let row: Option<(String, i64, Vec<u8>)> = connection
+            .query_row(
+                "SELECT path, len, sha FROM revision_files \
+                 WHERE revision_id = ?1 AND role = 'data' AND lower(path) = lower(?2)",
+                params![revision, path.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|_| DeployError::Io)?;
+        let Some((stored, len, sha)) = row else {
+            return Err(DeployError::StalePlan);
+        };
+        Ok((
+            RelativePath::parse(&stored).map_err(|_| DeployError::StalePlan)?,
+            u64::try_from(len).map_err(|_| DeployError::StalePlan)?,
+            sha.try_into().map_err(|_| DeployError::StalePlan)?,
+        ))
     }
 
     /// Hold the identity-proven parent handle across the public effect.
@@ -1109,23 +1159,7 @@ impl DeploymentInputs for NativeEffects {
     }
 
     fn profile_revision(&mut self, profile: ProfileId) -> Result<ProfileRevision, DeployError> {
-        let path = self
-            .catalog
-            .path(&self.root_handle)
-            .map_err(|_| DeployError::Io)?;
-        let connection = Connection::open_with_flags(
-            &path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|_| DeployError::Io)?;
-        // SQLite follows the pathname itself; prove the leaf after that open
-        // still names the pinned catalog.
-        self.catalog
-            .verify(&self.root_handle)
-            .map_err(|_| DeployError::Io)?;
-        connection
-            .busy_timeout(Duration::from_secs(5))
-            .map_err(|_| DeployError::Io)?;
+        let connection = self.catalog_connection()?;
         crate::library::read_profile_revision(&connection, profile).map_err(|_| DeployError::Io)
     }
 
@@ -1134,18 +1168,25 @@ impl DeploymentInputs for NativeEffects {
         installed: InstalledRevisionId,
         path: &RelativePath,
     ) -> Result<SourceRef, DeployError> {
-        let source_path = self.source_path(installed, path)?;
-        let fingerprint = effects::fingerprint_path(&source_path).map_err(|error| match error {
+        // The catalogued row, not the live payload, decides what may be
+        // deployed. A payload changed after import is refused before any
+        // operation directory, stage copy or game write.
+        let (stored_path, len, sha256) = self.catalogued_source(installed, path)?;
+        let source_path = self.source_path(installed, &stored_path)?;
+        let live = effects::fingerprint_path(&source_path).map_err(|error| match error {
             RootError::TargetUnavailable => DeployError::StalePlan,
             RootError::UnsupportedTarget(_) => DeployError::UnsupportedTarget,
             RootError::Io => DeployError::Io,
             _ => DeployError::InvalidPath,
         })?;
+        if live.len != len || live.sha256 != sha256 {
+            return Err(DeployError::StalePlan);
+        }
         Ok(SourceRef {
             installed,
-            path: path.clone(),
-            sha256: fingerprint.sha256,
-            len: fingerprint.len,
+            path: stored_path,
+            sha256,
+            len,
         })
     }
 }

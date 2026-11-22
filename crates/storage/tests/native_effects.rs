@@ -234,6 +234,7 @@ fn unqualified_installation_root_is_refused_before_any_write() {
 #[ignore = "requires TMPDIR on tmpfs or Btrfs"]
 fn concurrent_edit_during_apply_conflicts_and_preserves_external_bytes() {
     let fixture = Fixture::new();
+    drop(fixture.journal());
     let mut port = fixture.adapter();
 
     let target = TargetFile {
@@ -284,6 +285,52 @@ fn concurrent_edit_during_apply_conflicts_and_preserves_external_bytes() {
     assert_eq!(fs::read(forward.join("step")).unwrap(), BASE);
     assert_eq!(fs::read(forward.join("stage")).unwrap(), POST);
     assert!(!forward.join("displaced").exists());
+}
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn payload_changed_after_import_is_refused_at_preview_and_apply() {
+    let fixture = Fixture::new();
+    let mut journal = fixture.journal();
+    let mut port = fixture.adapter();
+    let payload = fixture.app.join("revisions/7/payload").join(WINNER);
+    let ops = fixture.app.join("effects/ops");
+
+    // The catalog recorded the imported digest; the live payload no longer
+    // matches it. Preview must trust the recorded row, not the live bytes.
+    fs::write(&payload, b"tampered\n").unwrap();
+    let error = marduk_core::deployment::preview_deployment(
+        &mut journal,
+        &mut port,
+        &profile(),
+        &inputs(),
+        &fixture.installation,
+        &fixture.data,
+    )
+    .unwrap_err();
+    assert_eq!(error, DeployError::StalePlan);
+    assert_eq!(fs::read(fixture.target(WINNER)).unwrap(), BASE);
+    assert!(!ops.exists(), "preview created an operation directory");
+
+    // Restore the catalogued bytes, preview cleanly, then change the payload
+    // before apply. The reviewed plan still carries the catalogued digest, so
+    // apply refuses before claiming or staging anything.
+    fs::write(&payload, POST).unwrap();
+    let plan = marduk_core::deployment::preview_deployment(
+        &mut journal,
+        &mut port,
+        &profile(),
+        &inputs(),
+        &fixture.installation,
+        &fixture.data,
+    )
+    .unwrap();
+    fs::write(&payload, b"late-change\n").unwrap();
+    let error = commit_deployment(&mut journal, &mut port, plan.id, || false).unwrap_err();
+    assert_eq!(error, DeployError::StalePlan);
+    assert_eq!(fs::read(fixture.target(WINNER)).unwrap(), BASE);
+    assert!(journal.claimed(plan.id).unwrap().is_none());
+    assert!(!ops.exists(), "apply created an operation directory");
 }
 
 #[test]
@@ -694,6 +741,7 @@ fn unreadable_private_slot_is_unavailable_not_absent() {
     use std::os::unix::fs::PermissionsExt;
 
     let fixture = Fixture::new();
+    drop(fixture.journal());
     let mut port = fixture.adapter();
     let target = TargetFile {
         root: RootRole::Data,
