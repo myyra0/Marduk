@@ -68,3 +68,14 @@ There is no longer a volume-dependent difference: the frozen `library_contract` 
 - `library_stage.rs:274` maps `ArchiveError::Io` from `admit_zip` to `StageUnavailable`; every other admission error stays `StageChanged`. No new test drives either branch: both need an injected syscall failure, so only the classification code changed.
 - `Catalog::open` creates `revisions/` with mode `0700` (`private_directory`); `revisions_directory_is_private_to_the_owner` asserts `0700` on create and after reopen.
 
+
+### Handle-relative private staging (2026-11-22)
+
+Base `8110c38`. `NativeStage` now keeps every archive and payload effect on the verified revision handle: parents are created with `mkdirat(0700)`, leaves with `openat2(O_CREAT|O_EXCL|O_NOFOLLOW)`, and hashing, listing, fsyncs and reclaim unlinks resolve beneath the handle with `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_XDEV`. The revision name is removed through the bound `revisions/` handle. This closes the path-join window for bytes; it does not qualify publication.
+
+- `MARDUK_M1_BTRFS_SCRATCH=/var/tmp cargo test -p marduk-platform --test library_boundary` — 8 witnesses ignored without `--ignored` (none pass silently); with `--ignored --test-threads=1`, 8 passed.
+- New witnesses redirect a staged revision after its handle was opened and require `StageChanged`/`StageUnavailable` from `reobserve` and `reclaim` with the redirect target untouched and the original revision retained.
+- `TMPDIR=/tmp cargo test -p marduk-platform`, `TMPDIR=/tmp cargo test -p marduk-storage`, `cargo fmt --all -- --check`, `cargo build --workspace --locked`, `TMPDIR=/tmp cargo test --workspace --locked` — passed.
+- Windows compile check passed; Windows/NTFS staging remains `Unsupported(Configuration)`. `Catalog::open` remains `StageUnavailable` and no native Apply is connected.
+
+Final-window rename containment remains the blocker: publication renames still lack an expected-parent primitive. No native wiring is unlocked.

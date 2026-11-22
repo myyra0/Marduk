@@ -9,7 +9,7 @@
 //! ZIP path.
 
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -23,7 +23,6 @@ use sha2::{Digest, Sha256};
 
 use crate::WriterGuard;
 
-const REVISIONS_DIR: &str = "revisions";
 const ARCHIVE_FILE: &str = "archive.zip";
 const PAYLOAD_DIR: &str = "payload";
 
@@ -76,15 +75,15 @@ impl NativeStage {
         let owner = revision.identity().clone();
         record_owner(&owner)?;
         // The caller's ownership write can take time; re-prove the bound tree
-        // before the first payload byte is written through the path.
+        // before the first archive byte is written.
         self.tree
             .reverify_revision(&name, &revision)
             .map_err(fsops::stage_error)?;
 
-        let directory = self.revision_dir(&name);
-        let archive = directory.join(ARCHIVE_FILE);
-        let archive_sha256 = copy_archive(input, &archive)?;
-        let files = extract(&directory, &archive)?;
+        // Every byte below is written relative to the revision handle opened
+        // above; a racing path swap cannot redirect the archive or payload.
+        let archive_sha256 = copy_archive(&revision, input)?;
+        let files = extract(&revision)?;
         let evidence = StageEvidence {
             allocation,
             archive_sha256,
@@ -94,8 +93,8 @@ impl NativeStage {
         self.tree
             .reverify_revision(&name, &revision)
             .map_err(fsops::stage_error)?;
-        verify_tree(&directory, &evidence)?;
-        flush(&self.root, &directory, &evidence)?;
+        verify_tree(&revision, &evidence)?;
+        flush(&revision, &evidence)?;
         // The receipt is issued only after the bound handles and their paths are
         // re-observed unchanged; content checks alone are not boundary evidence.
         self.tree
@@ -116,7 +115,7 @@ impl NativeStage {
         if revision.identity() != &evidence.owner {
             return Err(ImportError::StageChanged);
         }
-        verify_tree(&self.revision_dir(&name), evidence)?;
+        verify_tree(&revision, evidence)?;
         self.tree
             .reverify_revision(&name, &revision)
             .map_err(fsops::stage_error)
@@ -142,62 +141,36 @@ impl NativeStage {
             .reverify_revision(&name, &revision)
             .map_err(fsops::stage_error)?;
 
-        let directory = self.revision_dir(&name);
-        verify_tree(&directory, evidence)?;
+        verify_tree(&revision, evidence)?;
 
-        remove_file_if_present(&directory.join(ARCHIVE_FILE))?;
+        revision
+            .remove_relative_file(&[ARCHIVE_FILE])
+            .map_err(|_| ImportError::Storage)?;
         for file in &evidence.files {
-            remove_file_if_present(&payload_path(&directory, file.target.relative.as_str()))?;
+            revision
+                .remove_relative_file(&payload_components(file.target.relative.as_str()))
+                .map_err(|_| ImportError::Storage)?;
         }
-        prune(&directory, evidence)?;
+        prune(&revision, evidence)?;
+        match self.tree.remove_revision_dir(&name) {
+            Ok(true) => {}
+            Ok(false) => return Err(ImportError::StageChanged),
+            Err(_) => return Err(ImportError::Storage),
+        }
         self.tree
             .sync_revisions()
             .map_err(|_| ImportError::Storage)?;
         fsops::sync_dir(&self.root).map_err(|_| ImportError::Storage)
     }
-
-    fn revision_dir(&self, name: &str) -> PathBuf {
-        self.root.join(REVISIONS_DIR).join(name)
-    }
 }
 
-/// The staged tree is private application data: no group or other access.
-#[cfg(all(test, unix))]
-fn private_create_dir(path: &Path) -> io::Result<()> {
-    #[cfg_attr(not(unix), allow(unused_mut))]
-    let mut builder = fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(path)
-}
-
-fn private_create_dir_all(path: &Path) -> io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(path)
-}
-
-fn private_create_file(path: &Path) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path)
-}
-
-fn copy_archive(input: &mut dyn Read, path: &Path) -> Result<[u8; 32], ImportError> {
-    let mut file = private_create_file(path).map_err(|_| ImportError::StageUnavailable)?;
+fn copy_archive(
+    revision: &fsops::StagedDirectory,
+    input: &mut dyn Read,
+) -> Result<[u8; 32], ImportError> {
+    let mut file = revision
+        .create_private_file(&[ARCHIVE_FILE])
+        .map_err(|_| ImportError::StageUnavailable)?;
     let mut hasher = Sha256::new();
     let mut total = 0u64;
     let mut buffer = [0u8; 64 * 1024];
@@ -226,8 +199,10 @@ fn copy_archive(input: &mut dyn Read, path: &Path) -> Result<[u8; 32], ImportErr
     Ok(hasher.finalize().into())
 }
 
-fn extract(directory: &Path, archive: &Path) -> Result<Vec<PayloadFile>, ImportError> {
-    let file = fsops::open_regular(archive).map_err(|_| ImportError::StageUnavailable)?;
+fn extract(revision: &fsops::StagedDirectory) -> Result<Vec<PayloadFile>, ImportError> {
+    let file = revision
+        .open_relative_file(&[ARCHIVE_FILE])
+        .map_err(|_| ImportError::StageUnavailable)?;
     let mut admitted = admit_zip(file, M1_ZIP_LIMITS).map_err(ImportError::Archive)?;
 
     let mut files = Vec::with_capacity(admitted.entries().len());
@@ -236,19 +211,17 @@ fn extract(directory: &Path, archive: &Path) -> Result<Vec<PayloadFile>, ImportE
             let entry = &admitted.entries()[index];
             (entry.path.clone(), entry.uncompressed_len)
         };
-        let path = payload_path(directory, relative.as_str());
-        if let Some(parent) = path.parent() {
-            private_create_dir_all(parent).map_err(|_| ImportError::Storage)?;
-        }
-        let file = private_create_file(&path).map_err(|error| {
-            // A duplicate path is a proved shape conflict. A refused or
-            // exhausted filesystem leaves the stage unverified, not changed.
-            if error.kind() == io::ErrorKind::AlreadyExists {
-                ImportError::StageChanged
-            } else {
-                ImportError::StageUnavailable
-            }
-        })?;
+        let file = revision
+            .create_private_file(&payload_components(relative.as_str()))
+            .map_err(|error| {
+                // A duplicate path is a proved shape conflict. A refused or
+                // exhausted filesystem leaves the stage unverified, not changed.
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    ImportError::StageChanged
+                } else {
+                    ImportError::StageUnavailable
+                }
+            })?;
         let mut writer = HashingFile::new(file);
         let written = admitted
             .copy_entry(index, &mut writer)
@@ -270,48 +243,56 @@ fn extract(directory: &Path, archive: &Path) -> Result<Vec<PayloadFile>, ImportE
     Ok(files)
 }
 
-fn flush(root: &Path, directory: &Path, evidence: &StageEvidence) -> Result<(), ImportError> {
-    fsops::sync_file(&directory.join(ARCHIVE_FILE))?;
+fn flush(revision: &fsops::StagedDirectory, evidence: &StageEvidence) -> Result<(), ImportError> {
+    sync_relative_file(revision, &[ARCHIVE_FILE])?;
+    let mut directories = BTreeSet::new();
+    directories.insert(Vec::<String>::new());
     for file in &evidence.files {
-        fsops::sync_file(&payload_path(directory, file.target.relative.as_str()))?;
-    }
-    sync_ancestors(&directory.join(ARCHIVE_FILE), root)?;
-    for file in &evidence.files {
-        sync_ancestors(
-            &payload_path(directory, file.target.relative.as_str()),
-            root,
-        )?;
-    }
-    fsops::sync_dir(directory).map_err(|_| ImportError::Storage)
-}
-
-fn sync_ancestors(path: &Path, root: &Path) -> Result<(), ImportError> {
-    let mut current = path.parent();
-    while let Some(directory) = current {
-        fsops::sync_dir(directory).map_err(|_| ImportError::Storage)?;
-        if directory == root {
-            break;
+        sync_relative_file(revision, &payload_components(file.target.relative.as_str()))?;
+        let mut directory = vec![PAYLOAD_DIR.to_owned()];
+        directories.insert(directory.clone());
+        let components = file.target.relative.as_str().split('/').collect::<Vec<_>>();
+        for component in &components[..components.len().saturating_sub(1)] {
+            directory.push((*component).to_owned());
+            directories.insert(directory.clone());
         }
-        current = directory.parent();
+    }
+    for directory in directories {
+        let relative = directory.iter().map(String::as_str).collect::<Vec<_>>();
+        revision
+            .sync_relative_dir(&relative)
+            .map_err(|_| ImportError::Storage)?;
     }
     Ok(())
 }
 
+fn sync_relative_file(
+    revision: &fsops::StagedDirectory,
+    components: &[&str],
+) -> Result<(), ImportError> {
+    revision
+        .open_relative_file(components)
+        .and_then(|file| file.sync_all())
+        .map_err(|_| ImportError::Storage)
+}
+
 /// Only a proved digest, length or shape mismatch is `StageChanged`.
 /// Permissions and transient I/O failures leave the stage unverified.
-fn verify_tree(directory: &Path, evidence: &StageEvidence) -> Result<(), ImportError> {
-    match fsops::directory_identity(directory) {
-        Ok(actual) if actual == evidence.owner => {}
-        Ok(_) => return Err(ImportError::StageChanged),
-        Err(_) => return Err(ImportError::StageUnavailable),
+fn verify_tree(
+    revision: &fsops::StagedDirectory,
+    evidence: &StageEvidence,
+) -> Result<(), ImportError> {
+    if revision.identity() != &evidence.owner {
+        return Err(ImportError::StageChanged);
     }
 
-    let archive = directory.join(ARCHIVE_FILE);
-    let (archive_sha256, _) = hash_regular(&archive)?;
+    let (archive_sha256, _) = hash_regular(revision, &[ARCHIVE_FILE])?;
     if archive_sha256 != evidence.archive_sha256 {
         return Err(ImportError::StageChanged);
     }
-    let archive_file = fsops::open_regular(&archive).map_err(|_| ImportError::StageUnavailable)?;
+    let archive_file = revision
+        .open_relative_file(&[ARCHIVE_FILE])
+        .map_err(|_| ImportError::StageUnavailable)?;
     // A read failure is not an admission shape error: the snapshot stays
     // unverified rather than proved changed.
     admit_zip(archive_file, M1_ZIP_LIMITS).map_err(|error| match error {
@@ -319,23 +300,12 @@ fn verify_tree(directory: &Path, evidence: &StageEvidence) -> Result<(), ImportE
         _ => ImportError::StageChanged,
     })?;
 
-    let payload = directory.join(PAYLOAD_DIR);
     let mut top_level = BTreeSet::new();
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(_) => return Err(ImportError::StageUnavailable),
-    };
-    for entry in entries {
-        let entry = entry.map_err(|_| ImportError::StageUnavailable)?;
-        let name = entry
-            .file_name()
-            .to_str()
-            .map(str::to_owned)
-            .ok_or(ImportError::StageChanged)?;
-        let kind = entry
-            .file_type()
-            .map_err(|_| ImportError::StageUnavailable)?;
-        match (name.as_str(), kind.is_file(), kind.is_dir()) {
+    for (name, is_file, is_dir) in revision
+        .list_relative(&[])
+        .map_err(|_| ImportError::StageUnavailable)?
+    {
+        match (name.as_str(), is_file, is_dir) {
             (ARCHIVE_FILE, true, false) => {}
             (PAYLOAD_DIR, false, true) => {}
             _ => return Err(ImportError::StageChanged),
@@ -347,8 +317,8 @@ fn verify_tree(directory: &Path, evidence: &StageEvidence) -> Result<(), ImportE
     }
 
     let mut found = BTreeSet::new();
-    if payload.is_dir() {
-        collect_files(&payload, "", &mut found)?;
+    if top_level.contains(PAYLOAD_DIR) {
+        collect_files(revision, &mut vec![PAYLOAD_DIR.to_owned()], &mut found)?;
     } else if !evidence.files.is_empty() {
         return Err(ImportError::StageChanged);
     }
@@ -358,8 +328,8 @@ fn verify_tree(directory: &Path, evidence: &StageEvidence) -> Result<(), ImportE
         if !expected.insert(file.target.relative.as_str().to_owned()) {
             return Err(ImportError::StageChanged);
         }
-        let path = payload_path(directory, file.target.relative.as_str());
-        let (sha256, len) = hash_regular(&path)?;
+        let (sha256, len) =
+            hash_regular(revision, &payload_components(file.target.relative.as_str()))?;
         if sha256 != file.sha256 || len != file.len {
             return Err(ImportError::StageChanged);
         }
@@ -368,52 +338,49 @@ fn verify_tree(directory: &Path, evidence: &StageEvidence) -> Result<(), ImportE
         return Err(ImportError::StageChanged);
     }
 
-    match fsops::directory_identity(directory) {
-        Ok(actual) if actual == evidence.owner => Ok(()),
-        Ok(_) => Err(ImportError::StageChanged),
-        Err(_) => Err(ImportError::StageUnavailable),
-    }
+    Ok(())
 }
 
 fn collect_files(
-    root: &Path,
-    prefix: &str,
+    revision: &fsops::StagedDirectory,
+    components: &mut Vec<String>,
     found: &mut BTreeSet<String>,
 ) -> Result<(), ImportError> {
-    let entries = fs::read_dir(root).map_err(|_| ImportError::StageUnavailable)?;
-    for entry in entries {
-        let entry = entry.map_err(|_| ImportError::StageUnavailable)?;
-        let name = entry
-            .file_name()
-            .to_str()
-            .map(str::to_owned)
-            .ok_or(ImportError::StageChanged)?;
-        let relative = if prefix.is_empty() {
-            name
-        } else {
-            format!("{prefix}/{name}")
-        };
-        let kind = entry
-            .file_type()
-            .map_err(|_| ImportError::StageUnavailable)?;
-        if kind.is_dir() {
-            collect_files(&entry.path(), &relative, found)?;
-        } else if kind.is_file() {
-            found.insert(relative);
+    let relative = components.iter().map(String::as_str).collect::<Vec<_>>();
+    for (name, is_file, is_dir) in revision
+        .list_relative(&relative)
+        .map_err(|_| ImportError::StageUnavailable)?
+    {
+        components.push(name);
+        if is_dir {
+            collect_files(revision, components, found)?;
+        } else if is_file {
+            found.insert(components[1..].join("/"));
         } else {
             return Err(ImportError::StageChanged);
         }
+        components.pop();
     }
     Ok(())
 }
 
-fn hash_regular(path: &Path) -> Result<([u8; 32], u64), ImportError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => {}
-        Ok(_) => return Err(ImportError::StageChanged),
-        Err(_) => return Err(ImportError::StageUnavailable),
+fn hash_regular(
+    revision: &fsops::StagedDirectory,
+    components: &[&str],
+) -> Result<([u8; 32], u64), ImportError> {
+    let mut file = revision
+        .open_relative_file(components)
+        .map_err(|error| match error.kind() {
+            io::ErrorKind::NotFound => ImportError::StageUnavailable,
+            _ => ImportError::StageChanged,
+        })?;
+    if !file
+        .metadata()
+        .map_err(|_| ImportError::StageUnavailable)?
+        .is_file()
+    {
+        return Err(ImportError::StageChanged);
     }
-    let mut file = fsops::open_regular(path).map_err(|_| ImportError::StageUnavailable)?;
     let mut hasher = Sha256::new();
     let mut total = 0u64;
     let mut buffer = [0u8; 64 * 1024];
@@ -432,55 +399,36 @@ fn hash_regular(path: &Path) -> Result<([u8; 32], u64), ImportError> {
     Ok((hasher.finalize().into(), total))
 }
 
-fn prune(directory: &Path, evidence: &StageEvidence) -> Result<(), ImportError> {
-    let mut deep = vec![directory.join(PAYLOAD_DIR)];
+fn prune(revision: &fsops::StagedDirectory, evidence: &StageEvidence) -> Result<(), ImportError> {
+    let mut deep = vec![vec![PAYLOAD_DIR.to_owned()]];
     for file in &evidence.files {
-        let mut path = directory.join(PAYLOAD_DIR);
+        let mut path = vec![PAYLOAD_DIR.to_owned()];
         let components = file.target.relative.as_str().split('/').collect::<Vec<_>>();
         for component in &components[..components.len().saturating_sub(1)] {
-            path.push(component);
+            path.push((*component).to_owned());
             deep.push(path.clone());
         }
     }
-    deep.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    // Remove children before their parents so each unlink sees an empty
+    // directory; a non-empty directory is a proved shape change.
+    deep.sort_by_key(|path| std::cmp::Reverse(path.len()));
     deep.dedup();
     for path in deep {
-        if path == directory {
-            continue;
-        }
-        match fs::remove_dir(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => {
-                return Err(ImportError::StageChanged);
-            }
+        let relative = path.iter().map(String::as_str).collect::<Vec<_>>();
+        match revision.remove_relative_dir(&relative) {
+            Ok(true) => {}
+            Ok(false) => return Err(ImportError::StageChanged),
             Err(_) => return Err(ImportError::Storage),
         }
     }
-    match fs::remove_dir(directory) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => {
-            Err(ImportError::StageChanged)
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(ImportError::Storage),
-    }
+    Ok(())
 }
 
-fn remove_file_if_present(path: &Path) -> Result<(), ImportError> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(ImportError::Storage),
-    }
-}
-
-fn payload_path(directory: &Path, relative: &str) -> PathBuf {
-    let mut path = directory.join(PAYLOAD_DIR);
-    for component in relative.split('/') {
-        path.push(component);
-    }
-    path
+fn payload_components(relative: &str) -> Vec<&str> {
+    let mut components = Vec::with_capacity(relative.split('/').count() + 1);
+    components.push(PAYLOAD_DIR);
+    components.extend(relative.split('/'));
+    components
 }
 
 struct HashingFile {
@@ -517,7 +465,7 @@ impl Write for HashingFile {
 mod fsops {
     use super::*;
 
-    pub(crate) use crate::linux::StagingTree;
+    pub(crate) use crate::linux::{StagedDirectory, StagingTree};
 
     pub fn qualified(root: &Path) -> bool {
         crate::native::library_volume_qualified(root)
@@ -536,20 +484,6 @@ mod fsops {
         }
     }
 
-    pub fn directory_identity(path: &Path) -> Result<RootIdentity, RootError> {
-        crate::native::directory_identity(path)
-    }
-
-    pub fn open_regular(path: &Path) -> Result<File, RootError> {
-        crate::native::open_file(path)
-    }
-
-    pub fn sync_file(path: &Path) -> Result<(), ImportError> {
-        crate::native::open_file(path)
-            .and_then(|file| file.sync_all().map_err(|_| RootError::Io))
-            .map_err(|_| ImportError::Storage)
-    }
-
     pub fn sync_dir(path: &Path) -> Result<(), RootError> {
         crate::native::sync_directory(path)
     }
@@ -558,8 +492,6 @@ mod fsops {
 #[cfg(windows)]
 mod fsops {
     use super::*;
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
 
     /// Windows staging is disconnected; these placeholders keep the common
     /// adapter code compiling without claiming a boundary implementation.
@@ -572,6 +504,30 @@ mod fsops {
     impl StagedDirectory {
         pub fn identity(&self) -> &RootIdentity {
             &self.identity
+        }
+
+        pub fn create_private_file(&self, _relative: &[&str]) -> io::Result<File> {
+            Err(unsupported_io())
+        }
+
+        pub fn open_relative_file(&self, _relative: &[&str]) -> io::Result<File> {
+            Err(unsupported_io())
+        }
+
+        pub fn list_relative(&self, _relative: &[&str]) -> io::Result<Vec<(String, bool, bool)>> {
+            Err(unsupported_io())
+        }
+
+        pub fn remove_relative_file(&self, _relative: &[&str]) -> io::Result<()> {
+            Err(unsupported_io())
+        }
+
+        pub fn remove_relative_dir(&self, _relative: &[&str]) -> io::Result<bool> {
+            Err(unsupported_io())
+        }
+
+        pub fn sync_relative_dir(&self, _relative: &[&str]) -> io::Result<()> {
+            Err(unsupported_io())
         }
     }
 
@@ -603,10 +559,18 @@ mod fsops {
         pub fn sync_revisions(&self) -> Result<(), RootError> {
             Err(unsupported())
         }
+
+        pub fn remove_revision_dir(&self, _name: &str) -> io::Result<bool> {
+            Err(unsupported_io())
+        }
     }
 
     fn unsupported() -> RootError {
         RootError::UnsupportedTarget(marduk_core::root_identity::UnsupportedReason::Configuration)
+    }
+
+    fn unsupported_io() -> io::Error {
+        io::Error::new(io::ErrorKind::Unsupported, "native staging is unavailable")
     }
 
     pub fn qualified(_root: &Path) -> bool {
@@ -624,65 +588,10 @@ mod fsops {
         }
     }
 
-    pub fn directory_identity(path: &Path) -> Result<RootIdentity, RootError> {
-        crate::native::directory_identity(path)
-    }
-
-    pub fn open_regular(path: &Path) -> Result<File, RootError> {
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)
-            .map_err(|_| RootError::TargetUnavailable)
-    }
-
-    pub fn sync_file(path: &Path) -> Result<(), ImportError> {
-        open_regular(path)
-            .and_then(|file| file.sync_all().map_err(|_| RootError::Io))
-            .map_err(|_| ImportError::Storage)
-    }
-
     pub fn sync_dir(_path: &Path) -> Result<(), RootError> {
         // No ordinary-token directory barrier is qualified on Windows.
         Err(RootError::UnsupportedTarget(
             marduk_core::root_identity::UnsupportedReason::Configuration,
         ))
-    }
-}
-
-#[cfg(all(test, unix))]
-mod permissions_tests {
-    use super::{private_create_dir, private_create_dir_all, private_create_file};
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
-    #[test]
-    fn staged_revision_tree_is_private() {
-        let tmp = tempfile::tempdir().unwrap();
-        let revisions = tmp.path().join("revisions");
-        fs::create_dir(&revisions).unwrap();
-        let revision = revisions.join("7");
-        private_create_dir(&revision).unwrap();
-        private_create_dir_all(&revision.join("payload/deep")).unwrap();
-        drop(private_create_file(&revision.join("archive.zip")).unwrap());
-        drop(private_create_file(&revision.join("payload/deep/a.dds")).unwrap());
-
-        for path in [
-            &revision,
-            &revision.join("payload"),
-            &revision.join("payload/deep"),
-        ] {
-            assert_eq!(mode(path), 0o700, "{path:?}");
-        }
-        for path in [
-            revision.join("archive.zip"),
-            revision.join("payload/deep/a.dds"),
-        ] {
-            assert_eq!(mode(&path), 0o600, "{path:?}");
-        }
-    }
-
-    fn mode(path: &std::path::Path) -> u32 {
-        fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 }

@@ -1,8 +1,8 @@
 //! Focused private-library boundary tests for native staging.
 //!
-//! Native staging is Btrfs-only. Tests use `MARDUK_M1_BTRFS_SCRATCH` when set,
-//! else `/var/tmp` if it is Btrfs, and skip on an unqualified volume rather than
-//! claiming a native pass.
+//! Native staging is Btrfs-only. Every test is ignored unless run explicitly and
+//! `MARDUK_M1_BTRFS_SCRATCH` names a scratch directory on Btrfs; an unconfigured
+//! run therefore reports them as ignored instead of passing without assertions.
 
 #![cfg(target_os = "linux")]
 
@@ -13,7 +13,6 @@ mod zip_fixture;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use marduk_core::ids::InstalledRevisionId;
 use marduk_core::import::{ImportAllocation, ImportError, ImportId};
@@ -25,26 +24,15 @@ const FILE: &str = "textures/synthetic.dds";
 const BYTES: &[u8] = b"private stage bytes";
 const REVISIONS: &str = "revisions";
 
-fn scratch() -> Option<tempfile::TempDir> {
-    let parent = match std::env::var_os("MARDUK_M1_BTRFS_SCRATCH") {
-        Some(parent) => PathBuf::from(parent),
-        None => {
-            let output = Command::new("stat")
-                .args(["-f", "-c", "%T", "/var/tmp"])
-                .output()
-                .ok()?;
-            if String::from_utf8_lossy(&output.stdout).trim() != "btrfs" {
-                return None;
-            }
-            PathBuf::from("/var/tmp")
-        }
-    };
-    Some(
-        tempfile::Builder::new()
-            .prefix("marduk-stage-boundary-")
-            .tempdir_in(parent)
-            .unwrap(),
-    )
+fn scratch() -> tempfile::TempDir {
+    let parent = PathBuf::from(
+        std::env::var_os("MARDUK_M1_BTRFS_SCRATCH")
+            .expect("MARDUK_M1_BTRFS_SCRATCH must name a Btrfs scratch directory"),
+    );
+    tempfile::Builder::new()
+        .prefix("marduk-stage-boundary-")
+        .tempdir_in(parent)
+        .expect("Btrfs scratch directory is usable")
 }
 
 fn library(tmp: &Path) -> PathBuf {
@@ -77,10 +65,9 @@ fn refused(stage: &mut NativeStage, guard: &marduk_platform::WriterGuard, id: u6
 }
 
 #[test]
+#[ignore = "requires MARDUK_M1_BTRFS_SCRATCH"]
 fn symlinked_revisions_is_refused_without_writes() {
-    let Some(tmp) = scratch() else {
-        return;
-    };
+    let tmp = scratch();
     let root = tmp.path().join("library");
     fs::create_dir(&root).unwrap();
     let outside = tmp.path().join("outside");
@@ -95,10 +82,9 @@ fn symlinked_revisions_is_refused_without_writes() {
 }
 
 #[test]
+#[ignore = "requires MARDUK_M1_BTRFS_SCRATCH"]
 fn redirected_revision_path_is_refused_without_writes() {
-    let Some(tmp) = scratch() else {
-        return;
-    };
+    let tmp = scratch();
     let root = library(tmp.path());
     let outside = tmp.path().join("outside");
     fs::create_dir(&outside).unwrap();
@@ -119,10 +105,9 @@ fn redirected_revision_path_is_refused_without_writes() {
 }
 
 #[test]
+#[ignore = "requires MARDUK_M1_BTRFS_SCRATCH"]
 fn redirected_revisions_after_open_is_rechecked_before_write() {
-    let Some(tmp) = scratch() else {
-        return;
-    };
+    let tmp = scratch();
     let root = library(tmp.path());
     let mut stage = NativeStage::open(&root).unwrap();
     let outside = tmp.path().join("outside");
@@ -140,10 +125,9 @@ fn redirected_revisions_after_open_is_rechecked_before_write() {
 }
 
 #[test]
+#[ignore = "requires MARDUK_M1_BTRFS_SCRATCH"]
 fn redirect_during_owner_record_is_refused_before_payload_write() {
-    let Some(tmp) = scratch() else {
-        return;
-    };
+    let tmp = scratch();
     let root = library(tmp.path());
     let mut stage = NativeStage::open(&root).unwrap();
     let gate = WriterGate::open(root.join("lock")).unwrap();
@@ -171,10 +155,9 @@ fn redirect_during_owner_record_is_refused_before_payload_write() {
 }
 
 #[test]
+#[ignore = "requires MARDUK_M1_BTRFS_SCRATCH"]
 fn valid_private_root_stages_and_reobserves() {
-    let Some(tmp) = scratch() else {
-        return;
-    };
+    let tmp = scratch();
     let root = library(tmp.path());
     let mut stage = NativeStage::open(&root).unwrap();
     let gate = WriterGate::open(root.join("lock")).unwrap();
@@ -191,6 +174,10 @@ fn valid_private_root_stages_and_reobserves() {
 
     assert_eq!(recorded.as_ref(), Some(&receipt.evidence().owner));
     let revision = root.join(REVISIONS).join("1");
+    assert_eq!(
+        fs::metadata(&revision).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
     assert!(revision.join("archive.zip").is_file());
     assert_eq!(
         fs::read(revision.join("payload").join(FILE)).unwrap(),
@@ -201,10 +188,9 @@ fn valid_private_root_stages_and_reobserves() {
 }
 
 #[test]
+#[ignore = "requires MARDUK_M1_BTRFS_SCRATCH"]
 fn reobserve_detects_a_changed_bound_entry_after_flush() {
-    let Some(tmp) = scratch() else {
-        return;
-    };
+    let tmp = scratch();
     let root = library(tmp.path());
     let mut stage = NativeStage::open(&root).unwrap();
     let gate = WriterGate::open(root.join("lock")).unwrap();
@@ -221,4 +207,69 @@ fn reobserve_detects_a_changed_bound_entry_after_flush() {
         stage.reobserve(&guard, receipt.evidence()).unwrap_err(),
         ImportError::StageChanged
     );
+}
+
+#[test]
+#[ignore = "requires MARDUK_M1_BTRFS_SCRATCH"]
+fn reobserve_refuses_a_revision_redirected_after_stage_open() {
+    let tmp = scratch();
+    let root = library(tmp.path());
+    let mut stage = NativeStage::open(&root).unwrap();
+    let gate = WriterGate::open(root.join("lock")).unwrap();
+    let guard = gate.try_lock().unwrap();
+    let archive = zip();
+    let mut input = archive.as_slice();
+    let receipt = stage
+        .stage(&guard, allocation(1), &mut input, &mut |_owner| Ok(()))
+        .unwrap();
+
+    let outside = tmp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    let real = tmp.path().join("real-revision");
+    fs::rename(root.join(REVISIONS).join("1"), &real).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join(REVISIONS).join("1")).unwrap();
+
+    let error = stage.reobserve(&guard, receipt.evidence()).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ImportError::StageChanged | ImportError::StageUnavailable
+        ),
+        "{error:?}"
+    );
+    assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+    assert!(real.join("archive.zip").is_file());
+}
+
+#[test]
+#[ignore = "requires MARDUK_M1_BTRFS_SCRATCH"]
+fn reclaim_refuses_a_revision_redirected_after_stage_open() {
+    let tmp = scratch();
+    let root = library(tmp.path());
+    let mut stage = NativeStage::open(&root).unwrap();
+    let gate = WriterGate::open(root.join("lock")).unwrap();
+    let guard = gate.try_lock().unwrap();
+    let archive = zip();
+    let mut input = archive.as_slice();
+    let receipt = stage
+        .stage(&guard, allocation(1), &mut input, &mut |_owner| Ok(()))
+        .unwrap();
+
+    let outside = tmp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    let real = tmp.path().join("real-revision");
+    fs::rename(root.join(REVISIONS).join("1"), &real).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join(REVISIONS).join("1")).unwrap();
+
+    let error = stage.reclaim(&guard, receipt.evidence()).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ImportError::StageChanged | ImportError::StageUnavailable
+        ),
+        "{error:?}"
+    );
+    assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+    assert!(real.join("archive.zip").is_file());
+    assert!(real.join("payload").join(FILE).is_file());
 }

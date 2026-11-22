@@ -559,11 +559,21 @@ fn reopen_pinned_file(pinned: &File) -> Result<File, RootError> {
 }
 
 fn openat2(dirfd: RawFd, name: &OsStr, flags: u64, resolve: u64) -> io::Result<File> {
+    openat2_mode(dirfd, name, flags, 0, resolve)
+}
+
+fn openat2_mode(
+    dirfd: RawFd,
+    name: &OsStr,
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+) -> io::Result<File> {
     let name =
         CString::new(name.as_bytes()).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
     let how = OpenHow {
         flags,
-        mode: 0,
+        mode,
         resolve,
     };
     let descriptor = unsafe {
@@ -600,6 +610,10 @@ fn verify_root(file: File) -> Result<RootDir, RootError> {
 }
 
 fn statx_fd(file: &File) -> Result<libc::statx, RootError> {
+    statx_fd_io(file).map_err(|_| RootError::Io)
+}
+
+fn statx_fd_io(file: &File) -> io::Result<libc::statx> {
     let mut stx = MaybeUninit::<libc::statx>::zeroed();
     let result = unsafe {
         libc::statx(
@@ -611,7 +625,7 @@ fn statx_fd(file: &File) -> Result<libc::statx, RootError> {
         )
     };
     if result != 0 {
-        return Err(RootError::Io);
+        return Err(io::Error::last_os_error());
     }
     Ok(unsafe { stx.assume_init() })
 }
@@ -800,6 +814,146 @@ impl StagedDirectory {
         &self.identity
     }
 
+    /// Open a verified component of this directory. Every component is resolved
+    /// beneath the held handle with symlinks and cross-device traversal refused.
+    fn open_dir_at(&self, relative: &[&str]) -> io::Result<File> {
+        let mut current = self.file.try_clone()?;
+        for component in checked_components(relative)? {
+            current = openat2(
+                current.as_raw_fd(),
+                component.as_ref(),
+                DIRECTORY_FLAGS,
+                OPEN_RESOLVE,
+            )?;
+        }
+        Ok(current)
+    }
+
+    /// Create missing private directory components relative to the held handle.
+    /// An existing component is reopened without following a link; the owner is
+    /// checked so a pre-created substitute cannot redirect later writes.
+    fn ensure_dir_at(&self, relative: &[&str]) -> io::Result<File> {
+        let mut current = self.file.try_clone()?;
+        for component in checked_components(relative)? {
+            let name =
+                CString::new(component).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+            if unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o700 as libc::mode_t) }
+                != 0
+            {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EEXIST) {
+                    return Err(error);
+                }
+            }
+            let next = openat2(
+                current.as_raw_fd(),
+                component.as_ref(),
+                DIRECTORY_FLAGS,
+                OPEN_RESOLVE,
+            )?;
+            let stx = statx_fd_io(&next)?;
+            if stx.stx_uid != unsafe { libc::geteuid() } as u32 {
+                return Err(io::Error::from_raw_os_error(libc::EACCES));
+            }
+            current = next;
+        }
+        Ok(current)
+    }
+
+    pub(crate) fn create_private_file(&self, relative: &[&str]) -> io::Result<File> {
+        let (leaf, parents) = relative
+            .split_last()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let directory = self.ensure_dir_at(parents)?;
+        openat2_mode(
+            directory.as_raw_fd(),
+            leaf.as_ref(),
+            (libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                as u64,
+            0o600,
+            OPEN_RESOLVE,
+        )
+    }
+
+    pub(crate) fn open_relative_file(&self, relative: &[&str]) -> io::Result<File> {
+        let (leaf, parents) = relative
+            .split_last()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let directory = self.open_dir_at(parents)?;
+        openat2(
+            directory.as_raw_fd(),
+            leaf.as_ref(),
+            (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64,
+            OPEN_RESOLVE,
+        )
+    }
+
+    /// List one directory relative to the held handle. The returned booleans are
+    /// `is_file` and `is_dir`; a third object kind is reported as neither.
+    pub(crate) fn list_relative(&self, relative: &[&str]) -> io::Result<Vec<(String, bool, bool)>> {
+        let directory = self.open_dir_at(relative)?;
+        let mut entries = Vec::new();
+        for name in read_directory_io(&directory)? {
+            let stx = statx_at(directory.as_raw_fd(), &name, libc::AT_SYMLINK_NOFOLLOW)?;
+            let kind = stx.stx_mode as u32 & libc::S_IFMT;
+            entries.push((name, kind == libc::S_IFREG, kind == libc::S_IFDIR));
+        }
+        Ok(entries)
+    }
+
+    pub(crate) fn remove_relative_file(&self, relative: &[&str]) -> io::Result<()> {
+        let (leaf, parents) = relative
+            .split_last()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let directory = self.open_dir_at(parents)?;
+        let name = CString::new(*leaf).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ENOENT) {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove an empty directory relative to the held handle. `Ok(false)` means
+    /// the directory still had entries; `Ok(true)` means it was removed or was
+    /// already absent.
+    pub(crate) fn remove_relative_dir(&self, relative: &[&str]) -> io::Result<bool> {
+        let (leaf, parents) = relative
+            .split_last()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let directory = self.open_dir_at(parents)?;
+        let target = match openat2(
+            directory.as_raw_fd(),
+            leaf.as_ref(),
+            DIRECTORY_FLAGS,
+            OPEN_RESOLVE,
+        ) {
+            Ok(target) => target,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(true),
+            Err(error) => return Err(error),
+        };
+        if !read_directory_io(&target)?.is_empty() {
+            return Ok(false);
+        }
+        let name = CString::new(*leaf).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0
+        {
+            let error = io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ENOENT) => Ok(true),
+                Some(libc::ENOTEMPTY) => Ok(false),
+                _ => Err(error),
+            };
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn sync_relative_dir(&self, relative: &[&str]) -> io::Result<()> {
+        self.open_dir_at(relative)?.sync_all()
+    }
+
     fn open_child(parent: &RootDir, name: &str) -> Result<Self, RootError> {
         let file = openat2(
             parent.file.as_raw_fd(),
@@ -975,6 +1129,44 @@ impl StagingTree {
 
     pub(crate) fn sync_revisions(&self) -> Result<(), RootError> {
         self.revisions.file.sync_all().map_err(|_| RootError::Io)
+    }
+
+    /// Remove the name from the bound `revisions/` handle. `Ok(false)` means the
+    /// directory was not empty; `Ok(true)` means removed or already absent.
+    pub(crate) fn remove_revision_dir(&self, name: &str) -> io::Result<bool> {
+        if !ordinary_component(name) {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let directory = match openat2(
+            self.revisions.file.as_raw_fd(),
+            name.as_ref(),
+            DIRECTORY_FLAGS,
+            OPEN_RESOLVE,
+        ) {
+            Ok(directory) => directory,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(true),
+            Err(error) => return Err(error),
+        };
+        if !read_directory_io(&directory)?.is_empty() {
+            return Ok(false);
+        }
+        let name = CString::new(name).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        if unsafe {
+            libc::unlinkat(
+                self.revisions.file.as_raw_fd(),
+                name.as_ptr(),
+                libc::AT_REMOVEDIR,
+            )
+        } != 0
+        {
+            let error = io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ENOENT) => Ok(true),
+                Some(libc::ENOTEMPTY) => Ok(false),
+                _ => Err(error),
+            };
+        }
+        Ok(true)
     }
 
     fn verify_revision_path(
@@ -1189,7 +1381,24 @@ fn ordinary_component(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
 }
 
+fn checked_components<'a>(relative: &[&'a str]) -> io::Result<Vec<&'a str>> {
+    relative
+        .iter()
+        .map(|component| {
+            if ordinary_component(component) {
+                Ok(*component)
+            } else {
+                Err(io::Error::from_raw_os_error(libc::EINVAL))
+            }
+        })
+        .collect()
+}
+
 fn read_directory(directory: &File) -> Result<Vec<String>, RootError> {
+    read_directory_io(directory).map_err(|_| RootError::Io)
+}
+
+fn read_directory_io(directory: &File) -> io::Result<Vec<String>> {
     let descriptor = unsafe {
         libc::openat(
             directory.as_raw_fd(),
@@ -1198,12 +1407,13 @@ fn read_directory(directory: &File) -> Result<Vec<String>, RootError> {
         )
     };
     if descriptor < 0 {
-        return Err(RootError::Io);
+        return Err(io::Error::last_os_error());
     }
     let listing = unsafe { libc::fdopendir(descriptor) };
     if listing.is_null() {
+        let error = io::Error::last_os_error();
         unsafe { libc::close(descriptor) };
-        return Err(RootError::Io);
+        return Err(error);
     }
 
     let mut names = Vec::new();
@@ -1216,7 +1426,7 @@ fn read_directory(directory: &File) -> Result<Vec<String>, RootError> {
             if code == 0 {
                 return Ok(names);
             }
-            return Err(RootError::Io);
+            return Err(io::Error::from_raw_os_error(code));
         }
         let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
         if name.to_bytes() == b"." || name.to_bytes() == b".." {
