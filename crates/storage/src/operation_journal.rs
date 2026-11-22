@@ -6,7 +6,7 @@
 //! path or native diagnostic is stored.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use marduk_core::deployment::{
@@ -24,11 +24,17 @@ use marduk_core::root_identity::{
 };
 use marduk_core::targets::{RelativePath, RootRole, TargetFile};
 use marduk_platform::{GateError, WriterGate, WriterGuard};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use sha2::{Digest, Sha256};
 
 pub struct OperationJournal {
+    root: PathBuf,
     path: PathBuf,
+    /// Pins the verified app-owned root for this journal's lifetime, so the
+    /// SQLite path cannot be redirected by a substituted ancestor.
+    _root_handle: File,
     connection: Connection,
     gate: WriterGate,
 }
@@ -50,17 +56,29 @@ pub struct SelectedInstallation {
 impl OperationJournal {
     /// Open (and migrate) the shared catalog under the application data root.
     pub fn open(app_data: &Path) -> Result<Self, DeployError> {
-        fs::create_dir_all(app_data).map_err(|_| DeployError::Io)?;
-        let gate = WriterGate::open(app_data.join(crate::schema::JOURNAL_LOCK_FILE))
-            .map_err(gate_error)?;
-        let path = crate::schema::catalog_path(app_data);
-        let mut connection = Connection::open(&path).map_err(|_| DeployError::Io)?;
+        let root_handle =
+            marduk_platform::open_private_directory(app_data).map_err(|_| DeployError::Io)?;
+        let lock_path =
+            marduk_platform::private_child_path(&root_handle, crate::schema::JOURNAL_LOCK_FILE)
+                .map_err(|_| DeployError::Io)?;
+        let gate = WriterGate::open(lock_path).map_err(gate_error)?;
+        let path = marduk_platform::private_child_path(&root_handle, crate::schema::CATALOG_FILE)
+            .map_err(|_| DeployError::Io)?;
+        let mut connection = Connection::open_with_flags(
+            &path,
+            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(|_| DeployError::Io)?;
+        marduk_platform::verify_private_directory(app_data, &root_handle)
+            .map_err(|_| DeployError::Io)?;
 
         let _guard = gate.try_lock().map_err(gate_error)?;
         crate::schema::prepare(&mut connection).map_err(|_| DeployError::Io)?;
 
         Ok(Self {
+            root: app_data.to_path_buf(),
             path,
+            _root_handle: root_handle,
             connection,
             gate,
         })
@@ -168,7 +186,13 @@ impl OperationJournal {
     /// This is the restart read for clients: it reports recorded work but never
     /// resumes or retries it.
     pub fn selected_installation(&mut self) -> Result<Option<SelectedInstallation>, DeployError> {
-        read_selected(&self.connection)
+        // The lease row and the pending operation must come from one snapshot:
+        // a concurrent finalize cannot leave this answer terminal-as-pending
+        // with a stale generation.
+        let read = self.connection.transaction().map_err(|_| DeployError::Io)?;
+        let selected = read_selected(&read)?;
+        read.commit().map_err(|_| DeployError::Io)?;
+        Ok(selected)
     }
 }
 
@@ -244,7 +268,15 @@ impl OperationJournal {
 
 impl Journal for OperationJournal {
     fn reopen(&mut self) -> Result<(), DeployError> {
-        let connection = Connection::open(&self.path).map_err(|_| DeployError::Io)?;
+        marduk_platform::verify_private_directory(&self.root, &self._root_handle)
+            .map_err(|_| DeployError::Io)?;
+        let connection = Connection::open_with_flags(
+            &self.path,
+            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(|_| DeployError::Io)?;
+        marduk_platform::verify_private_directory(&self.root, &self._root_handle)
+            .map_err(|_| DeployError::Io)?;
         crate::schema::reconfigure(&connection).map_err(|_| DeployError::Io)?;
         self.connection = connection;
         Ok(())
@@ -1108,6 +1140,7 @@ fn read_status(
         return Ok(None);
     };
     let steps = read_steps(connection, op)?;
+    let displaced = displacement_refs(connection, op)?;
     let mut retained = BTreeSet::new();
     for row in &steps {
         retained.extend(row.prepared.spec.original.backup);
@@ -1118,13 +1151,15 @@ fn read_status(
             .is_some_and(|evidence| observed_retention(&evidence.retained));
         if let Some(undo) = &row.undo {
             retained.extend(undo.step_pre.backup);
-            // The canonical retain is known only when evidence observed it;
-            // an unreadable slot is not reported as retained.
-            if confirmed {
+            // The canonical retain is known only when evidence observed it and
+            // no later recovery observation reported the same slot. A slot
+            // first seen at `Applied` is historical evidence, not a current
+            // retention claim.
+            if confirmed && !displaced.contains(&row.prepared.retain) {
                 retained.insert(row.prepared.retain);
             }
         }
-        if confirmed {
+        if confirmed && !displaced.contains(&row.prepared.retain) {
             let settled = if row.phase == StepPhase::Undone {
                 row.undo.as_ref().unwrap_or(&row.prepared)
             } else {
@@ -1523,6 +1558,25 @@ fn direction_tag(direction: StepDirection) -> i64 {
 /// An artifact the journal actually observed, as opposed to an unreadable slot.
 fn observed_retention(artifact: &Artifact) -> bool {
     matches!(artifact, Artifact::Regular(_) | Artifact::Unsupported(_))
+}
+
+/// Every slot recovery has recorded evidence for, readable or not. A slot in
+/// this set can no longer be advertised from an earlier step observation alone.
+fn displacement_refs(
+    connection: &Connection,
+    op: OperationId,
+) -> Result<BTreeSet<BackupRef>, DeployError> {
+    let mut query = connection
+        .prepare("SELECT reported_ref FROM displacement_evidence WHERE operation_id = ?1")
+        .map_err(|_| DeployError::Io)?;
+    let rows = query
+        .query_map([sql_id(op.get())?], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(|_| DeployError::Io)?;
+    let mut refs = BTreeSet::new();
+    for row in rows {
+        refs.insert(decode_backup(&row.map_err(|_| DeployError::Io)?)?);
+    }
+    Ok(refs)
 }
 
 fn read_displacement(connection: &Connection, op: OperationId) -> Result<Option<()>, DeployError> {

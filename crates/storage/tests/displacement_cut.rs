@@ -145,6 +145,52 @@ fn unreadable_canonical_retain_blocks_recovery_without_effect() {
 }
 
 #[test]
+fn a_slot_confirmed_at_apply_is_not_retained_after_recovery_finds_it_unreadable() {
+    let dir = fixture_v1();
+    let mut journal = open_fixture(&dir);
+    let mut effects = MemEffects::new();
+    let plan = save_plan(&mut journal);
+    let op = journal.claim(Claim::Deploy(plan)).unwrap();
+    let step = deploy_step(op);
+    journal.seal(op, vec![step.clone()]).unwrap();
+    journal
+        .set_phase(op, Phase::Prepared, Phase::Applying)
+        .unwrap();
+    journal
+        .record_step(op, 0, StepPhase::Ready, StepPhase::Attempting, None)
+        .unwrap();
+    journal
+        .record_step(
+            op,
+            0,
+            StepPhase::Attempting,
+            StepPhase::Applied,
+            Some(applied()),
+        )
+        .unwrap();
+    effects.public.insert(
+        FILE.to_owned(),
+        MemFile {
+            bytes: POST.to_vec(),
+            fingerprint: fingerprint(POST, 0),
+        },
+    );
+    // The earlier `Applied` observation saw the canonical slot. A restart now
+    // records the same slot unreadable; that later evidence must win.
+    effects.unreadable_retains.insert(step.retain);
+
+    drop(journal);
+    let mut journal = OperationJournal::open(dir.path()).unwrap();
+    let status = recover_pending(&mut journal, &mut effects, &root(1), &root(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.blocker, Some(DeployError::RecoveryConflict));
+    assert!(!status.retained.contains(&step.retain));
+    assert_eq!(effects.mutations, 0);
+    assert_eq!(effects.public[FILE].bytes, POST);
+}
+
+#[test]
 fn unreadable_target_is_not_reported_as_displacement() {
     let dir = fixture_v1();
     let mut journal = open_fixture(&dir);
