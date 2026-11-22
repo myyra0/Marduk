@@ -346,12 +346,13 @@ impl NativeEffects {
         direction: StepDirection,
         exchange: bool,
         staged: Option<&Fingerprint>,
+        expected: Option<&Fingerprint>,
     ) -> Evidence {
         let directory = self.op_dir(op.get(), ordinal, direction);
         let stage_observation = artifact(&directory.join("stage"));
         let displaced = artifact(&directory.join("displaced"));
         let (stage, retained) = if exchange {
-            exchange_slots(stage_observation, displaced, staged)
+            exchange_slots(stage_observation, displaced, staged, expected)
         } else {
             (stage_observation, displaced)
         };
@@ -364,6 +365,10 @@ impl NativeEffects {
 
     fn evidence_for_step(&self, step: &PreparedStep) -> Evidence {
         let exchange = matches!(step.spec.pre, PreState::Regular(_)) && step.staged.is_some();
+        let expected = match &step.spec.pre {
+            PreState::Regular(fingerprint) => Some(fingerprint),
+            PreState::Absent => None,
+        };
         self.evidence_for(
             &step.spec.target,
             step.op,
@@ -371,6 +376,7 @@ impl NativeEffects {
             step.direction,
             exchange,
             step.staged.as_ref().map(|(_, fingerprint)| fingerprint),
+            expected,
         )
     }
 
@@ -452,6 +458,7 @@ impl NativeEffects {
                 staged.direction(),
                 false,
                 Some(&staged_fingerprint),
+                None,
             ));
         }
 
@@ -479,6 +486,7 @@ impl NativeEffects {
                 staged.direction(),
                 false,
                 Some(&staged_fingerprint),
+                None,
             );
             return match observed_after {
                 Observation::Unavailable(error) => EffectOutcome::Unavailable(error),
@@ -518,6 +526,7 @@ impl NativeEffects {
             staged.direction(),
             false,
             Some(&staged_fingerprint),
+            None,
         );
 
         if result.is_err() {
@@ -578,6 +587,7 @@ impl NativeEffects {
                 staged.direction(),
                 true,
                 Some(&staged_fingerprint),
+                Some(expected),
             ));
         }
         let stage_path = self.stage_path(staged);
@@ -598,6 +608,7 @@ impl NativeEffects {
                 staged.direction(),
                 true,
                 Some(&staged_fingerprint),
+                Some(expected),
             ));
         }
 
@@ -632,6 +643,7 @@ impl NativeEffects {
                 staged.direction(),
                 true,
                 Some(&staged_fingerprint),
+                Some(expected),
             ));
         }
         let Ok(stage_parent) = effects::directory_identity(&stage_directory) else {
@@ -670,6 +682,7 @@ impl NativeEffects {
             staged.direction(),
             true,
             Some(&staged_fingerprint),
+            Some(expected),
         );
 
         if let Err(error) = result {
@@ -722,6 +735,7 @@ impl NativeEffects {
                 retain.direction(),
                 false,
                 None,
+                None,
             ));
         }
         let displaced_path = self.backup_path(retain);
@@ -741,6 +755,7 @@ impl NativeEffects {
                 retain.ordinal(),
                 retain.direction(),
                 false,
+                None,
                 None,
             ));
         }
@@ -767,6 +782,7 @@ impl NativeEffects {
                 retain.ordinal(),
                 retain.direction(),
                 false,
+                None,
                 None,
             ));
         }
@@ -801,6 +817,7 @@ impl NativeEffects {
             retain.ordinal(),
             retain.direction(),
             false,
+            None,
             None,
         );
 
@@ -1191,35 +1208,70 @@ impl DeploymentInputs for NativeEffects {
     }
 }
 
-/// Split an exchange's stage and canonical retain observations.
+/// What one exchange slot holds relative to the expected displaced object.
 ///
-/// Only the Linux exchange leaves the displaced target in the stage slot. A
-/// Windows exchange retains it at the distinct `displaced` path, so a stage
-/// file there is never evidence of a retained original.
+/// A slot is only accounted for when it is absent or positively expected; an
+/// unreadable slot is neither, and an object of the wrong kind or identity is
+/// an unexpected occupant.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlotClass<'a> {
+    Absent,
+    Expected(&'a Fingerprint),
+    Unexpected,
+    Unreadable,
+}
+
+#[cfg(target_os = "linux")]
+impl<'a> SlotClass<'a> {
+    fn of(artifact: &'a Artifact, expected: Option<&'a Fingerprint>) -> Self {
+        match artifact {
+            Artifact::Absent => Self::Absent,
+            Artifact::Regular(actual) if expected == Some(actual) => Self::Expected(actual),
+            Artifact::Regular(_) | Artifact::Unsupported(_) => Self::Unexpected,
+            Artifact::Unavailable => Self::Unreadable,
+        }
+    }
+}
+
+/// Split an exchange's stage and canonical retain observations into the
+/// `(stage, retained)` evidence pair.
+///
+/// A clean settle needs the exact displaced object and no unaccounted occupant,
+/// so both slots are classified. Only a Linux exchange aliases the stage slot
+/// as the retain slot, and only when it holds the expected displaced object
+/// while the distinct `displaced` slot is empty. Every other pair is reported
+/// as observed, so it cannot satisfy the clean post-state: a pair with an
+/// absent stage is the only one that can, so an occupied distinct slot is
+/// carried in the stage field instead of being hidden behind the alias.
 fn exchange_slots(
     stage: Artifact,
     displaced: Artifact,
     staged: Option<&Fingerprint>,
+    expected: Option<&Fingerprint>,
 ) -> (Artifact, Artifact) {
     #[cfg(target_os = "linux")]
     {
-        match &stage {
-            Artifact::Regular(actual) if staged == Some(actual) => {
-                (Artifact::Regular(actual.clone()), displaced)
+        // The sealed stage copy is still in place: the exchange did not run.
+        if matches!(&stage, Artifact::Regular(actual) if staged == Some(actual)) {
+            return (stage, displaced);
+        }
+        match (
+            SlotClass::of(&stage, expected),
+            SlotClass::of(&displaced, None),
+        ) {
+            (SlotClass::Expected(_), SlotClass::Absent) => (Artifact::Absent, stage),
+            // An empty stage with an occupied distinct slot is the one pair
+            // that would otherwise read as a clean post-state.
+            (SlotClass::Absent, _) if displaced != Artifact::Absent => {
+                (displaced.clone(), displaced)
             }
-            other => (
-                Artifact::Absent,
-                if displaced == Artifact::Absent {
-                    other.clone()
-                } else {
-                    displaced
-                },
-            ),
+            _ => (stage, displaced),
         }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = staged;
+        let _ = (staged, expected);
         (stage, displaced)
     }
 }
@@ -1368,33 +1420,103 @@ mod tests {
     #[test]
     fn exchange_reports_a_stage_copy_separately_from_the_retain_slot() {
         let staged = fingerprint(1);
+        let expected = fingerprint(2);
         let (stage, retained) = exchange_slots(
             Artifact::Regular(staged.clone()),
             Artifact::Absent,
             Some(&staged),
+            Some(&expected),
         );
         assert_eq!(stage, Artifact::Regular(staged));
         assert_eq!(retained, Artifact::Absent);
     }
 
     #[test]
-    fn changed_stage_is_retained_only_in_the_linux_exchange_alias() {
+    fn linux_exchange_aliases_only_the_expected_displaced_object() {
         let staged = fingerprint(1);
-        let changed = fingerprint(2);
+        let expected = fingerprint(2);
         let (stage, retained) = exchange_slots(
-            Artifact::Regular(changed.clone()),
+            Artifact::Regular(expected.clone()),
             Artifact::Absent,
             Some(&staged),
+            Some(&expected),
         );
         #[cfg(target_os = "linux")]
         {
             assert_eq!(stage, Artifact::Absent);
-            assert_eq!(retained, Artifact::Regular(changed));
+            assert_eq!(retained, Artifact::Regular(expected));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(stage, Artifact::Regular(expected));
+            assert_eq!(retained, Artifact::Absent);
+        }
+    }
+
+    #[test]
+    fn unexpected_stage_bytes_are_not_credited_as_the_retained_object() {
+        let staged = fingerprint(1);
+        let expected = fingerprint(2);
+        let changed = fingerprint(3);
+        let (stage, retained) = exchange_slots(
+            Artifact::Regular(changed.clone()),
+            Artifact::Absent,
+            Some(&staged),
+            Some(&expected),
+        );
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(stage, Artifact::Regular(changed));
+            assert_eq!(retained, Artifact::Absent);
         }
         #[cfg(not(target_os = "linux"))]
         {
             assert_eq!(stage, Artifact::Regular(changed));
             assert_eq!(retained, Artifact::Absent);
+        }
+    }
+
+    #[test]
+    fn an_occupied_distinct_slot_never_settles_with_an_absent_stage() {
+        let staged = fingerprint(1);
+        let expected = fingerprint(2);
+        let (stage, retained) = exchange_slots(
+            Artifact::Absent,
+            Artifact::Regular(expected.clone()),
+            Some(&staged),
+            Some(&expected),
+        );
+        #[cfg(target_os = "linux")]
+        {
+            assert_ne!(stage, Artifact::Absent);
+            assert_eq!(retained, Artifact::Regular(expected));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(stage, Artifact::Absent);
+            assert_eq!(retained, Artifact::Regular(expected));
+        }
+    }
+
+    #[test]
+    fn unreadable_stage_is_never_reported_as_absent() {
+        let staged = fingerprint(1);
+        let expected = fingerprint(2);
+        let (stage, retained) = exchange_slots(
+            Artifact::Unavailable,
+            Artifact::Regular(expected.clone()),
+            Some(&staged),
+            Some(&expected),
+        );
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(stage, Artifact::Unavailable);
+            assert_eq!(retained, Artifact::Regular(expected));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(stage, Artifact::Unavailable);
+            assert_eq!(retained, Artifact::Regular(expected));
         }
     }
 

@@ -7,11 +7,7 @@ Last reviewed: 2026-11-22, at the commit recorded in `docs/research/m1-native-re
 
 ## Open defects
 
-**An exchange can settle with incomplete slot evidence.**
-`crates/storage/src/native_effects.rs` (`exchange_slots`) reports the stage as absent when the distinct `displaced`
-slot is occupied, even if the stage is unreadable or holds an unexpected object. A matching target and displaced
-fingerprint can then settle cleanly without accounting for every slot. Closing it means classifying both occupied
-slots explicitly and refusing a clean settle unless all of them are positively accounted for.
+None recorded.
 
 ## Known residual, documented rather than fixed
 

@@ -15,8 +15,8 @@ use marduk_core::deployment::{
 use marduk_core::ids::{InstalledRevisionId, MemberId, ProfileId, ProfileRevision};
 use marduk_core::profiles::{ProfileMember, ProfileSnapshot};
 use marduk_core::recovery::{
-    BarrierOutcome, Claim, CopyEffects, EffectOutcome, Journal, PreImage, StepDirection,
-    StepOutput, StepPhase, StepSpec,
+    Artifact, BarrierOutcome, Claim, CopyEffects, EffectOutcome, Evidence, Journal, PreImage,
+    PreparedStep, StepDirection, StepOutput, StepPhase, StepSpec,
 };
 use marduk_core::resolve::ResolvedInputs;
 use marduk_core::root_identity::{Fingerprint, GameLayout, RootError, RootIdentity};
@@ -1111,4 +1111,129 @@ fn unqualified_app_root_is_refused_before_any_write() {
     let error = NativeEffects::open(unqualified, &fixture.game, LAYOUT).unwrap_err();
     assert_eq!(error, DeployError::UnsupportedTarget);
     assert!(!fixture.app.join("effects").exists());
+}
+
+/// Prepare one checked exchange of `winner.dds` and run it, returning the port,
+/// the sealed step, the expected pre-image and the clean evidence it reported.
+fn run_exchange(fixture: &Fixture) -> (NativeEffects, PreparedStep, Fingerprint, Evidence) {
+    drop(fixture.journal());
+    let mut port = fixture.adapter();
+    let relative = RelativePath::parse(WINNER).unwrap();
+    let bound = port
+        .resolve_target(&TargetFile {
+            root: RootRole::Data,
+            relative: relative.clone(),
+        })
+        .unwrap();
+    let expected = marduk_platform::effects::fingerprint_path(&fixture.target(WINNER)).unwrap();
+    let source = port.source(InstalledRevisionId::new(7), &relative).unwrap();
+    let step = port
+        .prepare(
+            OperationId::try_from_u64(1).unwrap(),
+            0,
+            StepDirection::Forward,
+            &StepSpec {
+                target: bound,
+                original: PreImage {
+                    observation: PreState::Regular(expected.clone()),
+                    backup: None,
+                },
+                pre: PreState::Regular(expected.clone()),
+                output: StepOutput::Source(source),
+            },
+        )
+        .unwrap();
+    let staged = step.staged.as_ref().expect("exchange stages new bytes").0;
+    let outcome =
+        port.replace_existing_retain_displaced(&step.spec.target, &expected, staged, step.retain);
+    let EffectOutcome::Observed(evidence) = outcome else {
+        panic!("the normal exchange must report a clean outcome, got {outcome:?}");
+    };
+    assert_eq!(evidence.stage, Artifact::Absent);
+    assert_eq!(evidence.retained, Artifact::Regular(expected.clone()));
+    (port, step, expected, evidence)
+}
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn an_occupied_distinct_slot_never_settles_with_an_unaccounted_stage() {
+    let fixture = Fixture::new();
+    let (mut port, step, expected, clean) = run_exchange(&fixture);
+    let directory = fixture.effect_dir(step.op, step.ordinal);
+    let stage = directory.join("stage");
+    let displaced = directory.join("displaced");
+    // Both exchange slots now hold an object: the stage holds something the
+    // exchange never produced, and the distinct slot holds the expected bytes.
+    // A rename keeps the retained inode's exact fingerprint.
+    fs::rename(&stage, &displaced).unwrap();
+    fs::write(&stage, b"unexpected\n").unwrap();
+
+    let observed = port.inspect_step(&step);
+    assert_ne!(
+        observed, clean,
+        "an unaccounted stage must change the evidence"
+    );
+    assert_eq!(observed.retained, Artifact::Regular(expected));
+    let barrier = port.durability_barrier(&step, &clean);
+    assert!(
+        matches!(barrier, BarrierOutcome::Ambiguous(_)),
+        "a matching distinct fingerprint must not settle while the stage is unaccounted: {barrier:?}"
+    );
+    assert_eq!(fs::read(&stage).unwrap(), b"unexpected\n");
+    assert_eq!(fs::read(&displaced).unwrap(), BASE);
+    assert_eq!(fs::read(fixture.target(WINNER)).unwrap(), POST);
+}
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn an_unreadable_stage_never_settles_with_an_expected_distinct_slot() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let (mut port, step, expected, clean) = run_exchange(&fixture);
+    let directory = fixture.effect_dir(step.op, step.ordinal);
+    let stage = directory.join("stage");
+    let displaced = directory.join("displaced");
+    fs::rename(&stage, &displaced).unwrap();
+    fs::write(&stage, b"unreadable\n").unwrap();
+    fs::set_permissions(&stage, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let observed = port.inspect_step(&step);
+    assert_eq!(observed.retained, Artifact::Regular(expected));
+    assert!(
+        !matches!(observed.stage, Artifact::Absent),
+        "an unreadable stage must not be reported as absent"
+    );
+    let barrier = port.durability_barrier(&step, &clean);
+    fs::set_permissions(&stage, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(
+        matches!(barrier, BarrierOutcome::Ambiguous(_)),
+        "an unreadable stage must not settle behind a matching distinct slot: {barrier:?}"
+    );
+    assert_eq!(fs::read(&displaced).unwrap(), BASE);
+    assert_eq!(fs::read(fixture.target(WINNER)).unwrap(), POST);
+}
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn a_normal_exchange_still_settles_cleanly() {
+    let fixture = Fixture::new();
+    let (mut port, step, expected, clean) = run_exchange(&fixture);
+    let evidence = port.inspect_step(&step);
+    assert_eq!(evidence, clean);
+    assert_eq!(
+        evidence.stage,
+        Artifact::Absent,
+        "the stage alias is consumed by a clean exchange"
+    );
+    assert_eq!(evidence.retained, Artifact::Regular(expected));
+    let barrier = port.durability_barrier(&step, &evidence);
+    assert!(
+        matches!(barrier, BarrierOutcome::Durable(_)),
+        "the normal exchange must keep settling cleanly: {barrier:?}"
+    );
+    let directory = fixture.effect_dir(step.op, step.ordinal);
+    assert_eq!(fs::read(directory.join("stage")).unwrap(), BASE);
+    assert!(!directory.join("displaced").exists());
+    assert_eq!(fs::read(fixture.target(WINNER)).unwrap(), POST);
 }
