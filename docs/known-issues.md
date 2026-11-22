@@ -31,5 +31,8 @@ to retry automatically. It does not claim prevention. See the contract's "Known 
 - **ext4.** Excluded by decision. Linux deployment is qualified on Btrfs and tmpfs only.
 - **Btrfs cross-subvolume (`EXDEV`).** The subvolume case could not be torn down in the test environment, so the
   two-subvolume layout is `not run`.
-- **Windows desktop smoke.** The packaged desktop smoke now has a Windows job, but the job is advisory and has not
-  been green yet. Windows launched-shell behaviour stays unproven until that hosted job passes.
+- **Windows desktop smoke.** The packaged desktop smoke now has a Windows job, but it fails at session creation
+  (`session not created: DevToolsActivePort file doesn't exist`): `msedgedriver` starts and the app never exposes a
+  debugging port, consistent with a runner session that has no interactive desktop for WebView2. The job is advisory.
+  Unproven until it runs somewhere with a real desktop session — the Windows VM is the candidate. Recorded rather than
+  hidden by dropping Windows from the matrix.
