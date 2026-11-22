@@ -7,7 +7,8 @@ use marduk_core::root_identity::{
 };
 use marduk_core::targets::RelativePath;
 use marduk_platform::{
-    bind_installation, observe_target, reopen_installation, resolve_existing_parent,
+    WriterGate, bind_installation, observe_target, open_or_create_private_file,
+    open_private_directory, reopen_installation, resolve_existing_parent,
 };
 
 const LAYOUT: GameLayout = GameLayout {
@@ -226,4 +227,44 @@ fn unavailable_flags_probe_refuses_an_original() {
             reason: UnsupportedReason::Metadata
         })
     );
+}
+
+#[test]
+fn substituted_ancestor_cannot_redirect_lock_or_catalog_writes() {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("app-data");
+    fs::create_dir(&root).unwrap();
+    let pinned = open_private_directory(&root).unwrap();
+
+    // Replace the verified directory at its old pathname. A pathname-based
+    // open would now land in the attacker-controlled replacement.
+    fs::rename(&root, base.path().join("app-data-old")).unwrap();
+    fs::create_dir(&root).unwrap();
+    let outside = base.path().join("outside.sqlite3");
+    fs::write(&outside, b"outside").unwrap();
+    symlink(&outside, root.join("catalog.sqlite3")).unwrap();
+
+    let gate = WriterGate::open_at(&pinned, "library.lock").unwrap();
+    let _guard = gate.try_lock().unwrap();
+    let catalog = open_or_create_private_file(&pinned, "catalog.sqlite3").unwrap();
+    let path = catalog.path(&pinned).unwrap();
+    assert!(path.starts_with(format!("/proc/self/fd/{}", {
+        use std::os::fd::AsRawFd;
+        pinned.as_raw_fd()
+    })));
+    fs::write(&path, b"pinned").unwrap();
+    catalog.verify(&pinned).unwrap();
+
+    assert_eq!(
+        fs::read(base.path().join("app-data-old").join("catalog.sqlite3")).unwrap(),
+        b"pinned"
+    );
+    assert!(
+        base.path()
+            .join("app-data-old")
+            .join("library.lock")
+            .exists()
+    );
+    assert!(!root.join("library.lock").exists());
+    assert_eq!(fs::read(&outside).unwrap(), b"outside");
 }

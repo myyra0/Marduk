@@ -23,6 +23,7 @@ use crate::GateError;
 #[derive(Debug)]
 pub struct WriterGate {
     path: PathBuf,
+    anchor: Option<(File, String)>,
     volume: u32,
     index: u64,
 }
@@ -42,6 +43,23 @@ impl WriterGate {
         let (volume, index) = identify(&file)?;
         Ok(Self {
             path,
+            anchor: None,
+            volume,
+            index,
+        })
+    }
+
+    /// Open or create the lock file through a pinned directory handle. The
+    /// pathname is rebuilt from that handle on every lock, so a substituted
+    /// ancestor cannot redirect the lock object.
+    pub fn open_at(parent: &File, name: &str) -> Result<Self, GateError> {
+        let path = root::private_child_path(parent, name).map_err(|_| GateError::Unavailable)?;
+        let file = open_lock_file(&path, true)?;
+        let (volume, index) = identify(&file)?;
+        let anchor = parent.try_clone().map_err(|_| GateError::Io)?;
+        Ok(Self {
+            path,
+            anchor: Some((anchor, name.to_owned())),
             volume,
             index,
         })
@@ -52,7 +70,13 @@ impl WriterGate {
     /// There is no delete sharing, so another entrant cannot replace the lock
     /// file while it is held. Each entrant opens its own handle.
     pub fn try_lock(&self) -> Result<WriterGuard, GateError> {
-        let file = open_lock_file(&self.path, false)?;
+        let path = match &self.anchor {
+            Some((parent, name)) => {
+                root::private_child_path(parent, name).map_err(|_| GateError::Unavailable)?
+            }
+            None => self.path.clone(),
+        };
+        let file = open_lock_file(&path, false)?;
         if identify(&file)? != (self.volume, self.index) {
             return Err(GateError::Unavailable);
         }
@@ -173,7 +197,8 @@ mod root {
     use windows_sys::Win32::Foundation::{
         ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_INSUFFICIENT_BUFFER,
         ERROR_LOCK_VIOLATION, ERROR_MORE_DATA, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND,
-        ERROR_SHARING_VIOLATION, GENERIC_READ, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+        ERROR_SHARING_VIOLATION, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
+        INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Security::{
         ACL, ATTRIBUTE_SECURITY_INFORMATION, DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION,
@@ -182,15 +207,16 @@ mod root {
         LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, SCOPE_SECURITY_INFORMATION,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY,
-        FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_NOT_CONTENT_INDEXED,
-        FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM,
-        FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO,
-        FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
-        FILE_READ_EA, FILE_SHARE_READ, FILE_STANDARD_INFO, FILE_STREAM_INFO, FileAttributeTagInfo,
-        FileBasicInfo, FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo, FileIdInfo,
-        FileStandardInfo, FileStreamInfo, FindClose, FindFirstFileW, GetFileInformationByHandleEx,
+        CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_ARCHIVE,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL,
+        FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_ATTRIBUTE_SYSTEM, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_EXTD_DIR_INFO,
+        FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED,
+        FILE_READ_ATTRIBUTES, FILE_READ_EA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_STANDARD_INFO, FILE_STREAM_INFO, FileAttributeTagInfo, FileBasicInfo,
+        FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo, FileIdInfo, FileStandardInfo,
+        FileStreamInfo, FindClose, FindFirstFileW, GetFileInformationByHandleEx,
         GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
         GetVolumeNameForVolumeMountPointW, OPEN_EXISTING, READ_CONTROL, ReOpenFile,
         VOLUME_NAME_GUID, WIN32_FIND_DATAW,
@@ -1310,6 +1336,109 @@ mod root {
         fingerprint_open_file(&file)
     }
 
+    pub(crate) struct PrivateFile {
+        _file: File,
+        name: String,
+        volume: u64,
+        file_id: [u8; 16],
+    }
+
+    impl PrivateFile {
+        pub(crate) fn path(&self, parent: &File) -> Result<PathBuf, RootError> {
+            Ok(PathBuf::from(join(&final_path(parent)?, &self.name)))
+        }
+
+        pub(crate) fn verify(&self, parent: &File) -> Result<(), RootError> {
+            let expected = join(&final_path(parent)?, &self.name);
+            let file = open_pin_path(&expected).map_err(|_| RootError::TargetUnavailable)?;
+            let tag = attribute_tag(&file)?;
+            let standard = standard_info(&file)?;
+            let id = file_id(&file)?;
+            let parent_id = file_id(parent)?;
+            if is_reparse(&tag)
+                || standard.Directory
+                || id.VolumeSerialNumber != self.volume
+                || id.FileId.Identifier != self.file_id
+                || id.VolumeSerialNumber != parent_id.VolumeSerialNumber
+                || !final_path(&file)?.eq_ignore_ascii_case(&expected)
+            {
+                return Err(RootError::TargetUnavailable);
+            }
+            Ok(())
+        }
+    }
+
+    pub(crate) fn open_or_create_private_file(
+        parent: &File,
+        name: &str,
+    ) -> Result<PrivateFile, RootError> {
+        if !ordinary_component(name) {
+            return Err(RootError::TargetUnavailable);
+        }
+        let path = join(&final_path(parent)?, name);
+        let file = match open_pin_path(&path) {
+            Ok(file) => file,
+            Err(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => create_pin_path(&path)?,
+            Err(_) => return Err(RootError::TargetUnavailable),
+        };
+        let tag = attribute_tag(&file)?;
+        let standard = standard_info(&file)?;
+        let id = file_id(&file)?;
+        let parent_id = file_id(parent)?;
+        if is_reparse(&tag)
+            || standard.Directory
+            || id.VolumeSerialNumber == 0
+            || id.VolumeSerialNumber != parent_id.VolumeSerialNumber
+            || !final_path(&file)?.eq_ignore_ascii_case(&path)
+        {
+            return Err(RootError::TargetUnavailable);
+        }
+        Ok(PrivateFile {
+            _file: file,
+            name: name.to_owned(),
+            volume: id.VolumeSerialNumber,
+            file_id: id.FileId.Identifier,
+        })
+    }
+
+    fn open_pin_path(path: &str) -> Result<File, u32> {
+        let wide: Vec<u16> = path.encode_utf16().chain([0]).collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ptr::null(),
+                OPEN_EXISTING,
+                NO_FOLLOW,
+                ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(unsafe { GetLastError() });
+        }
+        Ok(unsafe { File::from_raw_handle(handle) })
+    }
+
+    fn create_pin_path(path: &str) -> Result<File, RootError> {
+        let wide: Vec<u16> = path.encode_utf16().chain([0]).collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ptr::null(),
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL | NO_FOLLOW,
+                ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(RootError::Io);
+        }
+        Ok(unsafe { File::from_raw_handle(handle) })
+    }
+
     pub(crate) fn open_private_directory(path: &Path) -> Result<File, RootError> {
         open_selection(path, true).map(|mut chain| chain.pop().expect("pinned root").file)
     }
@@ -1348,7 +1477,8 @@ mod root {
 }
 
 pub(crate) use root::{
-    Binding, ResolvedTarget, bind_installation, directory_identity, fingerprint_path,
-    observe_target, open_private_child_directory, open_private_directory, private_child_path,
-    reopen_installation, resolve_existing_parent, verify_private_directory,
+    Binding, PrivateFile, ResolvedTarget, bind_installation, directory_identity, fingerprint_path,
+    observe_target, open_or_create_private_file, open_private_child_directory,
+    open_private_directory, private_child_path, reopen_installation, resolve_existing_parent,
+    verify_private_directory,
 };

@@ -31,10 +31,11 @@ use sha2::{Digest, Sha256};
 
 pub struct OperationJournal {
     root: PathBuf,
-    path: PathBuf,
     /// Pins the verified app-owned root for this journal's lifetime, so the
     /// SQLite path cannot be redirected by a substituted ancestor.
     _root_handle: File,
+    /// Pins the catalog leaf across bootstrap and reopen.
+    catalog: marduk_platform::PrivateFile,
     connection: Connection,
     gate: WriterGate,
 }
@@ -58,27 +59,26 @@ impl OperationJournal {
     pub fn open(app_data: &Path) -> Result<Self, DeployError> {
         let root_handle =
             marduk_platform::open_private_directory(app_data).map_err(|_| DeployError::Io)?;
-        let lock_path =
-            marduk_platform::private_child_path(&root_handle, crate::schema::JOURNAL_LOCK_FILE)
+        let gate = WriterGate::open_at(&root_handle, crate::schema::JOURNAL_LOCK_FILE)
+            .map_err(gate_error)?;
+        let catalog =
+            marduk_platform::open_or_create_private_file(&root_handle, crate::schema::CATALOG_FILE)
                 .map_err(|_| DeployError::Io)?;
-        let gate = WriterGate::open(lock_path).map_err(gate_error)?;
-        let path = marduk_platform::private_child_path(&root_handle, crate::schema::CATALOG_FILE)
+        let path = catalog.path(&root_handle).map_err(|_| DeployError::Io)?;
+        let mut connection = Connection::open_with_flags(&path, OpenFlags::default())
             .map_err(|_| DeployError::Io)?;
-        let mut connection = Connection::open_with_flags(
-            &path,
-            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )
-        .map_err(|_| DeployError::Io)?;
+        catalog.verify(&root_handle).map_err(|_| DeployError::Io)?;
         marduk_platform::verify_private_directory(app_data, &root_handle)
             .map_err(|_| DeployError::Io)?;
 
         let _guard = gate.try_lock().map_err(gate_error)?;
         crate::schema::prepare(&mut connection).map_err(|_| DeployError::Io)?;
+        catalog.verify(&root_handle).map_err(|_| DeployError::Io)?;
 
         Ok(Self {
             root: app_data.to_path_buf(),
-            path,
             _root_handle: root_handle,
+            catalog,
             connection,
             gate,
         })
@@ -270,11 +270,18 @@ impl Journal for OperationJournal {
     fn reopen(&mut self) -> Result<(), DeployError> {
         marduk_platform::verify_private_directory(&self.root, &self._root_handle)
             .map_err(|_| DeployError::Io)?;
-        let connection = Connection::open_with_flags(
-            &self.path,
-            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )
-        .map_err(|_| DeployError::Io)?;
+        self.catalog
+            .verify(&self._root_handle)
+            .map_err(|_| DeployError::Io)?;
+        let path = self
+            .catalog
+            .path(&self._root_handle)
+            .map_err(|_| DeployError::Io)?;
+        let connection = Connection::open_with_flags(&path, OpenFlags::default())
+            .map_err(|_| DeployError::Io)?;
+        self.catalog
+            .verify(&self._root_handle)
+            .map_err(|_| DeployError::Io)?;
         marduk_platform::verify_private_directory(&self.root, &self._root_handle)
             .map_err(|_| DeployError::Io)?;
         crate::schema::reconfigure(&connection).map_err(|_| DeployError::Io)?;
@@ -744,17 +751,41 @@ impl Journal for OperationJournal {
             return Err(DeployError::Io);
         }
         let op_value = sql_id(op.get())?;
-        transaction.execute(
-            "INSERT INTO displacement_evidence (operation_id, ordinal, direction, reported_ref, evidence)
-             VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT DO NOTHING",
-            params![op_value, i64::from(step.ordinal), direction_tag(step.direction), encode_backup(at), encode_evidence(evidence)],
-        ).map_err(|_| DeployError::Io)?;
+        write_displacement(&transaction, op_value, step, at, evidence)?;
         transaction
             .execute(
                 "UPDATE operations SET blocker = 'recovery_conflict' WHERE id = ?1",
                 [op_value],
             )
             .map_err(|_| DeployError::Io)?;
+        transaction.commit().map_err(|_| DeployError::Io)
+    }
+
+    fn record_unreadable_retain(
+        &mut self,
+        op: OperationId,
+        step: &PreparedStep,
+        at: BackupRef,
+        evidence: &Evidence,
+    ) -> Result<(), DeployError> {
+        let _guard = self.lock()?;
+        let transaction = self.immediate()?;
+        let operation = load_operation(&transaction, op)?.ok_or(DeployError::UnknownOperation)?;
+        if !pending_is(&transaction, &operation.data, op)? || operation.phase.is_terminal() {
+            return Err(DeployError::UnknownOperation);
+        }
+        let row = read_steps(&transaction, op)?
+            .into_iter()
+            .find(|row| row.prepared.ordinal == step.ordinal)
+            .ok_or(DeployError::Io)?;
+        let sealed = match step.direction {
+            StepDirection::Forward => step == &row.prepared,
+            StepDirection::Undo => row.undo.as_ref() == Some(step),
+        };
+        if !sealed {
+            return Err(DeployError::Io);
+        }
+        write_displacement(&transaction, sql_id(op.get())?, step, at, evidence)?;
         transaction.commit().map_err(|_| DeployError::Io)
     }
 
@@ -1555,6 +1586,29 @@ fn direction_tag(direction: StepDirection) -> i64 {
     }
 }
 
+fn write_displacement(
+    transaction: &Transaction<'_>,
+    op: i64,
+    step: &PreparedStep,
+    at: BackupRef,
+    evidence: &Evidence,
+) -> Result<(), DeployError> {
+    transaction.execute(
+        "INSERT INTO displacement_evidence (operation_id, ordinal, direction, reported_ref, evidence)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT (operation_id, ordinal, direction, reported_ref)
+         DO UPDATE SET evidence = excluded.evidence",
+        params![
+            op,
+            i64::from(step.ordinal),
+            direction_tag(step.direction),
+            encode_backup(at),
+            encode_evidence(evidence)
+        ],
+    ).map_err(|_| DeployError::Io)?;
+    Ok(())
+}
+
 /// An artifact the journal actually observed, as opposed to an unreadable slot.
 fn observed_retention(artifact: &Artifact) -> bool {
     matches!(artifact, Artifact::Regular(_) | Artifact::Unsupported(_))
@@ -1580,14 +1634,24 @@ fn displacement_refs(
 }
 
 fn read_displacement(connection: &Connection, op: OperationId) -> Result<Option<()>, DeployError> {
-    connection
-        .query_row(
-            "SELECT 1 FROM displacement_evidence WHERE operation_id = ?1 LIMIT 1",
-            [sql_id(op.get())?],
-            |_| Ok(()),
-        )
-        .optional()
-        .map_err(|_| DeployError::Io)
+    let mut query = connection
+        .prepare("SELECT evidence FROM displacement_evidence WHERE operation_id = ?1")
+        .map_err(|_| DeployError::Io)?;
+    let rows = query
+        .query_map([sql_id(op.get())?], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(|_| DeployError::Io)?;
+    for row in rows {
+        let evidence = decode_evidence(&row.map_err(|_| DeployError::Io)?)?;
+        // Simultaneous target and retain unreadability is a preserved
+        // observation, not proof of a displaced artifact.
+        if matches!(evidence.target, Observation::Unavailable(_))
+            && !observed_retention(&evidence.retained)
+        {
+            continue;
+        }
+        return Ok(Some(()));
+    }
+    Ok(None)
 }
 
 fn owned_displacements(

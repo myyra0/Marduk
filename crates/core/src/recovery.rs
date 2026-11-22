@@ -325,6 +325,18 @@ pub trait Journal {
         self.block(op, Some(DeployError::RecoveryConflict))
     }
 
+    /// Keep an unreadable canonical-slot observation that is not a positive
+    /// displacement report. It is evidence, not a blocker by itself.
+    fn record_unreadable_retain(
+        &mut self,
+        _op: OperationId,
+        _step: &PreparedStep,
+        _at: BackupRef,
+        _evidence: &Evidence,
+    ) -> Result<(), DeployError> {
+        Ok(())
+    }
+
     /// An unexpected displacement requires operator review, not auto-retry.
     fn has_unresolved_displacement(&mut self, _op: OperationId) -> Result<bool, DeployError> {
         Ok(false)
@@ -470,10 +482,11 @@ pub(crate) fn preserve_canonical_displacement<J: Journal>(
     evidence: &Evidence,
 ) -> Result<bool, DeployError> {
     // An unreadable canonical slot proves nothing about its contents. Without
-    // a readable target it is not a displacement report; with a readable
-    // target it can never pass the check and let an effect run.
+    // a readable target it is not a displacement report, but the observation
+    // is still kept so repeated recovery cannot silently lose it.
     if evidence.retained == Artifact::Unavailable {
         if matches!(evidence.target, Observation::Unavailable(_)) {
+            journal.record_unreadable_retain(step.op, step, step.retain, evidence)?;
             return Ok(false);
         }
         journal.block_displacement(step.op, step, step.retain, evidence)?;

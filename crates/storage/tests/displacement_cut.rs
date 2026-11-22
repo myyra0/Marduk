@@ -229,7 +229,13 @@ fn unreadable_target_is_not_reported_as_displacement() {
         .unwrap()
         .unwrap();
     assert_eq!(status.blocker, Some(DeployError::TargetUnavailable));
-    assert!(journal.unexpected_displacements(op).unwrap().is_empty());
+    // The unreadable target also hides the canonical retain; the observation
+    // is kept but is not advertised as a retention or treated as a conflict.
+    let preserved = journal.unexpected_displacements(op).unwrap();
+    assert_eq!(preserved.len(), 1);
+    assert_eq!(preserved[0].0, step.retain);
+    assert_eq!(preserved[0].1.retained, Artifact::Unavailable);
+    assert!(matches!(preserved[0].1.target, Observation::Unavailable(_)));
     assert!(!status.retained.contains(&step.retain));
     assert!(!status.retained.contains(&step.alternate_displacement()));
     assert_eq!(effects.mutations, 0);
@@ -260,4 +266,241 @@ fn unreadable_target_is_not_reported_as_displacement() {
             active: None
         }
     );
+}
+
+fn displacement(target: Observation, retained: Artifact) -> Evidence {
+    Evidence {
+        target,
+        stage: Artifact::Absent,
+        retained,
+    }
+}
+
+#[test]
+fn repeated_recovery_keeps_the_latest_observation_per_slot() {
+    let dir = fixture_v1();
+    let mut journal = open_fixture(&dir);
+    let effects = MemEffects::new();
+    let plan = save_plan(&mut journal);
+    let op = journal.claim(Claim::Deploy(plan)).unwrap();
+    let step = deploy_step(op);
+    journal.seal(op, vec![step.clone()]).unwrap();
+
+    let readable = displacement(
+        Observation::Regular(fingerprint(POST, 0)),
+        Artifact::Regular(fingerprint(EDIT, 42)),
+    );
+    let unreadable = displacement(
+        Observation::Unavailable(RootError::TargetUnavailable),
+        Artifact::Unavailable,
+    );
+    journal
+        .block_displacement(op, &step, step.retain, &readable)
+        .unwrap();
+    journal
+        .block_displacement(op, &step, step.retain, &unreadable)
+        .unwrap();
+    let alternate = displacement(
+        Observation::Regular(fingerprint(POST, 0)),
+        Artifact::Regular(fingerprint(BASE, 11)),
+    );
+    journal
+        .block_displacement(op, &step, step.alternate_displacement(), &alternate)
+        .unwrap();
+
+    let entries = journal.unexpected_displacements(op).unwrap();
+    assert_eq!(entries.len(), 2, "distinct slots keep their history");
+    assert_eq!(
+        entries
+            .iter()
+            .find(|(at, _)| *at == step.retain)
+            .map(|(_, evidence)| evidence),
+        Some(&unreadable),
+        "the latest observation for the exact slot wins"
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .find(|(at, _)| *at == step.alternate_displacement())
+            .map(|(_, evidence)| evidence),
+        Some(&alternate)
+    );
+    drop(journal);
+
+    let mut journal = OperationJournal::open(dir.path()).unwrap();
+    assert_eq!(
+        journal.unexpected_displacements(op).unwrap(),
+        entries,
+        "the latest observation survives reopen"
+    );
+    let status = journal.status(op).unwrap().unwrap();
+    assert_eq!(status.blocker, Some(DeployError::RecoveryConflict));
+    // The latest observation for the canonical slot is unreadable, so the
+    // earlier readable record no longer advertises it as retained. The
+    // historical alternate observation still does.
+    assert!(!status.retained.contains(&step.retain));
+    assert!(status.retained.contains(&step.alternate_displacement()));
+    assert_eq!(effects.mutations, 0);
+}
+
+#[test]
+fn simultaneous_target_and_retain_unreadability_is_preserved() {
+    let dir = fixture_v1();
+    let mut journal = open_fixture(&dir);
+    let mut effects = MemEffects::new();
+    let plan = save_plan(&mut journal);
+    let op = journal.claim(Claim::Deploy(plan)).unwrap();
+    let step = deploy_step(op);
+    journal.seal(op, vec![step.clone()]).unwrap();
+    journal
+        .set_phase(op, Phase::Prepared, Phase::Applying)
+        .unwrap();
+    journal
+        .record_step(op, 0, StepPhase::Ready, StepPhase::Attempting, None)
+        .unwrap();
+
+    effects.unreadable_target = true;
+    effects.unreadable_retains.insert(step.retain);
+    drop(journal);
+    let mut journal = OperationJournal::open(dir.path()).unwrap();
+    let status = recover_pending(&mut journal, &mut effects, &root(1), &root(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.blocker, Some(DeployError::TargetUnavailable));
+    assert!(!status.retained.contains(&step.retain));
+    let entries = journal.unexpected_displacements(op).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].0, step.retain);
+    assert_eq!(entries[0].1.retained, Artifact::Unavailable);
+    assert!(matches!(entries[0].1.target, Observation::Unavailable(_)));
+    assert_eq!(effects.mutations, 0);
+}
+
+#[test]
+fn undo_slot_keeps_its_latest_observation() {
+    let dir = fixture_v1();
+    let mut journal = open_fixture(&dir);
+    let mut effects = MemEffects::new();
+    let plan = save_plan(&mut journal);
+    let op = journal.claim(Claim::Deploy(plan)).unwrap();
+    let forward = deploy_step(op);
+    journal.seal(op, vec![forward.clone()]).unwrap();
+    effects.remember(forward.clone());
+    journal
+        .set_phase(op, Phase::Prepared, Phase::Applying)
+        .unwrap();
+    journal
+        .record_step(op, 0, StepPhase::Ready, StepPhase::Attempting, None)
+        .unwrap();
+    journal
+        .record_step(
+            op,
+            0,
+            StepPhase::Attempting,
+            StepPhase::Applied,
+            Some(applied()),
+        )
+        .unwrap();
+    journal
+        .set_phase(op, Phase::Applying, Phase::RollingBack)
+        .unwrap();
+    let undo = PreparedStep {
+        op,
+        ordinal: 0,
+        direction: StepDirection::Undo,
+        spec: StepSpec {
+            target: bound(),
+            original: forward.spec.original.clone(),
+            pre: PreState::Regular(fingerprint(POST, 0)),
+            output: StepOutput::Original(forward.step_pre.backup.unwrap()),
+        },
+        step_pre: PreImage {
+            observation: PreState::Regular(fingerprint(POST, 0)),
+            backup: Some(BackupRef::from_record(
+                op,
+                0,
+                StepDirection::Undo,
+                BackupSlot::Step,
+            )),
+        },
+        staged: Some((
+            StageRef::from_record(op, 0, StepDirection::Undo),
+            fingerprint(BASE, 0),
+        )),
+        retain: BackupRef::from_record(op, 0, StepDirection::Undo, BackupSlot::Displaced),
+    };
+    journal.record_undo(op, 0, undo.clone()).unwrap();
+    effects.remember(undo.clone());
+
+    let readable = displacement(
+        Observation::Regular(fingerprint(BASE, 0)),
+        Artifact::Regular(fingerprint(EDIT, 42)),
+    );
+    let unreadable = displacement(
+        Observation::Unavailable(RootError::TargetUnavailable),
+        Artifact::Unavailable,
+    );
+    journal
+        .block_displacement(op, &undo, undo.retain, &readable)
+        .unwrap();
+    journal
+        .block_displacement(op, &undo, undo.retain, &unreadable)
+        .unwrap();
+
+    let entries = journal.unexpected_displacements(op).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].0, undo.retain);
+    assert_eq!(entries[0].0.direction(), StepDirection::Undo);
+    assert_eq!(entries[0].1, unreadable);
+    assert_eq!(effects.mutations, 0);
+}
+
+#[test]
+fn repeated_recovery_replaces_an_earlier_unreadable_observation() {
+    let dir = fixture_v1();
+    let mut journal = open_fixture(&dir);
+    let mut effects = MemEffects::new();
+    let plan = save_plan(&mut journal);
+    let op = journal.claim(Claim::Deploy(plan)).unwrap();
+    let step = deploy_step(op);
+    journal.seal(op, vec![step.clone()]).unwrap();
+    journal
+        .set_phase(op, Phase::Prepared, Phase::Applying)
+        .unwrap();
+    journal
+        .record_step(op, 0, StepPhase::Ready, StepPhase::Attempting, None)
+        .unwrap();
+    drop(journal);
+
+    let mut journal = OperationJournal::open(dir.path()).unwrap();
+    effects.unreadable_target = true;
+    let first = recover_pending(&mut journal, &mut effects, &root(1), &root(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.blocker, Some(DeployError::TargetUnavailable));
+    let entries = journal.unexpected_displacements(op).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].1.retained, Artifact::Unavailable);
+
+    // The next pass can read both slots and now observes a real displacement
+    // at the same canonical ref. That later observation must replace the
+    // earlier unreadable record rather than being dropped by ON CONFLICT.
+    effects.unreadable_target = false;
+    let displaced = MemFile {
+        bytes: EDIT.to_vec(),
+        fingerprint: fingerprint(EDIT, 42),
+    };
+    effects.backups.insert(step.retain, displaced.clone());
+    let second = recover_pending(&mut journal, &mut effects, &root(1), &root(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.blocker, Some(DeployError::RecoveryConflict));
+    assert!(second.retained.contains(&step.retain));
+    let entries = journal.unexpected_displacements(op).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].1.retained,
+        Artifact::Regular(displaced.fingerprint.clone())
+    );
+    assert_eq!(effects.mutations, 0);
 }

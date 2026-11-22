@@ -366,3 +366,46 @@ fn journal_reopen_refuses_a_catalog_replaced_by_a_link() {
     assert!(matches!(journal.reopen(), Err(DeployError::Io)));
     assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
 }
+
+#[cfg(windows)]
+fn redirected_catalog(dir: &Path) -> Option<std::path::PathBuf> {
+    let outside = dir.join("outside.sqlite3");
+    std::fs::write(&outside, b"outside").unwrap();
+    let catalog = dir.join(DB);
+    if std::fs::rename(&catalog, dir.join("moved.sqlite3")).is_err() {
+        // A fresh root has no catalog yet.
+    }
+    match std::os::windows::fs::symlink_file(&outside, &catalog) {
+        Ok(()) => Some(outside),
+        Err(_) => {
+            // Creating a file symlink needs Developer Mode or elevation.
+            let _ = std::fs::rename(dir.join("moved.sqlite3"), &catalog);
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn bootstrap_refuses_a_redirected_catalog_leaf() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(outside) = redirected_catalog(dir.path()) else {
+        return;
+    };
+
+    assert!(OperationJournal::open(dir.path()).is_err());
+    assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+}
+
+#[cfg(windows)]
+#[test]
+fn reopen_refuses_a_redirected_catalog_leaf() {
+    let dir = fixture_v1();
+    let mut journal = open_fixture(&dir);
+    let Some(outside) = redirected_catalog(dir.path()) else {
+        return;
+    };
+
+    assert!(journal.reopen().is_err());
+    assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+}

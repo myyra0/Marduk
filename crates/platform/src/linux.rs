@@ -15,6 +15,7 @@ use crate::GateError;
 #[derive(Debug)]
 pub struct WriterGate {
     path: PathBuf,
+    anchor: Option<(File, String)>,
     device: u64,
     inode: u64,
 }
@@ -34,6 +35,24 @@ impl WriterGate {
         let (device, inode) = identify(&file)?;
         Ok(Self {
             path,
+            anchor: None,
+            device,
+            inode,
+        })
+    }
+
+    /// Open or create the lock file relative to a pinned directory descriptor.
+    /// Reopening for each lock keeps a substituted ancestor out of the path.
+    pub fn open_at(parent: &File, name: &str) -> Result<Self, GateError> {
+        if !ordinary_component(name) {
+            return Err(GateError::Unavailable);
+        }
+        let anchor = parent.try_clone().map_err(|_| GateError::Io)?;
+        let file = open_lock_at(&anchor, name, true)?;
+        let (device, inode) = identify(&file)?;
+        Ok(Self {
+            path: PathBuf::new(),
+            anchor: Some((anchor, name.to_owned())),
             device,
             inode,
         })
@@ -45,7 +64,10 @@ impl WriterGate {
     /// to the description, so sharing the original descriptor would let two
     /// guards in one process both succeed.
     pub fn try_lock(&self) -> Result<WriterGuard, GateError> {
-        let file = open_lock_file(&self.path, false)?;
+        let file = match &self.anchor {
+            Some((parent, name)) => open_lock_at(parent, name, false)?,
+            None => open_lock_file(&self.path, false)?,
+        };
         let identity = identify(&file)?;
         if identity != (self.device, self.inode) {
             return Err(GateError::Unavailable);
@@ -71,6 +93,27 @@ fn open_lock_file(path: &Path, create: bool) -> Result<File, GateError> {
     }
 
     let descriptor = unsafe { libc::open(path.as_ptr(), flags, 0o600 as libc::mode_t) };
+    if descriptor < 0 {
+        return Err(open_error(io::Error::last_os_error()));
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+fn open_lock_at(parent: &File, name: &str, create: bool) -> Result<File, GateError> {
+    let name = CString::new(name.as_bytes()).map_err(|_| GateError::Unavailable)?;
+    let mut flags = libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    if create {
+        flags |= libc::O_CREAT;
+    }
+
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            flags,
+            0o600 as libc::mode_t,
+        )
+    };
     if descriptor < 0 {
         return Err(open_error(io::Error::last_os_error()));
     }
@@ -1319,6 +1362,88 @@ pub(crate) fn verify_private_directory(path: &Path, handle: &File) -> Result<(),
         return Err(RootError::TargetUnavailable);
     }
     Ok(())
+}
+
+pub(crate) struct PrivateFile {
+    file: File,
+    name: String,
+}
+
+impl PrivateFile {
+    pub(crate) fn path(&self, parent: &File) -> Result<PathBuf, RootError> {
+        // The descriptor keeps the directory component pinned, so SQLite
+        // cannot be redirected by renaming or replacing an ancestor.
+        Ok(PathBuf::from(format!(
+            "/proc/self/fd/{}/{}",
+            parent.as_raw_fd(),
+            self.name
+        )))
+    }
+
+    pub(crate) fn verify(&self, parent: &File) -> Result<(), RootError> {
+        let reopened = open_private_file_at(parent, &self.name)?;
+        let pinned = statx_fd(&self.file)?;
+        let current = statx_fd(&reopened)?;
+        let parent_stx = statx_fd(parent)?;
+        if !same_inode(&pinned, &current)
+            || current.stx_mode as u32 & libc::S_IFMT != libc::S_IFREG
+            || current.stx_mnt_id != parent_stx.stx_mnt_id
+            || current.stx_dev_major != parent_stx.stx_dev_major
+            || current.stx_dev_minor != parent_stx.stx_dev_minor
+        {
+            return Err(RootError::TargetUnavailable);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn open_or_create_private_file(
+    parent: &File,
+    name: &str,
+) -> Result<PrivateFile, RootError> {
+    if !ordinary_component(name) {
+        return Err(RootError::TargetUnavailable);
+    }
+    let file = match open_private_file_at(parent, name) {
+        Ok(file) => file,
+        Err(RootError::MissingParent) => openat2_mode(
+            parent.as_raw_fd(),
+            OsStr::new(name),
+            (libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                as u64,
+            0o600,
+            NO_LINKS,
+        )
+        .map_err(|_| RootError::Io)?,
+        Err(error) => return Err(error),
+    };
+    let stx = statx_fd(&file)?;
+    let parent_stx = statx_fd(parent)?;
+    if stx.stx_mode as u32 & libc::S_IFMT != libc::S_IFREG
+        || stx.stx_mnt_id != parent_stx.stx_mnt_id
+        || stx.stx_dev_major != parent_stx.stx_dev_major
+        || stx.stx_dev_minor != parent_stx.stx_dev_minor
+    {
+        return Err(RootError::TargetUnavailable);
+    }
+    Ok(PrivateFile {
+        file,
+        name: name.to_owned(),
+    })
+}
+
+fn open_private_file_at(parent: &File, name: &str) -> Result<File, RootError> {
+    openat2(
+        parent.as_raw_fd(),
+        OsStr::new(name),
+        (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64,
+        NO_LINKS,
+    )
+    .map_err(|error| match error.raw_os_error() {
+        Some(libc::ENOENT) | Some(libc::ENOTDIR) => RootError::MissingParent,
+        Some(libc::ELOOP) => RootError::OutsideBoundary,
+        _ => RootError::Io,
+    })
 }
 
 fn open_or_create_directory(parent: &File, name: &OsStr) -> Result<File, RootError> {

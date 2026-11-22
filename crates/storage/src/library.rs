@@ -56,6 +56,8 @@ pub struct Catalog {
     root: PathBuf,
     /// Pins the verified app-owned directory for this catalog's lifetime.
     _root_handle: File,
+    /// Pins the catalog leaf so a later reopen cannot substitute it.
+    _catalog: marduk_platform::PrivateFile,
     connection: Connection,
     gate: WriterGate,
     stage: StageAdapter,
@@ -75,28 +77,38 @@ impl Catalog {
         marduk_platform::open_private_child_directory(&root_handle, REVISIONS_DIR)
             .map_err(|_| ImportError::Storage)?;
 
-        let lock_path = marduk_platform::private_child_path(&root_handle, crate::schema::LOCK_FILE)
-            .map_err(|_| ImportError::Storage)?;
-        let gate = WriterGate::open(lock_path).map_err(gate_error)?;
+        let gate =
+            WriterGate::open_at(&root_handle, crate::schema::LOCK_FILE).map_err(gate_error)?;
         let _guard = gate.try_lock().map_err(gate_error)?;
 
-        let catalog_path =
-            marduk_platform::private_child_path(&root_handle, crate::schema::CATALOG_FILE)
+        let catalog =
+            marduk_platform::open_or_create_private_file(&root_handle, crate::schema::CATALOG_FILE)
                 .map_err(|_| ImportError::Storage)?;
-        let mut connection = Connection::open_with_flags(
-            &catalog_path,
-            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )
-        .map_err(storage_error)?;
+        let catalog_path = catalog
+            .path(&root_handle)
+            .map_err(|_| ImportError::Storage)?;
+        // The pathname starts at the pinned directory descriptor, so SQLite
+        // follows no ancestor that could be replaced. The leaf is proved by
+        // `PrivateFile` before and after the open instead of relying on the
+        // VFS no-follow flag.
+        let mut connection = Connection::open_with_flags(&catalog_path, OpenFlags::default())
+            .map_err(storage_error)?;
+        catalog
+            .verify(&root_handle)
+            .map_err(|_| ImportError::Storage)?;
         // The SQLite pathname cannot consume the descriptor, so re-prove that
         // it still names the pinned directory after the open.
         marduk_platform::verify_private_directory(root, &root_handle)
             .map_err(|_| ImportError::Storage)?;
         crate::schema::prepare(&mut connection).map_err(|_| ImportError::Storage)?;
+        catalog
+            .verify(&root_handle)
+            .map_err(|_| ImportError::Storage)?;
 
         Ok(Self {
             root: root.to_path_buf(),
             _root_handle: root_handle,
+            _catalog: catalog,
             connection,
             gate,
             // Native staging stays disconnected until the publication gate

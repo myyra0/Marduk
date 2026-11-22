@@ -93,6 +93,36 @@ pub fn verify_private_directory(path: &Path, handle: &std::fs::File) -> Result<(
     native::verify_private_directory(path, handle)
 }
 
+/// A regular file opened or created directly beneath a pinned app-owned
+/// directory, with the leaf's native identity kept for later re-proof.
+pub struct PrivateFile {
+    inner: native::PrivateFile,
+}
+
+impl PrivateFile {
+    /// A SQLite-compatible pathname that keeps the pinned directory as its
+    /// first component. The parent handle must stay open.
+    pub fn path(&self, parent: &std::fs::File) -> Result<std::path::PathBuf, RootError> {
+        self.inner.path(parent)
+    }
+
+    /// Re-open the leaf without following a link and prove it is the same
+    /// regular file on the pinned directory's volume.
+    pub fn verify(&self, parent: &std::fs::File) -> Result<(), RootError> {
+        self.inner.verify(parent)
+    }
+}
+
+/// Open an existing regular child of the pinned directory, or create it with a
+/// no-follow native handle. A reparse-tagged, non-regular or substituted leaf
+/// is refused before the caller can write through a pathname.
+pub fn open_or_create_private_file(
+    parent: &std::fs::File,
+    name: &str,
+) -> Result<PrivateFile, RootError> {
+    native::open_or_create_private_file(parent, name).map(|inner| PrivateFile { inner })
+}
+
 /// A live, verified installation pair owned by the platform adapter.
 ///
 /// The handles pin the selected installation and its direct data directory.
