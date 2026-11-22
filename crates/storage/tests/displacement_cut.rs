@@ -586,3 +586,175 @@ fn readability_degrading_keeps_history_and_advertises_only_a_latest_positive_rea
     assert!(journal.has_unresolved_displacement(op).unwrap());
     assert_eq!(effects.mutations, 0);
 }
+
+#[test]
+fn alternate_slot_later_unreadability_supersedes_an_earlier_report() {
+    let (dir, journal, step) = attempting_fixture();
+    let op = step.op;
+    let mut effects = MemEffects::new();
+    let alternate = step.alternate_displacement();
+    effects.backups.insert(
+        alternate,
+        MemFile {
+            bytes: EDIT.to_vec(),
+            fingerprint: fingerprint(EDIT, 42),
+        },
+    );
+
+    drop(journal);
+    let mut journal = OperationJournal::open(dir.path()).unwrap();
+    let first = recover_pending(&mut journal, &mut effects, &root(1), &root(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.blocker, Some(DeployError::RecoveryConflict));
+    assert!(first.retained.contains(&alternate));
+    assert_eq!(journal.unexpected_displacements(op).unwrap().len(), 1);
+
+    // The detection slot is now unreadable. That observation must be durable
+    // and must remove the earlier positive report from status.
+    effects.backups.remove(&alternate);
+    effects.unreadable_retains.insert(alternate);
+    let second = recover_pending(&mut journal, &mut effects, &root(1), &root(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.blocker, Some(DeployError::RecoveryConflict));
+    assert!(!second.retained.contains(&alternate));
+    assert!(journal.has_unresolved_displacement(op).unwrap());
+    let preserved = journal.unexpected_displacements(op).unwrap();
+    assert_eq!(preserved.len(), 1);
+    assert_eq!(preserved[0].0, alternate);
+    assert_eq!(preserved[0].1.retained, Artifact::Unavailable);
+    assert_eq!(slot_history(&dir, op), 2);
+
+    journal.reopen().unwrap();
+    let after = journal.status(op).unwrap().unwrap();
+    assert_eq!(after.blocker, Some(DeployError::RecoveryConflict));
+    assert!(!after.retained.contains(&alternate));
+    assert_eq!(effects.mutations, 0);
+}
+
+#[test]
+fn undo_slot_unreadability_is_not_advertised_and_directions_stay_distinct() {
+    let dir = fixture_v1();
+    let mut journal = open_fixture(&dir);
+    let plan = save_plan(&mut journal);
+    let op = journal.claim(Claim::Deploy(plan)).unwrap();
+    let forward = deploy_step(op);
+    journal.seal(op, vec![forward.clone()]).unwrap();
+    journal
+        .set_phase(op, Phase::Prepared, Phase::Applying)
+        .unwrap();
+    journal
+        .record_step(op, 0, StepPhase::Ready, StepPhase::Attempting, None)
+        .unwrap();
+    journal
+        .set_phase(op, Phase::Applying, Phase::RollingBack)
+        .unwrap();
+    let undo = PreparedStep {
+        op,
+        ordinal: 0,
+        direction: StepDirection::Undo,
+        spec: StepSpec {
+            target: bound(),
+            original: forward.spec.original.clone(),
+            pre: PreState::Regular(fingerprint(POST, 0)),
+            output: StepOutput::Original(forward.step_pre.backup.unwrap()),
+        },
+        step_pre: PreImage {
+            observation: PreState::Regular(fingerprint(POST, 0)),
+            backup: Some(BackupRef::from_record(
+                op,
+                0,
+                StepDirection::Undo,
+                BackupSlot::Step,
+            )),
+        },
+        staged: Some((
+            StageRef::from_record(op, 0, StepDirection::Undo),
+            fingerprint(BASE, 0),
+        )),
+        retain: BackupRef::from_record(op, 0, StepDirection::Undo, BackupSlot::Displaced),
+    };
+    journal.record_undo(op, 0, undo.clone()).unwrap();
+    journal
+        .record_step(
+            op,
+            0,
+            StepPhase::Attempting,
+            StepPhase::UndoAttempting,
+            None,
+        )
+        .unwrap();
+    journal
+        .record_step(
+            op,
+            0,
+            StepPhase::UndoAttempting,
+            StepPhase::Undone,
+            Some(Evidence {
+                target: Observation::Regular(fingerprint(BASE, 0)),
+                stage: Artifact::Absent,
+                retained: Artifact::Regular(fingerprint(POST, 0)),
+            }),
+        )
+        .unwrap();
+
+    // The settled undo retain is advertised from the step's own observation
+    // while no later slot history exists.
+    assert!(
+        journal
+            .status(op)
+            .unwrap()
+            .unwrap()
+            .retained
+            .contains(&undo.retain)
+    );
+
+    let unreadable = displacement(
+        Observation::Unavailable(RootError::TargetUnavailable),
+        Artifact::Unavailable,
+    );
+    journal
+        .record_unreadable_retain(op, &undo, undo.retain, &unreadable)
+        .unwrap();
+    let forward_observation = displacement(
+        Observation::Regular(fingerprint(POST, 0)),
+        Artifact::Regular(fingerprint(EDIT, 42)),
+    );
+    journal
+        .block_displacement(op, &forward, forward.retain, &forward_observation)
+        .unwrap();
+
+    let verify = |journal: &mut OperationJournal| {
+        let status = journal.status(op).unwrap().unwrap();
+        assert_eq!(status.blocker, Some(DeployError::RecoveryConflict));
+        assert!(
+            !status.retained.contains(&undo.retain),
+            "an unreadable undo slot is not a known retention"
+        );
+        assert!(
+            status.retained.contains(&forward.retain),
+            "the forward direction keeps its own positive observation"
+        );
+        assert!(journal.has_unresolved_displacement(op).unwrap());
+        let entries = journal.unexpected_displacements(op).unwrap();
+        assert_eq!(entries.len(), 2, "each direction keeps its own slot");
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|(at, _)| at.direction() == StepDirection::Undo)
+                .count(),
+            1
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|(at, _)| at.direction() == StepDirection::Forward)
+                .count(),
+            1
+        );
+    };
+    verify(&mut journal);
+    journal.reopen().unwrap();
+    verify(&mut journal);
+}

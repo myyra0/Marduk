@@ -1240,12 +1240,6 @@ fn read_status(
             .evidence
             .as_ref()
             .is_some_and(|evidence| observed_retention(&evidence.retained));
-        if let Some(undo) = &row.undo {
-            retained.extend(undo.step_pre.backup);
-            if confirmed && !recorded.contains(&row.prepared.retain) {
-                retained.insert(row.prepared.retain);
-            }
-        }
         // The canonical retain is known only when the step's own evidence
         // observed it and no later slot history exists. History is applied
         // below from its latest observation only.
@@ -1254,7 +1248,7 @@ fn read_status(
         } else {
             &row.prepared
         };
-        if confirmed && !recorded.contains(&row.prepared.retain) {
+        if confirmed && !recorded.contains(&settled.retain) {
             retained.insert(settled.retain);
         }
     }

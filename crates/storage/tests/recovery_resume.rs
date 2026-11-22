@@ -443,7 +443,12 @@ impl CopyEffects for MemEffects {
     }
 
     fn inspect_alternate_displacement(&mut self, step: &PreparedStep) -> Artifact {
-        self.artifact(self.backups.get(&step.alternate_displacement()))
+        let at = step.alternate_displacement();
+        if self.unreadable_retains.contains(&at) {
+            Artifact::Unavailable
+        } else {
+            self.artifact(self.backups.get(&at))
+        }
     }
 
     fn durability_barrier(&mut self, step: &PreparedStep, _: &Evidence) -> BarrierOutcome {

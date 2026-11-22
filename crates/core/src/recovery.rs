@@ -470,9 +470,32 @@ fn preserve_displacements<J: Journal, P: CopyEffects>(
     // target read must never suppress their inspection.
     let mut found = preserve_canonical_displacement(journal, step, evidence)?;
     match port.inspect_alternate_displacement(step) {
-        Artifact::Absent => {}
-        Artifact::Unavailable if !found => return Err(DeployError::TargetUnavailable),
-        Artifact::Unavailable => {}
+        Artifact::Absent => {
+            let mut readable = evidence.clone();
+            readable.retained = Artifact::Absent;
+            journal.record_readable_slot(
+                step.op,
+                step,
+                step.alternate_displacement(),
+                &readable,
+            )?;
+        }
+        Artifact::Unavailable => {
+            // An unreadable detection slot proves nothing, but a later
+            // observation must not leave an earlier positive report standing
+            // as if it were still current.
+            let mut unreadable = evidence.clone();
+            unreadable.retained = Artifact::Unavailable;
+            journal.record_unreadable_retain(
+                step.op,
+                step,
+                step.alternate_displacement(),
+                &unreadable,
+            )?;
+            if !found {
+                return Err(DeployError::TargetUnavailable);
+            }
+        }
         retained => {
             let mut evidence = evidence.clone();
             evidence.retained = retained;
