@@ -434,16 +434,16 @@ pub fn copy_file(
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{
-        GetLastError, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_INSUFFICIENT_BUFFER,
-        ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, GENERIC_WRITE,
+        ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_LOCK_VIOLATION,
+        ERROR_SHARING_VIOLATION, GENERIC_WRITE, GetLastError,
     };
     use windows_sys::Win32::Security::{
-        GetKernelObjectSecurity, SetKernelObjectSecurity, DACL_SECURITY_INFORMATION,
-        GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetKernelObjectSecurity,
+        OWNER_SECURITY_INFORMATION, SetKernelObjectSecurity,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        FileBasicInfo, GetFileInformationByHandleEx, SetFileInformationByHandle,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO, WRITE_DAC, WRITE_OWNER,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
+        SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER,
     };
 
     let unsupported = || CopyError::Unsupported(UnsupportedReason::Metadata);
@@ -594,10 +594,10 @@ fn source_dacl_grants_only_current_user(
     use std::mem::{offset_of, size_of};
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::Security::{
-        CreateWellKnownSid, EqualSid, GetAce, GetLengthSid, GetSecurityDescriptorDacl,
-        GetTokenInformation, IsValidAcl, IsValidSid, TokenUser, WinBuiltinAdministratorsSid,
-        WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, INHERIT_ONLY_ACE,
-        SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER,
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, CreateWellKnownSid, EqualSid, GetAce, GetLengthSid,
+        GetSecurityDescriptorDacl, GetTokenInformation, INHERIT_ONLY_ACE, IsValidAcl, IsValidSid,
+        SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid,
+        WinLocalSystemSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_APPEND_DATA, FILE_WRITE_DATA, WRITE_DAC, WRITE_OWNER,
@@ -734,7 +734,7 @@ fn creation_time(path: &std::path::Path) -> Result<i64, RootError> {
     use std::mem::size_of;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
-        FileBasicInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO,
+        FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
     };
 
     let file = open_file(path)?;
@@ -761,8 +761,8 @@ fn restore_creation_time(path: &std::path::Path, expected: i64) -> Result<(), Ro
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::Storage::FileSystem::{
-        FileBasicInfo, GetFileInformationByHandleEx, SetFileTime, FILE_BASIC_INFO,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES,
+        FILE_BASIC_INFO, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES,
+        FileBasicInfo, GetFileInformationByHandleEx, SetFileTime,
     };
 
     let file = std::fs::OpenOptions::new()
