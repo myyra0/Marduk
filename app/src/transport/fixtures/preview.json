@@ -1,0 +1,35 @@
+{
+  "ok": true,
+  "result": {
+    "blockers": [
+      {
+        "code": "InvalidPath",
+        "detail": {
+          "reason": "MissingParent"
+        }
+      },
+      {
+        "code": "TargetUnavailable"
+      }
+    ],
+    "files": [
+      {
+        "candidates": [
+          "9007199254740997",
+          "9007199254741001"
+        ],
+        "needsBackup": true,
+        "target": {
+          "path": "textures/winner.dds",
+          "role": "data"
+        },
+        "winner": "9007199254741001"
+      }
+    ],
+    "id": "9223372036854775703",
+    "installationId": "9007199254740993",
+    "label": "Skyrim Special Edition",
+    "profileId": "1",
+    "revision": "42"
+  }
+}

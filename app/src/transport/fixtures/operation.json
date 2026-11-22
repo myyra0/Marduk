@@ -1,0 +1,18 @@
+{
+  "ok": true,
+  "result": {
+    "blocker": null,
+    "generationId": "9223372036854775802",
+    "id": "9223372036854775801",
+    "kind": "restore",
+    "phase": "completed",
+    "retained": [
+      {
+        "direction": "undo",
+        "operationId": "9223372036854775701",
+        "ordinal": 3,
+        "slot": "displaced"
+      }
+    ]
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "error": {
+    "code": "InvalidPath",
+    "detail": {
+      "reason": "MissingParent"
+    }
+  },
+  "ok": false
+}

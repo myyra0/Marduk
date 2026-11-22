@@ -1,0 +1,19 @@
+{
+  "ok": true,
+  "result": {
+    "archiveSha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "expectedRevision": "42",
+    "files": [
+      {
+        "path": "textures/winner.dds",
+        "role": "data"
+      },
+      {
+        "path": "meshes/only-a.nif",
+        "role": "data"
+      }
+    ],
+    "id": "9223372036854775702",
+    "profileId": "1"
+  }
+}

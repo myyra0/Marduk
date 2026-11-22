@@ -1,0 +1,74 @@
+{
+  "ok": true,
+  "result": {
+    "activeGenerationId": "9223372036854775804",
+    "availability": {
+      "deploy": {
+        "available": false,
+        "blocker": {
+          "code": "UnsupportedTarget",
+          "detail": {
+            "reason": "Configuration"
+          }
+        }
+      },
+      "import": {
+        "available": false,
+        "blocker": {
+          "code": "StageUnavailable"
+        }
+      },
+      "restore": {
+        "available": false,
+        "blocker": {
+          "code": "UnsupportedTarget",
+          "detail": {
+            "reason": "Configuration"
+          }
+        }
+      },
+      "target": {
+        "available": true
+      }
+    },
+    "installation": {
+      "id": "9007199254740993",
+      "label": "Skyrim Special Edition"
+    },
+    "pending": {
+      "blocker": {
+        "code": "RecoveryConflict"
+      },
+      "generationId": "9223372036854775804",
+      "id": "9223372036854775803",
+      "kind": "deploy",
+      "phase": "applying",
+      "retained": [
+        {
+          "direction": "forward",
+          "operationId": "9223372036854775805",
+          "ordinal": 2,
+          "slot": "original"
+        }
+      ]
+    },
+    "profile": {
+      "id": "9007199254740995",
+      "members": [
+        {
+          "displayName": "Base textures",
+          "enabled": true,
+          "id": "9007199254740997",
+          "installedId": "9007199254740999"
+        },
+        {
+          "displayName": "Weather overhaul",
+          "enabled": false,
+          "id": "9007199254741001",
+          "installedId": "9007199254741003"
+        }
+      ],
+      "revision": "9223372036854775807"
+    }
+  }
+}

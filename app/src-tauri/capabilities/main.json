@@ -1,0 +1,20 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-local",
+  "description": "Frozen workspace commands for the trusted local main window only.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "allow-pick-installation",
+    "allow-pick-zip",
+    "allow-setup",
+    "allow-status",
+    "allow-import-preview",
+    "allow-import-apply",
+    "allow-order",
+    "allow-deploy-preview",
+    "allow-deploy-apply",
+    "allow-restore",
+    "allow-operation"
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "ok": true,
+  "result": {
+    "id": "9007199254740995",
+    "members": [
+      {
+        "displayName": "Base textures",
+        "enabled": true,
+        "id": "9007199254740997",
+        "installedId": "9007199254740999"
+      },
+      {
+        "displayName": "Weather overhaul",
+        "enabled": false,
+        "id": "9007199254741001",
+        "installedId": "9007199254741003"
+      }
+    ],
+    "revision": "9223372036854775807"
+  }
+}

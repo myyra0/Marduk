@@ -273,7 +273,7 @@ impl WireError {
 
 pub type Blocker = WireError;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Member {
     pub id: String,
@@ -282,7 +282,7 @@ pub struct Member {
     pub display_name: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     pub id: String,
@@ -290,21 +290,21 @@ pub struct Snapshot {
     pub members: Vec<Member>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Availability {
     pub available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocker: Option<Blocker>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Installation {
     pub id: String,
     pub label: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Retained {
     pub operation_id: String,
@@ -313,14 +313,14 @@ pub struct Retained {
     pub slot: Slot,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
     Forward,
     Undo,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Slot {
     Original,
@@ -328,14 +328,14 @@ pub enum Slot {
     Displaced,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     Deploy,
     Restore,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Operation {
     pub id: String,
@@ -346,7 +346,7 @@ pub struct Operation {
     pub retained: Vec<Retained>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AvailabilitySet {
     pub target: Availability,
@@ -355,7 +355,7 @@ pub struct AvailabilitySet {
     pub restore: Availability,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceStatus {
     pub installation: Option<Installation>,
@@ -365,20 +365,20 @@ pub struct WorkspaceStatus {
     pub active_generation_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Target {
     pub role: Role,
     pub path: String,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     Data,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Prepared {
     pub id: String,
@@ -388,7 +388,7 @@ pub struct Prepared {
     pub files: Vec<Target>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewFile {
     pub target: Target,
@@ -399,7 +399,7 @@ pub struct PreviewFile {
 
 /// Deployment preview shape. Phase B must produce it from the qualified effect
 /// port and round-trip it through this DTO before the desktop shows Review.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Preview {
     pub id: Option<String>,
@@ -413,7 +413,7 @@ pub struct Preview {
 
 /// Restore outcome shape. Phase B must produce both variants and cover their
 /// round trip; phase A only returns the typed unsupported blocker.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "camelCase")]
 pub enum RestoreResult {
     Operation { operation: Operation },
@@ -1059,5 +1059,256 @@ mod tests {
         let root = app_data_root_in(Path::new("/var/lib/user-data"));
         assert_eq!(root, Path::new("/var/lib/user-data").join(APP_IDENTIFIER));
         assert_eq!(root.file_name().unwrap(), APP_IDENTIFIER);
+    }
+}
+
+/// Rust-generated client wire fixtures.
+///
+/// The desktop transport tests parse these files, so the committed JSON is
+/// produced by the same serialization the commands return. Regenerate with
+/// `MDUK_WRITE_WIRE_FIXTURES=1 cargo test -p marduk-workspace wire_fixture`
+/// after changing a DTO, then rerun without the variable to verify the check.
+#[cfg(test)]
+mod wire_fixture {
+    use super::*;
+
+    const LARGE_A: &str = "9007199254740993";
+    const LARGE_B: &str = "9007199254740995";
+    const LARGE_C: &str = "9007199254740997";
+    const LARGE_D: &str = "9007199254740999";
+    const LARGE_E: &str = "9007199254741001";
+    const LARGE_F: &str = "9007199254741003";
+    const REVISION: &str = "9223372036854775807";
+
+    fn fixtures() -> Vec<(&'static str, Value)> {
+        vec![
+            ("status.json", ok(status_fixture())),
+            ("snapshot.json", ok(snapshot_fixture())),
+            ("operation.json", ok(operation_fixture())),
+            ("prepared.json", ok(prepared_fixture())),
+            ("preview.json", ok(preview_fixture())),
+            (
+                "restore-no-active.json",
+                ok(RestoreResult::NoActiveDeployment {
+                    code: Code::NoActiveDeployment,
+                }),
+            ),
+            (
+                "error-stale-plan.json",
+                serde_json::to_value(Envelope::<()>::error(WireError::new(Code::StalePlan)))
+                    .unwrap(),
+            ),
+            (
+                "error-invalid-path.json",
+                serde_json::to_value(Envelope::<()>::error(WireError::with_detail(
+                    Code::InvalidPath,
+                    Detail::Reason {
+                        reason: ReasonDto::MissingParent,
+                    },
+                )))
+                .unwrap(),
+            ),
+            (
+                "error-limit.json",
+                serde_json::to_value(Envelope::<()>::error(WireError::with_detail(
+                    Code::LimitExceeded,
+                    Detail::Kind {
+                        kind: LimitKindDto::Entries,
+                    },
+                )))
+                .unwrap(),
+            ),
+        ]
+    }
+
+    fn ok<T: Serialize>(result: T) -> Value {
+        serde_json::to_value(Envelope::ok(result)).unwrap()
+    }
+
+    fn snapshot_fixture() -> Snapshot {
+        Snapshot {
+            id: LARGE_B.to_owned(),
+            revision: REVISION.to_owned(),
+            members: vec![
+                Member {
+                    id: LARGE_C.to_owned(),
+                    installed_id: LARGE_D.to_owned(),
+                    enabled: true,
+                    display_name: "Base textures".to_owned(),
+                },
+                Member {
+                    id: LARGE_E.to_owned(),
+                    installed_id: LARGE_F.to_owned(),
+                    enabled: false,
+                    display_name: "Weather overhaul".to_owned(),
+                },
+            ],
+        }
+    }
+
+    fn operation_fixture() -> Operation {
+        Operation {
+            id: "9223372036854775801".to_owned(),
+            kind: Kind::Restore,
+            phase: "completed".to_owned(),
+            generation_id: Some("9223372036854775802".to_owned()),
+            blocker: None,
+            retained: vec![Retained {
+                operation_id: "9223372036854775701".to_owned(),
+                ordinal: 3,
+                direction: Direction::Undo,
+                slot: Slot::Displaced,
+            }],
+        }
+    }
+
+    fn status_fixture() -> WorkspaceStatus {
+        WorkspaceStatus {
+            installation: Some(Installation {
+                id: LARGE_A.to_owned(),
+                label: "Skyrim Special Edition".to_owned(),
+            }),
+            profile: snapshot_fixture(),
+            availability: AvailabilitySet {
+                target: Availability {
+                    available: true,
+                    blocker: None,
+                },
+                import: Availability {
+                    available: false,
+                    blocker: Some(WireError::new(Code::StageUnavailable)),
+                },
+                deploy: Availability {
+                    available: false,
+                    blocker: Some(WireError::with_detail(
+                        Code::UnsupportedTarget,
+                        Detail::Reason {
+                            reason: ReasonDto::Configuration,
+                        },
+                    )),
+                },
+                restore: Availability {
+                    available: false,
+                    blocker: Some(WireError::with_detail(
+                        Code::UnsupportedTarget,
+                        Detail::Reason {
+                            reason: ReasonDto::Configuration,
+                        },
+                    )),
+                },
+            },
+            pending: Some(Operation {
+                id: "9223372036854775803".to_owned(),
+                kind: Kind::Deploy,
+                phase: "applying".to_owned(),
+                generation_id: Some("9223372036854775804".to_owned()),
+                blocker: Some(WireError::new(Code::RecoveryConflict)),
+                retained: vec![Retained {
+                    operation_id: "9223372036854775805".to_owned(),
+                    ordinal: 2,
+                    direction: Direction::Forward,
+                    slot: Slot::Original,
+                }],
+            }),
+            active_generation_id: Some("9223372036854775804".to_owned()),
+        }
+    }
+
+    fn prepared_fixture() -> Prepared {
+        Prepared {
+            id: "9223372036854775702".to_owned(),
+            profile_id: "1".to_owned(),
+            expected_revision: "42".to_owned(),
+            archive_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_owned(),
+            files: vec![
+                Target {
+                    role: Role::Data,
+                    path: "textures/winner.dds".to_owned(),
+                },
+                Target {
+                    role: Role::Data,
+                    path: "meshes/only-a.nif".to_owned(),
+                },
+            ],
+        }
+    }
+
+    fn preview_fixture() -> Preview {
+        Preview {
+            id: Some("9223372036854775703".to_owned()),
+            profile_id: "1".to_owned(),
+            revision: "42".to_owned(),
+            installation_id: LARGE_A.to_owned(),
+            label: "Skyrim Special Edition".to_owned(),
+            files: vec![PreviewFile {
+                target: Target {
+                    role: Role::Data,
+                    path: "textures/winner.dds".to_owned(),
+                },
+                winner: LARGE_E.to_owned(),
+                candidates: vec![LARGE_C.to_owned(), LARGE_E.to_owned()],
+                needs_backup: true,
+            }],
+            blockers: vec![
+                WireError::with_detail(
+                    Code::InvalidPath,
+                    Detail::Reason {
+                        reason: ReasonDto::MissingParent,
+                    },
+                ),
+                WireError::new(Code::TargetUnavailable),
+            ],
+        }
+    }
+
+    fn fixture_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../app/src/transport/fixtures")
+    }
+
+    #[test]
+    fn committed_wire_fixtures_are_rust_serialized() {
+        let dir = fixture_dir();
+        let write = std::env::var_os("MDUK_WRITE_WIRE_FIXTURES").is_some();
+        if write {
+            std::fs::create_dir_all(&dir).unwrap();
+        }
+        for (name, value) in fixtures() {
+            let path = dir.join(name);
+            if write {
+                let text = serde_json::to_string_pretty(&value).unwrap();
+                std::fs::write(&path, format!("{text}\n")).unwrap();
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+                panic!(
+                    "missing {name}; run MDUK_WRITE_WIRE_FIXTURES=1 \
+                     cargo test -p marduk-workspace committed_wire_fixtures_are_rust_serialized"
+                )
+            });
+            let committed: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(committed, value, "{name} drifted from the Rust DTOs");
+        }
+    }
+
+    #[test]
+    fn fixture_results_deserialize_into_client_dtos() {
+        let result = |value: Value| value["result"].clone();
+
+        let status: WorkspaceStatus = serde_json::from_value(result(ok(status_fixture()))).unwrap();
+        assert_eq!(status.profile.revision, REVISION);
+        assert_eq!(status.profile.members[0].id, LARGE_C);
+        assert_eq!(status.pending.unwrap().retained[0].ordinal, 2);
+
+        let _: Snapshot = serde_json::from_value(result(ok(snapshot_fixture()))).unwrap();
+        let _: Operation = serde_json::from_value(result(ok(operation_fixture()))).unwrap();
+        let _: Prepared = serde_json::from_value(result(ok(prepared_fixture()))).unwrap();
+        let _: Preview = serde_json::from_value(result(ok(preview_fixture()))).unwrap();
+        let restore: RestoreResult =
+            serde_json::from_value(result(ok(RestoreResult::NoActiveDeployment {
+                code: Code::NoActiveDeployment,
+            })))
+            .unwrap();
+        assert!(matches!(restore, RestoreResult::NoActiveDeployment { .. }));
     }
 }

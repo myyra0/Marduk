@@ -1,0 +1,9 @@
+{
+  "error": {
+    "code": "LimitExceeded",
+    "detail": {
+      "kind": "Entries"
+    }
+  },
+  "ok": false
+}
