@@ -49,6 +49,23 @@ const DOM_STATE = `
   };
 `;
 
+/** Evaluated in the page on failure. Captures the rendered state for diagnosis. */
+const DIAG_STATE = `
+  const alertNodes = Array.from(document.querySelectorAll('[role="alert"], .notice, .error'));
+  const alertText = alertNodes.length
+    ? alertNodes.map(function (node) { return (node.textContent || '').trim(); }).filter(Boolean).join('\\n')
+    : (document.body ? (document.body.textContent || '').trim() : '');
+  const internals = window.__TAURI_INTERNALS__;
+  return {
+    documentTitle: document.title,
+    locationHref: location.href,
+    bodyHtml: document.body ? document.body.innerHTML.slice(0, 2000) : '',
+    alertText: alertText.slice(0, 4000),
+    tauriInternalsExists: typeof internals !== 'undefined' && internals !== null,
+    tauriInvokeIsFunction: !!(internals && typeof internals.invoke === 'function'),
+  };
+`;
+
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
 }
@@ -107,6 +124,26 @@ async function waitForDriver(): Promise<void> {
   );
 }
 
+async function fetchBrowserConsoleMessages(sessionId: string): Promise<unknown[] | null> {
+  const attempts: Array<() => Promise<unknown>> = [
+    () => http('POST', `/session/${sessionId}/log`, { type: 'browser' }, 10_000),
+    () => http('GET', `/session/${sessionId}/log?type=browser`, undefined, 10_000),
+  ];
+  for (const attempt of attempts) {
+    try {
+      const value = await attempt();
+      if (Array.isArray(value)) return value;
+      if (value && typeof value === 'object' && Array.isArray((value as { value?: unknown }).value)) {
+        return (value as { value: unknown[] }).value;
+      }
+      if (value !== null && value !== undefined) return [value];
+    } catch {
+      // driver may not expose browser logs; try the next shape
+    }
+  }
+  return null;
+}
+
 async function waitFor<T>(
   label: string,
   timeoutMs: number,
@@ -127,6 +164,8 @@ async function waitFor<T>(
 }
 
 let sessionId: string | null = null;
+let execute: ((script: string) => Promise<unknown>) | null = null;
+let executeAsync: ((script: string) => Promise<unknown>) | null = null;
 
 try {
   assert(
@@ -148,9 +187,9 @@ try {
   );
   sessionId = session.sessionId;
 
-  const execute = (script: string): Promise<unknown> =>
+  execute = (script: string): Promise<unknown> =>
     http('POST', `/session/${sessionId}/execute/sync`, { script, args: [] }, 60_000);
-  const executeAsync = (script: string): Promise<unknown> =>
+  executeAsync = (script: string): Promise<unknown> =>
     http('POST', `/session/${sessionId}/execute/async`, { script, args: [] }, 60_000);
 
   const nativeTitle = await http('GET', `/session/${sessionId}/title`);
@@ -274,6 +313,40 @@ try {
   );
 } catch (error) {
   console.error(`desktop smoke failed: ${describe(error)}`);
+  if (sessionId !== null && execute !== null) {
+    try {
+      const diag = (await execute(DIAG_STATE)) as {
+        documentTitle?: string;
+        locationHref?: string;
+        bodyHtml?: string;
+        alertText?: string;
+        tauriInternalsExists?: boolean;
+        tauriInvokeIsFunction?: boolean;
+      } | null;
+      if (diag) {
+        console.error(`document title: ${diag.documentTitle ?? '(none)'}`);
+        console.error(`location.href: ${diag.locationHref ?? '(none)'}`);
+        console.error(`body.innerHTML (first 2000 chars):\n${diag.bodyHtml ?? ''}`);
+        console.error(`alert/notice/error text: ${diag.alertText ?? '(none)'}`);
+        console.error(
+          `window.__TAURI_INTERNALS__ exists: ${diag.tauriInternalsExists === true}; invoke is function: ${diag.tauriInvokeIsFunction === true}`,
+        );
+      }
+    } catch (diagError) {
+      console.error(`diagnostic DOM capture failed: ${describe(diagError)}`);
+    }
+    try {
+      const consoleMessages = await fetchBrowserConsoleMessages(sessionId);
+      if (consoleMessages !== null) {
+        console.error(`captured browser console messages (${consoleMessages.length}):`);
+        for (const message of consoleMessages) {
+          console.error(typeof message === 'string' ? message : JSON.stringify(message));
+        }
+      }
+    } catch (consoleError) {
+      // skip silently if the driver does not expose console messages
+    }
+  }
   process.exitCode = 1;
 } finally {
   if (sessionId !== null) {
