@@ -94,6 +94,23 @@ pub fn open_private_child_directory(
     native::open_private_child_directory(parent, name)
 }
 
+/// Open or create a chain of application-owned child directories beneath a
+/// pinned parent, refusing a link at any component.
+///
+/// Each component is opened through the previously verified handle, so a
+/// pre-existing symlink or junction is a typed refusal before the caller can
+/// create or open an artifact beneath it.
+pub fn open_private_child_chain(
+    parent: &std::fs::File,
+    components: &[&str],
+) -> Result<std::fs::File, RootError> {
+    let mut current = parent.try_clone().map_err(|_| RootError::Io)?;
+    for name in components {
+        current = native::open_private_child_directory(&current, name)?;
+    }
+    Ok(current)
+}
+
 /// Resolve a child pathname that stays beneath the pinned parent handle.
 ///
 /// The parent must remain open for the returned path to keep its meaning.

@@ -1023,6 +1023,39 @@ fn restore_time_external_edit_conflicts_and_preserves_external_bytes() {
 
 #[test]
 #[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn preexisting_ops_redirect_is_refused_before_any_write_outside_the_app_root() {
+    let fixture = Fixture::new();
+    let mut journal = fixture.journal();
+    let mut port = fixture.adapter();
+    let plan = marduk_core::deployment::preview_deployment(
+        &mut journal,
+        &mut port,
+        &profile(),
+        &inputs(),
+        &fixture.installation,
+        &fixture.data,
+    )
+    .unwrap();
+
+    let outside = fixture.temp_path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    let ops = fixture.app.join("effects/ops");
+    std::os::unix::fs::symlink(&outside, &ops).unwrap();
+
+    let error =
+        marduk_core::deployment::commit_deployment(&mut journal, &mut port, plan.id, || false)
+            .unwrap_err();
+    assert_eq!(error, DeployError::TargetUnavailable);
+    assert!(
+        fs::read_dir(&outside).unwrap().next().is_none(),
+        "no operation artifact may be written through the redirect"
+    );
+    assert_eq!(fs::read(fixture.target(WINNER)).unwrap(), BASE);
+    assert_eq!(fs::read_link(&ops).unwrap(), outside);
+}
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
 fn unqualified_app_root_is_refused_before_any_write() {
     let fixture = Fixture::new();
     let unqualified = Path::new("/sys/kernel");

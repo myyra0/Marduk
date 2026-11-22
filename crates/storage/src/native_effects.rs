@@ -53,6 +53,9 @@ pub struct NativeEffects {
     locator: PathBuf,
     layout: GameLayout,
     binding: InstallationBinding,
+    /// The pinned `effects` directory. Operation-directory chains are created
+    /// beneath this handle so a pre-existing redirect cannot receive writes.
+    effects: File,
     private: PathBuf,
     /// Pins the catalog leaf for `profile_revision`, which SQLite opens by
     /// pathname. The handle is re-proved after that open.
@@ -98,7 +101,6 @@ impl NativeEffects {
         let effects_directory =
             marduk_platform::open_private_child_directory(&root_handle, "effects")
                 .map_err(|_| DeployError::Io)?;
-        drop(effects_directory);
         let private = marduk_platform::private_child_path(&root_handle, "effects")
             .map_err(|_| DeployError::Io)?;
         let catalog =
@@ -117,6 +119,7 @@ impl NativeEffects {
             locator: locator.to_path_buf(),
             layout,
             binding,
+            effects: effects_directory,
             private,
             catalog,
             resolved_root,
@@ -168,6 +171,34 @@ impl NativeEffects {
                 StepDirection::Forward => "forward",
                 StepDirection::Undo => "undo",
             })
+    }
+
+    /// Create the operation directory through the pinned `effects` handle and
+    /// re-prove the pathname still names that directory before any artifact is
+    /// created or opened beneath it. A pre-existing link at `ops` or any
+    /// operation component is refused here instead of being followed.
+    fn bind_operation_directory(
+        &self,
+        operation: u64,
+        ordinal: u32,
+        direction: StepDirection,
+    ) -> Result<PathBuf, DeployError> {
+        let operation_text = operation.to_string();
+        let ordinal_text = ordinal.to_string();
+        let direction_text = match direction {
+            StepDirection::Forward => "forward",
+            StepDirection::Undo => "undo",
+        };
+        marduk_platform::verify_private_directory(&self.private, &self.effects)
+            .map_err(map_root)?;
+        let handle = marduk_platform::open_private_child_chain(
+            &self.effects,
+            &["ops", &operation_text, &ordinal_text, direction_text],
+        )
+        .map_err(map_root)?;
+        let path = self.op_dir(operation, ordinal, direction);
+        marduk_platform::verify_private_directory(&path, &handle).map_err(map_root)?;
+        Ok(path)
     }
 
     fn stage_path(&self, at: StageRef) -> PathBuf {
@@ -802,8 +833,7 @@ impl CopyEffects for NativeEffects {
         direction: StepDirection,
         intent: &StepSpec,
     ) -> Result<PreparedStep, DeployError> {
-        fs::create_dir_all(self.op_dir(op.get(), ordinal, direction))
-            .map_err(|_| DeployError::Io)?;
+        self.bind_operation_directory(op.get(), ordinal, direction)?;
 
         let resolved = self.resolved(&intent.target).map_err(map_root)?;
         let observed = marduk_platform::observe_target(&resolved).map_err(map_root)?;
