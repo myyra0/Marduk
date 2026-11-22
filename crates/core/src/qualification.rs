@@ -199,6 +199,15 @@ pub const PROOFS: &[Proof] = &[
         capability: Capability::LibraryStaging,
         os: Os::Windows,
         volume: VolumeClass::Ntfs,
+        layer: Layer::Catalog,
+        witnesses: &["windows_catalog_stages_a_payload_beside_its_root_pin"],
+        date: "2026-11-22",
+        revision: "pending",
+    },
+    Proof {
+        capability: Capability::LibraryStaging,
+        os: Os::Windows,
+        volume: VolumeClass::Ntfs,
         layer: Layer::Staging,
         witnesses: &[
             "redirected_revisions_is_refused_without_writes",
@@ -310,6 +319,15 @@ pub const PROOFS: &[Proof] = &[
     },
     Proof {
         capability: Capability::NativeEffects,
+        os: Os::Windows,
+        volume: VolumeClass::Ntfs,
+        layer: Layer::Composition,
+        witnesses: &["qualified_native_round_trip_retains_backups_and_restores_the_original_tree"],
+        date: "2026-11-22",
+        revision: "pending",
+    },
+    Proof {
+        capability: Capability::NativeEffects,
         os: Os::Linux,
         volume: VolumeClass::Btrfs,
         layer: Layer::Deploy,
@@ -418,37 +436,29 @@ mod tests {
     }
 
     #[test]
-    fn windows_staging_adapter_runs_while_its_import_stays_closed() {
-        assert!(is_available(
-            Capability::LibraryStaging,
-            Route::Adapter,
-            Os::Windows,
-            VolumeClass::Ntfs
-        ));
-        assert!(!is_available(
-            Capability::LibraryStaging,
-            Route::Import,
-            Os::Windows,
-            VolumeClass::Ntfs
-        ));
+    fn windows_staging_and_import_are_proven_on_ntfs() {
+        for route in [Route::Adapter, Route::Import] {
+            assert!(is_available(
+                Capability::LibraryStaging,
+                route,
+                Os::Windows,
+                VolumeClass::Ntfs
+            ));
+        }
     }
 
     #[test]
-    fn native_effects_adapter_is_proven_only_on_the_two_linux_volumes() {
-        for volume in [VolumeClass::Btrfs, VolumeClass::Tmpfs] {
-            assert!(is_available(
-                Capability::NativeEffects,
-                Route::Adapter,
-                Os::Linux,
-                volume
-            ));
+    fn native_effects_adapter_is_proven_on_the_witnessed_volumes() {
+        for (os, volume) in [
+            (Os::Linux, VolumeClass::Btrfs),
+            (Os::Linux, VolumeClass::Tmpfs),
+            (Os::Windows, VolumeClass::Ntfs),
+        ] {
+            assert!(
+                is_available(Capability::NativeEffects, Route::Adapter, os, volume),
+                "{os}/{volume}"
+            );
         }
-        assert!(!is_available(
-            Capability::NativeEffects,
-            Route::Adapter,
-            Os::Windows,
-            VolumeClass::Ntfs
-        ));
         assert!(!is_available(
             Capability::NativeEffects,
             Route::Adapter,
@@ -507,16 +517,16 @@ mod tests {
                 );
             }
         }
-        // A Windows-shaped answer is a record query, not a host check. Only the
-        // native effect composition opens these routes; every other capability
-        // and every unproven volume stays refused.
+        // A Windows-shaped answer is a record query, not a host check. The
+        // native effect composition opens these routes on NTFS; every other
+        // capability and every unproven volume stays refused.
         for (capability, os, volume) in [
-            (Capability::NativeEffects, Os::Windows, VolumeClass::Ntfs),
             (Capability::NativeEffects, Os::Windows, VolumeClass::Other),
             (Capability::NativeEffects, Os::Linux, VolumeClass::Ext4),
             (Capability::NativeEffects, Os::Linux, VolumeClass::Other),
             (Capability::EffectPrimitives, Os::Linux, VolumeClass::Btrfs),
             (Capability::EffectPrimitives, Os::Linux, VolumeClass::Tmpfs),
+            (Capability::EffectPrimitives, Os::Windows, VolumeClass::Ntfs),
             (Capability::LibraryStaging, Os::Linux, VolumeClass::Btrfs),
             (Capability::LibraryStaging, Os::Linux, VolumeClass::Tmpfs),
             (Capability::LibraryStaging, Os::Windows, VolumeClass::Ntfs),
@@ -527,6 +537,14 @@ mod tests {
                     "{capability} {route:?} on {os}/{volume} must stay closed"
                 );
             }
+        }
+        for route in [Route::Deploy, Route::Restore] {
+            assert!(is_available(
+                Capability::NativeEffects,
+                route,
+                Os::Windows,
+                VolumeClass::Ntfs
+            ));
         }
     }
 

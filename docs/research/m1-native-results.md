@@ -1,8 +1,8 @@
 # M1-R03 native results
 
-Runtime evidence from 2026-11-22 (IST), code commit `29e587d`, base `ebd9e07`. Task 6 native-adapter rows were re-tested at `101b4f7` (recovery fix `7feb64b`), and the composition round trip was re-run at `af0fc6d` with scoped metadata that differs between the original and the staged payload (`2b6b51d` recorded the earlier composition run). The client-visible deploy and restore run is recorded at `97c03d9` in [Client-visible deploy and restore](#client-visible-deploy-and-restore-2026-11-22). `not run` is never a pass. No qualifying power-cut result exists. [ADR 0004](../adr/0004-windows-writes-use-standard-flush.md) narrows the Windows barrier to standard flushing; the code change is at `6056ab3`, and the NTFS composition attempt there did not pass, so Windows deploy stays unqualified.
+Runtime evidence from 2026-11-22 (IST), code commit `29e587d`, base `ebd9e07`. Task 6 native-adapter rows were re-tested at `101b4f7` (recovery fix `7feb64b`), and the composition round trip was re-run at `af0fc6d` with scoped metadata that differs between the original and the staged payload (`2b6b51d` recorded the earlier composition run). The client-visible deploy and restore run is recorded at `97c03d9` in [Client-visible deploy and restore](#client-visible-deploy-and-restore-2026-11-22). The NTFS whole-composition run is recorded at `f71dd402` in [Windows composition run](#windows-composition-run-2026-11-22). `not run` is never a pass. No qualifying power-cut result exists. [ADR 0004](../adr/0004-windows-writes-use-standard-flush.md) narrows the Windows barrier to standard flushing; that decision still excludes power-cut recovery from the claim.
 
-Close-out 2026-11-22: the Task 5 gate blocked native wiring; a later Task 5 continuation connected private-library staging on the two Linux volume classes with runtime evidence (Btrfs and tmpfs), and the Windows staging adapter is implemented and witnessed on NTFS while its product gate stays closed; see [Qualified library staging](#qualified-library-staging-connected-2026-11-22). Native game-directory preview, Apply and Restore are connected in the workspace proof lane on the two Linux volume classes (Task 6), and client `dispatch` serves deploy and restore where the record proves the composition (Linux Btrfs and tmpfs). Crash/power-cut evidence is deferred; Windows deploy stays refused for lack of a composition proof. `not run` rows stay `not run`.
+Close-out 2026-11-22: the Task 5 gate blocked native wiring; a later Task 5 continuation connected private-library staging on the two Linux volume classes with runtime evidence (Btrfs and tmpfs), and the Windows staging adapter is implemented and witnessed on NTFS; see [Qualified library staging](#qualified-library-staging-connected-2026-11-22). Native game-directory preview, Apply and Restore are connected in the workspace proof lane on the two Linux volume classes (Task 6), and the NTFS whole-composition run now opens the same routes there. Client `dispatch` serves deploy and restore where the record proves the composition (Linux Btrfs and tmpfs, Windows NTFS). Crash/power-cut evidence is deferred. `not run` rows stay `not run`.
 
 Environment: Linux 7.3.5-1-cachyos, x86-64, rustc 1.100.0, uid 1000 with `CapEff: 0` (ordinary user, no elevated token). tmpfs scratch: `/tmp` `rw,noatime,inode64,huge=advise`, fsid `b6b575e7…`, mount view 74, no Btrfs tree. Btrfs scratch: `/home` on `/dev/nvme0n1p2[/@home]` `rw,noatime,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/@home`, fsid `b68b24bc…`, view 61, tree 257. All fixtures are synthetic files under a disposable parent; no game, external root or elevated operation was touched.
 
@@ -14,12 +14,12 @@ Environment: Linux 7.3.5-1-cachyos, x86-64, rustc 1.100.0, uid 1000 with `CapEff
 | `native_detach_preserves_unknown_file` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run | — |
 | `native_error_does_not_prove_no_change` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run | — |
 | `native_namespace_survives_claimed_barrier` | ran 2026-11-22, passed (process-only, new create only) | ran 2026-11-22, passed (process-only, new create only) | not run | narrowed (ADR 0004: standard flush, power cut not covered) | Task 8, not run |
-| `library_catalog_never_names_missing_payload` | not run (staging wired on this volume; catalog witness not run) | not run (staging wired on this volume; catalog witness not run) | not run (unqualified; `StageUnavailable`) | not run (unqualified; `StageUnavailable`) | Task 8, not run |
+| `library_catalog_never_names_missing_payload` | not run (staging wired on this volume; catalog witness not run) | not run (staging wired on this volume; catalog witness not run) | not run (unqualified; `StageUnavailable`) | not run (catalog witness not run) | Task 8, not run |
 | `btrfs_cross_subvolume_copy_does_not_use_cross_subvolume_rename` | not run (subvolume teardown EPERM; two-subvolume `EXDEV`/substitution not run) | N/A | N/A | N/A | — |
 
 **Evidence scope:** The root/parent substitution row covers refusal when substitution was visible at the last live check. It does not demonstrate prevention inside the final check-to-syscall window.
 
-**Narrowed is not a pass.** ADR 0004 accepts standard filesystem flushing on Windows and drops the claim that an interrupted deploy is always recoverable. The NTFS barrier cell therefore records a decision, not a run: the barrier and crash rows stay unrun, and no power-cut result exists on any configuration. Windows deploy and restore remain refused until a composition-rung proof exists (see [Windows composition attempt](#windows-composition-attempt-2026-11-22-not-recorded)).
+**Narrowed is not a pass.** ADR 0004 accepts standard filesystem flushing on Windows and drops the claim that an interrupted deploy is always recoverable. The NTFS barrier cell therefore records a decision, not a run: the barrier and crash rows stay unrun, and no power-cut result exists on any configuration. The separate NTFS composition run (below) opens the deploy and restore routes without changing that narrowed barrier row.
 
 ## Per-row evidence
 
@@ -76,9 +76,10 @@ Wired: private staging (private archive snapshot, admitted member set, hashed pa
 
 Library-staging witnesses. The Linux row is the catalog witness the record proves; the eight Windows rows are the recorded `library_staging_witnesses` suite, of which the record names two.
 
-| Staging witness | Linux Btrfs | Linux tmpfs | Hosted `windows-2025` NTFS |
+| Staging witness | Linux Btrfs | Linux tmpfs | Windows NTFS |
 |---|---|---|---|
 | `qualified_volume_stages_the_payload_through_the_production_catalog` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run |
+| `windows_catalog_stages_a_payload_beside_its_root_pin` | not run | not run | ran 2026-11-22 at `f71dd402`, passed |
 | `staged_revision_keeps_real_bytes_private_and_reobserves_after_reopen` | not run | not run | ran 2026-11-22 at 367ca69, passed |
 | `redirected_revisions_is_refused_without_writes` | not run | not run | ran 2026-11-22 at 367ca69, passed |
 | `redirected_revision_path_is_refused_without_writes` | not run | not run | ran 2026-11-22 at 367ca69, passed |
@@ -88,9 +89,9 @@ Library-staging witnesses. The Linux row is the catalog witness the record prove
 | `reobserve_refuses_an_added_payload_file` | not run | not run | ran 2026-11-22 at 367ca69, passed |
 | `reobserve_refuses_a_revision_redirected_while_unbound` | not run | not run | ran 2026-11-22 at 367ca69, passed |
 
-The runtime evidence behind the accepted magic set is the tmpfs/Btrfs effect table at the top of this document plus the catalog staging witnesses above. No ext4 or native NTFS catalog run exists; those cells stay `not run`. `VolumeClass::Other` is the catch-all: a new filesystem needs a `volume_class` mapping branch, a `PROOFS` row and a staging-matrix row; an unmapped magic stays unproven for every capability (`crates/platform/src/linux_root_tests.rs`).
+The runtime evidence behind the accepted magic set is the tmpfs/Btrfs effect table at the top of this document plus the catalog staging witnesses above. No ext4 catalog run exists; native NTFS catalog and composition rows are recorded in [Windows composition run](#windows-composition-run-2026-11-22). `VolumeClass::Other` is the catch-all: a new filesystem needs a `volume_class` mapping branch, a `PROOFS` row and a staging-matrix row; an unmapped magic stays unproven for every capability (`crates/platform/src/linux_root_tests.rs`).
 
-Windows product availability stays closed: the record's NTFS proofs reach only the staging and primitive layers, so `library_volume_qualified` and `effects_volume_qualified` are `false` and deploy-level NTFS rows remain `not run`. The private staging adapter itself is implemented and was re-run on NTFS after the 2026-11-22 review fixes:
+Windows product availability follows the record: NTFS import is proven at the catalog layer and NTFS deploy/restore at the composition layer by the run below, while every other Windows volume class stays refused. The private staging adapter itself is implemented and was re-run on NTFS after the 2026-11-22 review fixes:
 
 - Tree: `7bcd2c1` plus the staging review fix. VM: Windows 10 `DESKTOP-4NP2KM5`, `rustc 1.100.0`. Scratch volume `C:` reported `File System Name : NTFS` (`fsutil fsinfo volumeinfo C:`).
 - `cargo test -p marduk-platform --test library_staging_witnesses -- --nocapture` → `running 8 tests`, `test result: ok. 8 passed; 0 failed`, including `reobserve_refuses_an_added_payload_file`.
@@ -137,8 +138,9 @@ native_deployment -- --ignored --test-threads=1`, 6 passed on each volume):
 
 Crash and power-cut behaviour for Linux Btrfs and tmpfs is not covered by these
 runs and remains deferred; the process-restart witnesses above are not
-power-loss evidence. Windows deploy stays refused because NTFS has no
-composition proof.
+power-loss evidence. The NTFS composition and process-restart run is recorded in
+[Windows composition run](#windows-composition-run-2026-11-22); it is not
+power-loss evidence either.
 
 The separate `deploy_evidence` test and its `evidence` feature entry points were
 deleted. That build could force the stage open and serve a wire import while the
@@ -157,42 +159,59 @@ pre-image `original` copy, so a broken retain path could pass.
 `TMPDIR=/tmp` (tmpfs) and `TMPDIR=/var/tmp` (Btrfs) `cargo test -p
 marduk-workspace --locked --test native_deployment -- --ignored
 --test-threads=1` → 5 passed on each at `af0fc6d`.
-Windows deploy remains unproven. The barrier no longer refuses (ADR 0004), but
-the composition run stops earlier: the pathname effect cannot add the target
-name while the identity-pinned parent handle denies write sharing. See
-[Windows composition attempt](#windows-composition-attempt-2026-11-22-not-recorded).
+The earlier NTFS composition attempt stopped at a sharing violation; the fixed
+run is recorded below.
 
-### Windows composition attempt (2026-11-22, not recorded)
+### Windows composition run (2026-11-22)
 
-Code at `6056ab3`, Windows 10 `DESKTOP-4NP2KM5`, `rustc 1.100.0`, scratch and
-synthetic installation root under `%TEMP%` on `C:` (`fsutil fsinfo volumeinfo C:`
-reports `NTFS`). The run used `schtasks /ru admin /rp 0000` because an SSH
-session kills the build. To reach the adapter, the run used the `6056ab3` tree
-with the availability entry for this configuration provisionally opened; that
-entry is not committed, because the run did not pass and the record stays
-closed.
+Code at `f71dd402`, Windows 10 `DESKTOP-4NP2KM5`, `rustc 1.100.0`. The
+synthetic scratch and installation root were under `%TEMP%` on `C:`
+(`fsutil fsinfo volumeinfo C:` reports `File System Name : NTFS`). The run used
+`schtasks /ru admin /rp 0000` because an SSH session kills the build; the
+repository was synced with `git archive f71dd402`, `scp` and `tar -xzf` over
+`C:\marduk`.
 
 - `cargo test -p marduk-workspace --locked --test native_deployment -- --ignored
   --nocapture --test-threads=1` → `running 1 test`,
-  `test result: FAILED. 0 passed; 1 failed`, at
-  `qualified_native_round_trip_retains_backups_and_restores_the_original_tree`.
-  The witness reached preview and `prepare` for both intents, then the first
-  publish returned `Conflict` with the target absent and the stage intact.
-- Cause: the Windows effect primitives move by pathname (`MoveFileExW`), and the
-  identity-pinned target-parent handle is opened with `FILE_SHARE_READ`. The
-  kernel's internal open for the destination name needs write access to that
-  directory, so the move fails with `ERROR_SHARING_VIOLATION` and the adapter
-  reports the reobserved conflict. No barrier is reached and no row is recorded.
-- The same attempt showed Windows import is still closed: `Catalog::open` pins
-  the app-data root and the staging tree needs a writable root handle, so
-  `NativeStage::open` fails with a sharing violation while the catalog is alive.
-  A temporary probe confirmed the staging adapter opens the same root after the
-  catalog handle is dropped. No product change was kept for either finding.
+  `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;
+  finished in 0.25s`, `WITNESS_EXIT_0`.
+  `qualified_native_round_trip_retains_backups_and_restores_the_original_tree`
+  drove the production `Catalog`, `OperationJournal` and `NativeEffects`
+  through setup, ZIP import (production catalog with native staging), member
+  order, preview, apply, restart, plan replay and restore.
+- Import reached the private stage while the catalog's app-root handle stayed
+  open. The two opens now coexist because the pinned app root shares read and
+  write (`FILE_SHARE_READ | FILE_SHARE_WRITE`) and denies delete sharing.
+- Apply's first publish created the destination name while the identity-pinned
+  target-parent handle stayed open. The parent pin now shares read and write and
+  denies delete sharing, so the kernel's own destination open succeeds and the
+  move completes.
+- The deny-delete claim still holds with write sharing enabled:
+  `crates/platform/tests/windows_root_regressions.rs` ran 7 passed, 1 ignored
+  (`short_name_alias_is_never_an_absent_or_admitted_leaf`, needs 8.3 scratch) at
+  the same revision, including `pinned_ancestor_shares_write_but_refuses_delete`
+  (a write handle succeeds; renaming the pinned directory returns Win32 32) and
+  `pinned_target_parent_accepts_a_new_destination`.
+- `cargo test -p marduk-storage --locked --test catalog_sharing` → 3 passed at
+  the same revision: `catalog_root_pin_and_native_stage_coexist`,
+  `catalog_and_journal_open_together`, and the existing schema-sharing witness.
 
-This is a `not run` composition row, not a pass. Enabling Windows deploy needs a
-reviewed Windows effect path that does not require write sharing on the pinned
-parent (handle-relative rename, or an explicitly accepted widening); the
-availability record stays closed until that run passes.
+Exact composed effects observed by the witness: imported members are
+`textures/winner.dds = b\n` and `textures/a-only.dds = only-a\n`; after apply the
+public tree holds `winner.dds = b\n`, `a-only.dds = only-a\n`,
+`untouched.txt = keep\n` and `outside-plan.txt = user\n`; the displaced original
+`winner.dds = base\n` is retained at the operation-owned displaced slot; after
+restart the committed generation replays without reapplying; restore returns
+`winner.dds = base\n` and the initial tree byte-for-byte; a second restore is
+`NoActiveDeployment` with the tree unchanged. Windows metadata preservation is
+not asserted by this witness (`set_mode`, `mode_of`, `mtime_of` and `owner_of`
+are Unix-only), so no NTFS metadata row is claimed here; the separate
+`effects_primitives` copy witness remains unrun against this revision.
+
+This is a composition-rung pass, not a client-visible run and not power-cut
+evidence. The availability record now proves NTFS import at the catalog layer
+and NTFS deploy/restore at the composition layer; the narrowed barrier row above
+stays a decision.
 
 ### Scoped metadata witnesses (`af0fc6d`)
 
@@ -268,11 +287,11 @@ Base `8110c38`. `NativeStage` now keeps every archive and payload effect on the 
 - `MARDUK_M1_BTRFS_SCRATCH=/var/tmp cargo test -p marduk-platform --test library_boundary` — 8 witnesses ignored without `--ignored` (none pass silently); with `--ignored --test-threads=1`, 8 passed. (The suite has since grown to 10 witnesses; the qualified re-run records 10 passed.)
 - New witnesses redirect a staged revision after its handle was opened and require `StageChanged`/`StageUnavailable` from `reobserve` and `reclaim` with the redirect target untouched and the original revision retained.
 - `TMPDIR=/tmp cargo test -p marduk-platform`, `TMPDIR=/tmp cargo test -p marduk-storage`, `cargo fmt --all -- --check`, `cargo build --workspace --locked`, `TMPDIR=/tmp cargo test --workspace --locked` — passed.
-- Windows compile check passed; the NTFS staging capability is implemented and witnessed at the adapter layer below, while product availability stays closed. `Catalog::open` connects native staging on qualified Linux volumes only (see above). Apply/Restore status is stated once in the Task 6 section below.
+- Windows compile check passed; the NTFS staging capability is implemented and witnessed at the adapter layer below. The later NTFS composition run opens `Catalog::open` native staging and Native Apply/Restore through the record; see [Windows composition run](#windows-composition-run-2026-11-22).
 
 **Known limitation (accepted by the 2026-11-22 user ruling):** On Linux and Windows, a same-privilege process can substitute the parent or leaf between the final live-handle check and the syscall. The [R02 contract](../contracts/m1-recovery.md#native-seam-that-r03-must-qualify) requires post-effect reobservation to detect divergence, retention of actually displaced bytes, and refusal to retry automatically on divergence. It does not claim prevention. A syscall error is not evidence of no change.
 
-The ruling changes the qualification criterion; it supplies no runtime evidence. Native staging is now wired only on Linux Btrfs and Linux tmpfs, and remains unqualified and unwired on ext4 and native NTFS. Game-directory publication through the native adapter is connected on those two Linux volume classes, and client Apply and Restore are served there because the record proves the composition. Power-cut behaviour remains unqualified.
+The ruling changes the qualification criterion; it supplies no runtime evidence. Native staging is now wired on Linux Btrfs, Linux tmpfs and Windows NTFS through the record. Game-directory publication through the native adapter is connected on those volume classes, and client Apply and Restore are served there because the record proves the composition. Power-cut behaviour remains unqualified.
 
 ## Native copy adapter (Task 6, 2026-11-22)
 
@@ -295,9 +314,9 @@ the record proves the composition, and no real game directory was written.
 All rows below re-ran on 2026-11-22 at `101b4f7` on both qualified Linux volume
 classes.
 
-| Witness | Linux Btrfs | Linux tmpfs | Linux ext4 | Hosted `windows-2025` NTFS |
+| Witness | Linux Btrfs | Linux tmpfs | Linux ext4 | Windows NTFS |
 |---|---|---|---|---|
-| `qualified_native_round_trip_retains_backups_and_restores_the_original_tree` (workspace: setup → import → order → preview → apply → restart → replay → restore) | ran 2026-11-22 at `af0fc6d`, passed | ran 2026-11-22 at `af0fc6d`, passed | not run | not run |
+| `qualified_native_round_trip_retains_backups_and_restores_the_original_tree` (workspace: setup → import → order → preview → apply → restart → replay → restore) | ran 2026-11-22 at `af0fc6d`, passed | ran 2026-11-22 at `af0fc6d`, passed | not run | ran 2026-11-22 at `f71dd402`, passed |
 | `visible_xattr_on_an_original_is_refused_before_any_write` (workspace preview) | ran 2026-11-22 at `af0fc6d`, passed (`user.*`); `trusted.*` not run | ran 2026-11-22 at `af0fc6d`, passed (`user.*`); `trusted.*` not run | not run | not run |
 | `restart_after_apply_before_ack_rolls_back_and_never_reapplies` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
 | `restart_after_record_undo_uses_the_sealed_stage_fingerprint` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
@@ -379,13 +398,14 @@ substitution limitation in
 the adapter detects divergence after an effect and retains displaced bytes; it
 does not claim prevention.
 
-## Windows native effects (primitive runtime only; deploy-level not run)
+## Windows native effects (primitive and composition runtime)
 
 The Windows arms of `crates/platform/src/effects.rs` implement the same
 contract as the Linux arms. The six `effects_primitives` witnesses pass on the
-hosted `windows-2025` job at `eb39be0` on real NTFS. That is primitive-level
-evidence: no deploy-level NTFS row, end-to-end adapter run or power-cut evidence
-exists yet; `not run` is never a pass, and qualification stays closed.
+hosted `windows-2025` job at `eb39be0` on real NTFS. The later NTFS
+whole-composition run at `f71dd402` exercises publish, replace, detach and
+restore through the production adapter. Power-cut evidence still does not exist;
+`not run` is never a pass.
 
 | Primitive | Contract implemented | Linux runtime | Hosted `windows-2025` NTFS runtime | Power |
 |---|---|---|---|---|
@@ -394,7 +414,11 @@ exists yet; `not run` is never a pass, and qualification stays closed.
 | `effects::replace` | exchange by two no-replace renames in production (target → `<operation>/displaced`, stage → target); a caller that retains at a different path adds a third rename from that slot; a cut after the first rename leaves the canonical `displaced` slot plus the staged object and resumes from that shape, which `evidence_for`, `prepare` and `sync_effect` inspect; the staged object's file id, creation time, attributes and DACL are preserved, so the public target fingerprints as the sealed staged artifact; a failure returns an error, never `Ok` | `effects_primitives::replace_retains_the_displaced_file_and_keeps_the_staged_object` and `interrupted_replace_keeps_the_canonical_displaced_slot_and_resumes` passed 2026-11-22 | ran 2026-11-22 at `eb39be0`, passed | — |
 | `effects::detach` | one no-replace rename into the retain slot; an occupied slot fails, unknown bytes are never replaced | `effects_primitives::detach_preserves_an_unknown_file` passed 2026-11-22 | ran 2026-11-22 at `eb39be0`, passed | — |
 | `effects::sync_directory` | `FlushFileBuffers` on a directory handle opened with `FILE_FLAG_BACKUP_SEMANTICS`; not a namespace or power-cut barrier | `effects_primitives::sync_directory_succeeds_on_a_real_directory` passed 2026-11-22 | ran 2026-11-22 at `eb39be0`, passed | not claimed |
-| `effects::volume_qualified` | `false` on Windows until deploy-level evidence exists. The NTFS probe (from `GetVolumeInformationByHandleW` on the opened root) is kept for the private staging lane; NTFS alone is not qualification | `effects_primitives::volume_qualification_reads_the_opened_root` passed 2026-11-22 (refusal branch) | not run | — |
+| `effects::volume_qualified` | a record query: NTFS is true for the adapter and deploy routes where the composition proof exists; the NTFS probe (from `GetVolumeInformationByHandleW` on the opened root) supplies the class, not the decision | `effects_primitives::volume_qualification_reads_the_opened_root` passed 2026-11-22 (refusal branch) | not run | — |
+
+The NTFS adapter and deploy answer comes from the whole-composition row at
+`f71dd402` (see [Windows composition run](#windows-composition-run-2026-11-22)),
+not from the primitive `volume_qualified` witness above.
 
 Design note: `ReplaceFileW` is deliberately not used. It merges the replaced
 file's creation time and DACL into the replacement, so the resulting public file
@@ -409,11 +433,12 @@ derived beside the stage, so the adapter's leftover guard, evidence scan and
 directory sync all see the displaced bytes after a cut.
 
 The six file-level primitives passed hosted `windows-2025` at `eb39be0` on real
-NTFS (the run that exposed and then verified the tunneling fix). That is
-primitive-level evidence only: deploy-level NTFS rows remain `not run`, the
-namespace barrier is narrowed by ADR 0004 rather than proven, and
-`effects_volume_qualified` therefore returns `false` on Windows. Native Apply
-stays refused on Windows by `native_effects_gate`, which reads the record.
+NTFS (the run that exposed and then verified the tunneling fix). The NTFS
+whole-composition run at `f71dd402` adds the adapter and deploy rows. The
+namespace barrier remains narrowed by ADR 0004 rather than proven, so the record
+opens Apply/Restore without claiming power-cut recovery. `effects_volume_qualified`
+returns true on NTFS through the composition proof and stays false for every
+other Windows volume class.
 
 Commands run for this row set:
 
@@ -431,7 +456,8 @@ durability required by [M1 recovery](../contracts/m1-recovery.md). [ADR
 flushing without a power-cut guarantee. `Narrowed` in
 `crates/core/src/qualification.rs` records that decision separately from
 `PROOFS`; the guard rejects a runtime pass or route availability from a narrowed
-cell, and it still requires a composition proof before Windows deploy can open.
+cell. The separate composition proof at `f71dd402` is what opens Windows deploy
+and restore; it does not turn the narrowed barrier row into a pass.
 
 **What the code does.** `effects::sync_directory` opens a directory for write
 with `FILE_FLAG_BACKUP_SEMANTICS` and calls `File::sync_all` (on Windows,
@@ -440,9 +466,9 @@ with `FILE_FLAG_BACKUP_SEMANTICS` and calls `File::sync_all` (on Windows,
 was removed: `effects::sync_file` now opens each staged or target file writable
 and flushes it, `effects::sync_bound_directory` flushes the changed parent, and
 `NativeEffects::durability_barrier` returns `Durable` only when the reobserved
-evidence is unchanged. That run did not reach the barrier because the pathname
-move conflicts with the pinned parent handle (above), so the change is compiled
-and reviewed but not runtime-witnessed on Windows.
+evidence is unchanged. The NTFS composition run at `f71dd402` reached and
+completed that sequence for apply and restore; the change remains a narrowed
+standard flush, not power-cut evidence.
 Context7's `windows-sys` lookup was checked against the locked
 `windows-sys-0.61.2/src/Windows/Win32/Storage/FileSystem/mod.rs` bindings;
 [Rust's Windows file implementation](https://github.com/rust-lang/rust/blob/master/library/std/src/sys/fs/windows.rs)

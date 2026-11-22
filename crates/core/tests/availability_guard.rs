@@ -514,16 +514,15 @@ fn a_composition_proof_opens_deploy_without_opening_an_unproven_configuration() 
             );
         }
     }
-    // Windows deploy can only be opened by a composition run, never by the
-    // narrowed barrier row (ADR 0004): no NTFS composition proof exists yet, so
-    // the route stays refused.
-    assert!(!available(
+    // Windows deploy is opened by the NTFS composition run, not by the
+    // narrowed barrier row (ADR 0004).
+    assert!(available(
         Capability::NativeEffects,
         Route::Deploy,
         Os::Windows,
         VolumeClass::Ntfs
     ));
-    assert!(!available(
+    assert!(available(
         Capability::NativeEffects,
         Route::Restore,
         Os::Windows,

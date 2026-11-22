@@ -72,7 +72,7 @@ fn intermediate_directory_rename_is_pinned_or_observation_refuses() {
 }
 
 #[test]
-fn pinned_ancestor_refuses_a_write_handle() {
+fn pinned_ancestor_shares_write_but_refuses_delete() {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
 
@@ -88,10 +88,34 @@ fn pinned_ancestor_refuses_a_write_handle() {
     };
     drop(open_writer().expect("fixture permits a directory write handle"));
     let binding = bind_installation(&install, &LAYOUT).unwrap();
-    let error = open_writer().expect_err("a pinned ancestor must deny write sharing");
+    drop(open_writer().expect("a pinned ancestor shares write"));
+    let error = fs::rename(&ancestor, tmp.path().join("moved"))
+        .expect_err("a pinned ancestor must refuse delete sharing");
     assert_eq!(error.raw_os_error(), Some(32));
     drop(binding);
-    drop(open_writer().expect("write handle permitted once pins are dropped"));
+    fs::rename(&ancestor, tmp.path().join("moved"))
+        .expect("rename must work once the pins are dropped");
+}
+
+#[test]
+fn pinned_target_parent_accepts_a_new_destination() {
+    let tmp = tempfile::tempdir().unwrap();
+    layout(tmp.path());
+    fs::create_dir_all(tmp.path().join("Data/Textures/Sub")).unwrap();
+    let binding = bind_installation(tmp.path(), &LAYOUT).unwrap();
+    let target = resolve_existing_parent(
+        &binding,
+        &RelativePath::parse("Textures/Sub/new.dds").unwrap(),
+    )
+    .unwrap();
+    // The kernel opens the pinned parent for write to create the destination;
+    // read-only sharing on that handle was the whole-composition blocker.
+    fs::write(tmp.path().join("Data/Textures/Sub/new.dds"), b"created").unwrap();
+    assert_eq!(
+        fs::read(tmp.path().join("Data/Textures/Sub/new.dds")).unwrap(),
+        b"created"
+    );
+    drop(target);
 }
 
 fn short_path(path: &Path) -> std::path::PathBuf {

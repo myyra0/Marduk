@@ -173,8 +173,15 @@ fn open_error(code: WIN32_ERROR) -> GateError {
 //
 // Each child is opened no-follow with a GUID path derived from its pinned
 // parent and verified against that parent's native enumeration. Directory
-// handles deny write and delete sharing from the volume root through the
-// resolved parent. Observation is not write authority.
+// handles share read and write but deny delete sharing from the volume root
+// through the resolved parent, so the bound name cannot be renamed or replaced
+// while writes inside it remain possible. Observation is not write authority.
+//
+// A shared write, not exclusive access, is what the product needs: the pinned
+// app root must coexist with the native stage that creates inside it, and a
+// pinned target parent must accept the kernel's own open for a move
+// destination. Delete sharing stays denied; that is the name-binding
+// mechanism.
 // ---------------------------------------------------------------------------
 mod root {
     use super::ERROR_ALREADY_EXISTS;
@@ -241,6 +248,10 @@ mod root {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     const NO_FOLLOW: u32 = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT;
+    /// Pinned directories share write so the process can create and replace
+    /// entries inside them, but never delete sharing: while the pin lives the
+    /// bound name cannot be renamed or replaced.
+    const PIN_SHARE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
     const DIRECTORY_ACCESS: u32 = FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES;
     const METADATA_ACCESS: u32 = FILE_READ_ATTRIBUTES | FILE_READ_EA | READ_CONTROL;
     const ORDINARY_ATTRIBUTES: u32 = FILE_ATTRIBUTE_ARCHIVE
@@ -505,7 +516,7 @@ mod root {
     }
 
     fn open_selection(path: &Path, create: bool) -> Result<Vec<RootDir>, RootError> {
-        open_selection_shared(path, create, FILE_SHARE_READ, FILE_SHARE_READ)
+        open_selection_shared(path, create, PIN_SHARE, PIN_SHARE)
     }
 
     fn open_selection_shared(
@@ -641,16 +652,26 @@ mod root {
         entry: &DirectoryEntry,
         access: u32,
     ) -> Result<File, RootError> {
+        open_entry_shared(parent, entry, access, FILE_SHARE_READ)
+    }
+
+    fn open_entry_shared(
+        parent: &RootDir,
+        entry: &DirectoryEntry,
+        access: u32,
+        share: u32,
+    ) -> Result<File, RootError> {
         check_locator(parent)?;
-        let file = open_path(&join(&parent.final_path, &entry.name), access).map_err(|code| {
-            if matches!(code, ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) {
-                RootError::TargetUnavailable
-            } else if is_sharing(code) {
-                RootError::UnsupportedTarget(UnsupportedReason::Sharing)
-            } else {
-                RootError::Io
-            }
-        })?;
+        let file = open_path_shared(&join(&parent.final_path, &entry.name), access, share)
+            .map_err(|code| {
+                if matches!(code, ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) {
+                    RootError::TargetUnavailable
+                } else if is_sharing(code) {
+                    RootError::UnsupportedTarget(UnsupportedReason::Sharing)
+                } else {
+                    RootError::Io
+                }
+            })?;
         if identity(&file)? != entry_identity(parent.volume, entry) {
             return Err(RootError::TargetUnavailable);
         }
@@ -666,7 +687,7 @@ mod root {
         if entry.attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
             return Err(RootError::UnsupportedTarget(UnsupportedReason::ObjectKind));
         }
-        let file = open_entry(parent, &entry, DIRECTORY_ACCESS)?;
+        let file = open_entry_shared(parent, &entry, DIRECTORY_ACCESS, PIN_SHARE)?;
         let child = verify_root(file)?;
         if child.final_path != join(&parent.final_path, &entry.name)
             || child.volume != parent.volume
@@ -1634,7 +1655,11 @@ mod root {
 
     pub(crate) fn directory_identity(path: &Path) -> Result<RootIdentity, RootError> {
         let text = path.to_str().ok_or(RootError::TargetUnavailable)?;
-        let file = open_path(text, DIRECTORY_ACCESS).map_err(|_| RootError::TargetUnavailable)?;
+        // This proof may run beside a writable pin on the same directory (the
+        // native stage or a target parent), so it must also share write while
+        // still denying delete.
+        let file = open_path_shared(text, DIRECTORY_ACCESS, PIN_SHARE)
+            .map_err(|_| RootError::TargetUnavailable)?;
         Ok(verify_root(file)?.identity)
     }
 
@@ -2699,9 +2724,9 @@ pub(crate) use root::{
     verify_private_directory, volume_class,
 };
 
-/// Product library import is closed on Windows: the record proves the staging
-/// adapter on NTFS, not the catalog layer. The class comes from the opened root;
-/// `marduk_core::qualification` decides.
+/// Product library import on Windows is answered by the record: it needs the
+/// catalog layer, not only the staging adapter. The class comes from the
+/// opened root; `marduk_core::qualification` decides.
 pub(crate) fn library_volume_qualified(root: &Path) -> bool {
     available(
         Capability::LibraryStaging,
@@ -2711,8 +2736,8 @@ pub(crate) fn library_volume_qualified(root: &Path) -> bool {
     )
 }
 
-/// The composed native effect adapter is closed on Windows: the record proves
-/// the effect primitives on NTFS, not the adapter or deploy layer.
+/// The composed native effect adapter on Windows is answered by the record. It
+/// needs the adapter layer, which the NTFS composition proof satisfies.
 pub(crate) fn effects_volume_qualified(root: &Path) -> bool {
     available(
         Capability::NativeEffects,
@@ -2722,8 +2747,8 @@ pub(crate) fn effects_volume_qualified(root: &Path) -> bool {
     )
 }
 
-/// Client deploy and restore stay closed on Windows: the record proves the
-/// effect primitives on NTFS, not the composition that the client route needs.
+/// Client deploy and restore on Windows require the composition proof, which
+/// the NTFS whole-composition run records.
 pub(crate) fn deploy_volume_qualified(root: &Path) -> bool {
     available(
         Capability::NativeEffects,

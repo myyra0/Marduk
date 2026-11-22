@@ -49,3 +49,26 @@ fn catalog_and_journal_share_one_v2_schema() {
         .unwrap();
     assert_eq!(version, 2);
 }
+
+#[cfg(windows)]
+#[test]
+fn catalog_root_pin_and_native_stage_coexist() {
+    let dir: TempDir = tempfile::tempdir().unwrap();
+    let catalog = Catalog::open(dir.path()).unwrap();
+    // The catalog's pinned app root shares write, so the stage can bind the
+    // same directory while the catalog stays open.
+    let stage = marduk_platform::library_stage::NativeStage::open(dir.path())
+        .expect("native stage must open beside the catalog root pin");
+    drop(stage);
+    drop(catalog);
+}
+
+#[cfg(windows)]
+#[test]
+fn catalog_and_journal_open_together() {
+    let dir: TempDir = tempfile::tempdir().unwrap();
+    let catalog = Catalog::open(dir.path()).unwrap();
+    let journal = OperationJournal::open(dir.path()).unwrap();
+    drop(journal);
+    drop(catalog);
+}
