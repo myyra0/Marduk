@@ -478,10 +478,12 @@ and restore; it does not turn the narrowed barrier row into a pass.
 with `FILE_FLAG_BACKUP_SEMANTICS` and calls `File::sync_all` (on Windows,
 `FlushFileBuffers`). Publish, replace and detach use same-volume, no-replace
 `MoveFileExW` with flags `0`. At `6056ab3` the barrier's blanket Windows refusal
-was removed: `effects::sync_file` now opens each staged or target file writable
-and flushes it, `effects::sync_bound_directory` flushes the changed parent, and
+was removed. `effects::sync_bound_directory` flushes the changed parent, and
 `NativeEffects::durability_barrier` returns `Durable` only when the reobserved
-evidence is unchanged. The NTFS composition run at `62b9b94b` reached and
+evidence is unchanged. There is no post-effect file flush: retained bytes were
+stable before the effect and must not be reopened for write, while copies this
+process created are flushed by `copy_file`. The NTFS composition run at
+`62b9b94b` reached and
 completed that sequence for apply and restore; the change remains a narrowed
 standard flush, not power-cut evidence.
 Context7's `windows-sys` lookup was checked against the locked

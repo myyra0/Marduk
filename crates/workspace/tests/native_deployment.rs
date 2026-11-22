@@ -61,6 +61,16 @@ fn set_mtime(path: &Path, time: SystemTime) {
         .unwrap();
 }
 
+fn set_read_only(path: &Path) {
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+fn is_read_only(path: &Path) -> bool {
+    fs::metadata(path).unwrap().permissions().readonly()
+}
+
 #[cfg(unix)]
 fn mode_of(path: &Path) -> u32 {
     fs::metadata(path).unwrap().permissions().mode() & 0o7777
@@ -999,4 +1009,55 @@ fn mixed_case_archive_target_merges_with_the_existing_spelling() {
     };
     assert_eq!(operation.phase, "completed");
     assert_eq!(tree(&fixture.game), fixture.initial);
+}
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn read_only_original_deploys_and_restores() {
+    let mut fixture = Fixture::new();
+    fixture.setup();
+    let winner = fixture.game.join("Data/textures/winner.dds");
+    set_read_only(&winner);
+    assert!(is_read_only(&winner));
+
+    let (revision, _) = fixture.import_and_order();
+    let preview = fixture
+        .workspace
+        .proof_preview_deployment(ProfileRevision::new(revision))
+        .unwrap();
+    assert_eq!(preview.files.len(), 2);
+    let plan = PlanId::try_from_u64(preview.id.as_ref().unwrap().parse().unwrap()).unwrap();
+    let operation = fixture.workspace.proof_apply_deployment(plan).unwrap();
+    assert_eq!(operation.phase, "completed");
+    assert!(
+        operation.blocker.is_none(),
+        "apply blocker: {:?}",
+        operation.blocker
+    );
+    assert_eq!(tree(&fixture.game)["Data/textures/winner.dds"], POST);
+
+    let restore = fixture.workspace.proof_restore().unwrap();
+    let RestoreResult::Operation { operation } = restore else {
+        panic!("expected a tracked restore, got {restore:?}");
+    };
+    assert_eq!(operation.phase, "completed");
+    assert!(
+        operation.blocker.is_none(),
+        "restore blocker: {:?}",
+        operation.blocker
+    );
+    assert_eq!(fs::read(&winner).unwrap(), BASE);
+    assert!(
+        is_read_only(&winner),
+        "restore keeps the read-only original"
+    );
+    assert_eq!(tree(&fixture.game), fixture.initial);
+
+    #[cfg(windows)]
+    {
+        // Let the temporary directory remove the restored original.
+        let mut permissions = fs::metadata(&winner).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&winner, permissions).unwrap();
+    }
 }

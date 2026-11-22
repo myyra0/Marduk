@@ -175,29 +175,6 @@ pub fn sync_directory(path: &std::path::Path) -> Result<(), RootError> {
     directory.sync_all().map_err(|_| RootError::Io)
 }
 
-/// Flush an existing regular file to stable storage without following a final
-/// link. The file is opened writable because `FlushFileBuffers` requires write
-/// access; a file this process may read but not flush is an error, never a
-/// silent success.
-#[cfg(target_os = "linux")]
-pub fn sync_file(path: &std::path::Path) -> Result<(), RootError> {
-    let file = crate::native::open_file(path)?;
-    file.sync_all().map_err(|_| RootError::Io)
-}
-
-#[cfg(windows)]
-pub fn sync_file(path: &std::path::Path) -> Result<(), RootError> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-        .map_err(|_| RootError::TargetUnavailable)?;
-    file.sync_all().map_err(|_| RootError::Io)
-}
-
 /// Flush the directory that a public effect changed.
 ///
 /// Linux fsyncs the pinned parent handle. Windows cannot flush the read-only

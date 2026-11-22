@@ -767,16 +767,11 @@ impl NativeEffects {
 
     fn sync_effect(&mut self, step: &PreparedStep) -> Result<(), RootError> {
         let directory = self.op_dir(step.op.get(), step.ordinal, step.direction);
-        let target_tree_path = self.resolved(&step.spec.target)?.public_path();
-        for name in ["stage", "displaced", "original", "step"] {
-            let path = directory.join(name);
-            if fs::symlink_metadata(&path).is_ok() {
-                effects::sync_file(&path)?;
-            }
-        }
-        if let Observation::Regular(_) = self.observe_bound(&step.spec.target) {
-            effects::sync_file(&target_tree_path)?;
-        }
+        // No post-effect file flush. Retained bytes (the displaced original)
+        // were stable before this effect and were never opened for write, so a
+        // read-only original is satisfiable. Every copy this process wrote was
+        // flushed by `copy_file`; the namespace change is covered by the
+        // directory barriers below.
         self.sync_directory_chain(&directory)?;
         // The changed target parent is part of the barrier. A failed
         // re-resolution or open must not leave the effect reported durable.
