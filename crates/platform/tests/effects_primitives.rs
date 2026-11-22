@@ -123,6 +123,9 @@ fn replace_retains_the_displaced_file_and_keeps_the_staged_object() {
     .unwrap();
 
     assert_eq!(fs::read(&target_path).unwrap(), STAGED);
+    // NTFS tunneling gives a rename into a just-vacated name the removed
+    // entry's creation time; `replace` restores the staged birth time after
+    // its renames, so identity must still match field for field.
     assert_eq!(
         fingerprint_path(&target_path).unwrap(),
         staged,

@@ -29,9 +29,12 @@
 //!   name. The target briefly has no name between those two moves, so this is
 //!   not an atomic exchange. `ReplaceFileW` is deliberately not used: it merges
 //!   the replaced file's creation time and DACL into the replacement, so the
-//!   public target would no longer carry the sealed staged fingerprint. Every
-//!   failed step returns an error and the caller must re-observe; a failed
-//!   exchange is never reported as a no-op.
+//!   public target would no longer carry the sealed staged fingerprint. NTFS
+//!   tunneling would also give each object the creation time of the name it
+//!   lands on, so both birth times are captured before the moves and restored,
+//!   then re-read, before success is reported. Every failed step returns an
+//!   error and the caller must re-observe; a failed exchange is never reported
+//!   as a no-op.
 //! - `detach` is one no-replace rename into the retain slot. Unknown bytes in
 //!   the slot make the call fail rather than be replaced.
 //! - `sync_directory` flushes a directory handle opened with
@@ -188,6 +191,12 @@ pub fn replace(
         } else {
             retain_path.to_path_buf()
         };
+        // NTFS tunneling re-applies the creation time of a name removed within
+        // the last ~15 s to the next object added under it, including a rename.
+        // Both renames below land on a name this exchange just vacated, so the
+        // births are captured first and restored afterwards.
+        let staged_creation = creation_time(stage_path)?;
+        let displaced_creation = creation_time(target_path)?;
         // 1. Retain the expected target under a name that must be absent.
         move_path_noreplace(target_path, &displaced).map_err(|_| RootError::Io)?;
         // 2. Publish the staged object with its identity and metadata intact.
@@ -196,6 +205,8 @@ pub fn replace(
         if displaced.as_path() != retain_path {
             move_path_noreplace(&displaced, retain_path).map_err(|_| RootError::Io)?;
         }
+        restore_creation_time(target_path, staged_creation)?;
+        restore_creation_time(retain_path, displaced_creation)?;
         Ok(())
     }
 }
@@ -463,6 +474,80 @@ fn wide(path: &std::path::Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
 
     path.as_os_str().encode_wide().chain([0]).collect()
+}
+
+/// Creation time of an existing object in FILETIME 100 ns units.
+#[cfg(windows)]
+fn creation_time(path: &std::path::Path) -> Result<i64, RootError> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
+    };
+
+    let file = open_file(path)?;
+    let mut basic = FILE_BASIC_INFO::default();
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            (&mut basic as *mut FILE_BASIC_INFO).cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(RootError::Io);
+    }
+    Ok(basic.CreationTime)
+}
+
+/// Rewrite an object's creation time and prove the write took effect.
+#[cfg(windows)]
+fn restore_creation_time(path: &std::path::Path, expected: i64) -> Result<(), RootError> {
+    use std::mem::size_of;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_BASIC_INFO, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES,
+        FileBasicInfo, GetFileInformationByHandleEx, SetFileTime,
+    };
+
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|_| RootError::Io)?;
+    // Null access/write pointers leave those times unchanged.
+    let creation = FILETIME {
+        dwLowDateTime: expected as u32,
+        dwHighDateTime: (expected >> 32) as u32,
+    };
+    if unsafe {
+        SetFileTime(
+            file.as_raw_handle(),
+            &creation,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    } == 0
+    {
+        return Err(RootError::Io);
+    }
+    let mut observed = FILE_BASIC_INFO::default();
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            (&mut observed as *mut FILE_BASIC_INFO).cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+        || observed.CreationTime != expected
+    {
+        return Err(RootError::Io);
+    }
+    Ok(())
 }
 
 /// Move a single name without replacing an existing destination. No
