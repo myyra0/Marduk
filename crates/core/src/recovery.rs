@@ -337,6 +337,19 @@ pub trait Journal {
         Ok(())
     }
 
+    /// Keep a readable inspection of one private slot that shows no unexpected
+    /// artifact. A durable journal uses it to supersede earlier unreadable
+    /// evidence for the same exact slot; fakes keep no slot history.
+    fn record_readable_slot(
+        &mut self,
+        _op: OperationId,
+        _step: &PreparedStep,
+        _at: BackupRef,
+        _evidence: &Evidence,
+    ) -> Result<(), DeployError> {
+        Ok(())
+    }
+
     /// An unexpected displacement requires operator review, not auto-retry.
     fn has_unresolved_displacement(&mut self, _op: OperationId) -> Result<bool, DeployError> {
         Ok(false)
@@ -502,6 +515,9 @@ pub(crate) fn preserve_canonical_displacement<J: Journal>(
         journal.block_displacement(step.op, step, step.retain, evidence)?;
         return Ok(true);
     }
+    // A readable slot that shows the expected state supersedes any earlier
+    // unreadable observation for the same exact slot.
+    journal.record_readable_slot(step.op, step, step.retain, evidence)?;
     Ok(false)
 }
 

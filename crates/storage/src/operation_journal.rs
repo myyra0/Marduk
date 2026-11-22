@@ -757,7 +757,14 @@ impl Journal for OperationJournal {
             return Err(DeployError::Io);
         }
         let op_value = sql_id(op.get())?;
-        write_displacement(&transaction, op_value, step, at, evidence)?;
+        write_displacement(
+            &transaction,
+            op_value,
+            step,
+            at,
+            evidence,
+            SlotState::Displaced,
+        )?;
         transaction
             .execute(
                 "UPDATE operations SET blocker = 'recovery_conflict' WHERE id = ?1",
@@ -791,7 +798,48 @@ impl Journal for OperationJournal {
         if !sealed {
             return Err(DeployError::Io);
         }
-        write_displacement(&transaction, sql_id(op.get())?, step, at, evidence)?;
+        write_displacement(
+            &transaction,
+            sql_id(op.get())?,
+            step,
+            at,
+            evidence,
+            SlotState::Unknown,
+        )?;
+        transaction.commit().map_err(|_| DeployError::Io)
+    }
+
+    fn record_readable_slot(
+        &mut self,
+        op: OperationId,
+        step: &PreparedStep,
+        at: BackupRef,
+        evidence: &Evidence,
+    ) -> Result<(), DeployError> {
+        // Normal recovery inspects many clean slots; only a slot that already
+        // has history can be superseded, so avoid a write transaction for the
+        // common case.
+        if !has_slot_history(&self.connection, op, step, at)? {
+            return Ok(());
+        }
+        let _guard = self.lock()?;
+        let transaction = self.immediate()?;
+        let operation = load_operation(&transaction, op)?.ok_or(DeployError::UnknownOperation)?;
+        if !pending_is(&transaction, &operation.data, op)? || operation.phase.is_terminal() {
+            return Err(DeployError::UnknownOperation);
+        }
+        let row = read_steps(&transaction, op)?
+            .into_iter()
+            .find(|row| row.prepared.ordinal == step.ordinal)
+            .ok_or(DeployError::Io)?;
+        let sealed = match step.direction {
+            StepDirection::Forward => step == &row.prepared,
+            StepDirection::Undo => row.undo.as_ref() == Some(step),
+        };
+        if !sealed {
+            return Err(DeployError::Io);
+        }
+        write_readable_slot(&transaction, sql_id(op.get())?, step, at, evidence)?;
         transaction.commit().map_err(|_| DeployError::Io)
     }
 
@@ -1177,41 +1225,48 @@ fn read_status(
         return Ok(None);
     };
     let steps = read_steps(connection, op)?;
-    let displaced = displacement_refs(connection, op)?;
+    let latest = latest_observations(connection, op)?;
+    // Any slot with history is decided by its latest observation, never by an
+    // earlier step or apply-time observation for the same slot.
+    let recorded: BTreeSet<BackupRef> = latest.iter().map(|slot| slot.at).collect();
     let mut retained = BTreeSet::new();
     for row in &steps {
         retained.extend(row.prepared.spec.original.backup);
         retained.extend(row.prepared.step_pre.backup);
+        if let Some(undo) = &row.undo {
+            retained.extend(undo.step_pre.backup);
+        }
         let confirmed = row
             .evidence
             .as_ref()
             .is_some_and(|evidence| observed_retention(&evidence.retained));
         if let Some(undo) = &row.undo {
             retained.extend(undo.step_pre.backup);
-            // The canonical retain is known only when evidence observed it and
-            // no later recovery observation reported the same slot. A slot
-            // first seen at `Applied` is historical evidence, not a current
-            // retention claim.
-            if confirmed && !displaced.contains(&row.prepared.retain) {
+            if confirmed && !recorded.contains(&row.prepared.retain) {
                 retained.insert(row.prepared.retain);
             }
         }
-        if confirmed && !displaced.contains(&row.prepared.retain) {
-            let settled = if row.phase == StepPhase::Undone {
-                row.undo.as_ref().unwrap_or(&row.prepared)
-            } else {
-                &row.prepared
-            };
+        // The canonical retain is known only when the step's own evidence
+        // observed it and no later slot history exists. History is applied
+        // below from its latest observation only.
+        let settled = if row.phase == StepPhase::Undone {
+            row.undo.as_ref().unwrap_or(&row.prepared)
+        } else {
+            &row.prepared
+        };
+        if confirmed && !recorded.contains(&row.prepared.retain) {
             retained.insert(settled.retain);
         }
     }
-    let displacement = read_displacement(connection, op)?;
+    // Only a latest observation that positively read an artifact is
+    // advertised; an unreadable slot is not known.
     retained.extend(
-        owned_displacements(connection, op, &steps)?
-            .into_iter()
-            .filter(|(_, evidence)| observed_retention(&evidence.retained))
-            .map(|(at, _)| at),
+        latest
+            .iter()
+            .filter(|slot| unresolved(slot) && observed_retention(&slot.evidence.retained))
+            .map(|slot| slot.at),
     );
+    let unresolved = latest.iter().any(unresolved);
     let generation = match (row.kind, row.phase) {
         (OperationKind::Deploy, Phase::Completed) => row.result_generation,
         (OperationKind::Restore, Phase::Completed) => None,
@@ -1226,7 +1281,7 @@ fn read_status(
             .transpose()?
             .map(GenerationId::try_from_u64)
             .transpose()?,
-        blocker: if displacement.is_some() {
+        blocker: if unresolved {
             Some(DeployError::RecoveryConflict)
         } else {
             row.blocker.as_deref().map(parse_error).transpose()?
@@ -1598,21 +1653,94 @@ fn write_displacement(
     step: &PreparedStep,
     at: BackupRef,
     evidence: &Evidence,
+    state: SlotState,
 ) -> Result<(), DeployError> {
-    transaction.execute(
-        "INSERT INTO displacement_evidence (operation_id, ordinal, direction, reported_ref, evidence)
-         VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT (operation_id, ordinal, direction, reported_ref)
-         DO UPDATE SET evidence = excluded.evidence",
-        params![
-            op,
-            i64::from(step.ordinal),
-            direction_tag(step.direction),
-            encode_backup(at),
-            encode_evidence(evidence)
-        ],
-    ).map_err(|_| DeployError::Io)?;
+    transaction
+        .execute(
+            "INSERT INTO displacement_observations
+             (operation_id, ordinal, direction, reported_ref, evidence, slot_state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                op,
+                i64::from(step.ordinal),
+                direction_tag(step.direction),
+                encode_backup(at),
+                encode_evidence(evidence),
+                state as i64
+            ],
+        )
+        .map_err(|_| DeployError::Io)?;
     Ok(())
+}
+
+/// Keep a readable, expected inspection of a slot only when that slot already
+/// has history. A slot that was never reported needs no row, and the absence of
+/// history keeps normal recovery writes unchanged.
+fn write_readable_slot(
+    transaction: &Transaction<'_>,
+    op: i64,
+    step: &PreparedStep,
+    at: BackupRef,
+    evidence: &Evidence,
+) -> Result<(), DeployError> {
+    transaction
+        .execute(
+            "INSERT INTO displacement_observations
+             (operation_id, ordinal, direction, reported_ref, evidence, slot_state)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6
+         WHERE EXISTS (
+             SELECT 1 FROM displacement_observations
+             WHERE operation_id = ?1 AND ordinal = ?2 AND direction = ?3
+               AND reported_ref = ?4
+         )",
+            params![
+                op,
+                i64::from(step.ordinal),
+                direction_tag(step.direction),
+                encode_backup(at),
+                encode_evidence(evidence),
+                SlotState::Readable as i64
+            ],
+        )
+        .map_err(|_| DeployError::Io)?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotState {
+    /// Inspected and readable with no unexpected artifact.
+    Readable = 0,
+    /// A displacement report that requires operator review.
+    Displaced = 1,
+    /// The slot could not be read; it is not a known retention.
+    Unknown = 2,
+}
+
+/// Whether a slot already has durable history, so a clean inspection must be
+/// appended to supersede it.
+fn has_slot_history(
+    connection: &Connection,
+    op: OperationId,
+    step: &PreparedStep,
+    at: BackupRef,
+) -> Result<bool, DeployError> {
+    connection
+        .query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM displacement_observations
+                 WHERE operation_id = ?1 AND ordinal = ?2 AND direction = ?3
+                   AND reported_ref = ?4
+             )",
+            params![
+                sql_id(op.get())?,
+                i64::from(step.ordinal),
+                direction_tag(step.direction),
+                encode_backup(at)
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|exists| exists != 0)
+        .map_err(|_| DeployError::Io)
 }
 
 /// An artifact the journal actually observed, as opposed to an unreadable slot.
@@ -1620,55 +1748,31 @@ fn observed_retention(artifact: &Artifact) -> bool {
     matches!(artifact, Artifact::Regular(_) | Artifact::Unsupported(_))
 }
 
-/// Every slot recovery has recorded evidence for, readable or not. A slot in
-/// this set can no longer be advertised from an earlier step observation alone.
-fn displacement_refs(
-    connection: &Connection,
-    op: OperationId,
-) -> Result<BTreeSet<BackupRef>, DeployError> {
-    let mut query = connection
-        .prepare("SELECT reported_ref FROM displacement_evidence WHERE operation_id = ?1")
-        .map_err(|_| DeployError::Io)?;
-    let rows = query
-        .query_map([sql_id(op.get())?], |row| row.get::<_, Vec<u8>>(0))
-        .map_err(|_| DeployError::Io)?;
-    let mut refs = BTreeSet::new();
-    for row in rows {
-        refs.insert(decode_backup(&row.map_err(|_| DeployError::Io)?)?);
-    }
-    Ok(refs)
+struct LatestObservation {
+    ordinal: u32,
+    direction: i64,
+    at: BackupRef,
+    evidence: Evidence,
+    state: SlotState,
 }
 
-fn read_displacement(connection: &Connection, op: OperationId) -> Result<Option<()>, DeployError> {
-    let mut query = connection
-        .prepare("SELECT evidence FROM displacement_evidence WHERE operation_id = ?1")
-        .map_err(|_| DeployError::Io)?;
-    let rows = query
-        .query_map([sql_id(op.get())?], |row| row.get::<_, Vec<u8>>(0))
-        .map_err(|_| DeployError::Io)?;
-    for row in rows {
-        let evidence = decode_evidence(&row.map_err(|_| DeployError::Io)?)?;
-        // Simultaneous target and retain unreadability is a preserved
-        // observation, not proof of a displaced artifact.
-        if matches!(evidence.target, Observation::Unavailable(_))
-            && !observed_retention(&evidence.retained)
-        {
-            continue;
-        }
-        return Ok(Some(()));
-    }
-    Ok(None)
-}
-
-fn owned_displacements(
+/// The latest inspection of every exact slot (ordinal, direction, reported
+/// ref). Earlier history stays durable but never decides status or blocking.
+fn latest_observations(
     connection: &Connection,
     op: OperationId,
-    steps: &[StepRecord],
-) -> Result<Vec<(BackupRef, Evidence)>, DeployError> {
+) -> Result<Vec<LatestObservation>, DeployError> {
     let mut query = connection
         .prepare(
-            "SELECT ordinal, direction, reported_ref, evidence FROM displacement_evidence
-         WHERE operation_id = ?1 ORDER BY ordinal, direction, reported_ref",
+            "SELECT d.ordinal, d.direction, d.reported_ref, d.evidence, d.slot_state
+             FROM displacement_observations AS d
+             JOIN (
+                 SELECT ordinal, direction, reported_ref, MAX(seq) AS seq
+                 FROM displacement_observations WHERE operation_id = ?1
+                 GROUP BY ordinal, direction, reported_ref
+             ) AS latest ON latest.seq = d.seq
+             WHERE d.operation_id = ?1
+             ORDER BY d.ordinal, d.direction, d.reported_ref",
         )
         .map_err(|_| DeployError::Io)?;
     let rows = query
@@ -1678,33 +1782,71 @@ fn owned_displacements(
                 row.get::<_, i64>(1)?,
                 row.get::<_, Vec<u8>>(2)?,
                 row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })
         .map_err(|_| DeployError::Io)?;
-    let mut owned = Vec::new();
+    let mut observations = Vec::new();
     for row in rows {
-        let (ordinal, direction, at, evidence) = row.map_err(|_| DeployError::Io)?;
-        let ordinal = u32::try_from(ordinal).map_err(|_| DeployError::Io)?;
+        let (ordinal, direction, at, evidence, state) = row.map_err(|_| DeployError::Io)?;
+        observations.push(LatestObservation {
+            ordinal: u32::try_from(ordinal).map_err(|_| DeployError::Io)?,
+            direction,
+            at: decode_backup(&at)?,
+            evidence: decode_evidence(&evidence)?,
+            state: match state {
+                0 => SlotState::Readable,
+                1 => SlotState::Displaced,
+                2 => SlotState::Unknown,
+                _ => return Err(DeployError::Io),
+            },
+        });
+    }
+    Ok(observations)
+}
+
+/// Whether a latest observation requires operator review. A readable expected
+/// slot resolves a previous report; everything else stays unresolved until a
+/// later inspection supersedes it.
+fn unresolved(observation: &LatestObservation) -> bool {
+    observation.state != SlotState::Readable
+}
+
+fn read_displacement(connection: &Connection, op: OperationId) -> Result<Option<()>, DeployError> {
+    Ok(latest_observations(connection, op)?
+        .iter()
+        .any(unresolved)
+        .then_some(()))
+}
+
+fn owned_displacements(
+    connection: &Connection,
+    op: OperationId,
+    steps: &[StepRecord],
+) -> Result<Vec<(BackupRef, Evidence)>, DeployError> {
+    let mut owned = Vec::new();
+    for latest in latest_observations(connection, op)? {
+        if !unresolved(&latest) {
+            continue;
+        }
         let row = steps
             .iter()
-            .find(|row| row.prepared.ordinal == ordinal)
+            .find(|row| row.prepared.ordinal == latest.ordinal)
             .ok_or(DeployError::Io)?;
-        let step = match direction {
+        let step = match latest.direction {
             0 => &row.prepared,
             1 => row.undo.as_ref().ok_or(DeployError::Io)?,
             _ => return Err(DeployError::Io),
         };
-        let at = decode_backup(&at)?;
-        let evidence = decode_evidence(&evidence)?;
         // Only the sealed canonical retain and its deterministic alternate are
         // displacement locations. Any other reported ref stays a blocker (the
         // evidence row still prevents finalization) but is never advertised.
-        if at.operation() == op
-            && at.ordinal() == ordinal
-            && at.direction() == step.direction
-            && (at == step.retain || at == step.alternate_displacement())
+        if latest.at.operation() == op
+            && latest.at.ordinal() == latest.ordinal
+            && latest.at.direction() == step.direction
+            && (latest.at == step.retain || latest.at == step.alternate_displacement())
         {
-            owned.push((at, evidence));
+            owned.push((latest.at, latest.evidence));
         }
     }
     Ok(owned)

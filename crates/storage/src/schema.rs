@@ -18,8 +18,10 @@ pub(crate) const MIGRATION_VERSION: i64 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SCHEMA_V1: &str = include_str!("../migrations/0001_library.sql");
 const SCHEMA_V2: &str = include_str!("../migrations/0002_operations.sql");
+/// Additive recovery records that are re-applied on every open. The script
+/// must stay idempotent (`IF NOT EXISTS`, guarded copies) because it is not
+/// version-gated; the schema version stays at 2.
 const RECOVERY_PROOFS: &str = include_str!("../migrations/v2_recovery_proofs.sql");
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SchemaError;
 

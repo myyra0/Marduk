@@ -200,6 +200,58 @@ fn recovery_pair_and_locator_must_match_the_claim() {
 }
 
 #[test]
+fn legacy_displacement_rows_are_copied_into_slot_history_once() {
+    let (dir, mut journal, op) = claimed_fixture();
+    let step = prepared(op);
+    journal.seal(op, vec![step.clone()]).unwrap();
+    journal
+        .set_phase(op, Phase::Prepared, Phase::Applying)
+        .unwrap();
+    journal
+        .record_step(op, 0, StepPhase::Ready, StepPhase::Attempting, None)
+        .unwrap();
+    journal
+        .block_displacement(op, &step, step.retain, &applied())
+        .unwrap();
+    drop(journal);
+
+    let db = Connection::open(dir.path().join(DB)).unwrap();
+    db.execute(
+        "INSERT INTO displacement_evidence
+             (operation_id, ordinal, direction, reported_ref, evidence)
+         SELECT operation_id, ordinal, direction, reported_ref, evidence
+         FROM displacement_observations",
+        [],
+    )
+    .unwrap();
+    db.execute("DELETE FROM displacement_observations", [])
+        .unwrap();
+    drop(db);
+
+    let mut journal = OperationJournal::open(dir.path()).unwrap();
+    assert!(journal.has_unresolved_displacement(op).unwrap());
+    assert_eq!(journal.unexpected_displacements(op).unwrap().len(), 1);
+    drop(journal);
+
+    let db = Connection::open(dir.path().join(DB)).unwrap();
+    let count = |db: &Connection| {
+        db.query_row(
+            "SELECT count(*) FROM displacement_observations WHERE operation_id = ?1",
+            [op.get() as i64],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(count(&db), 1);
+    drop(db);
+
+    // Reopening again must not copy the same legacy row a second time.
+    drop(OperationJournal::open(dir.path()).unwrap());
+    let db = Connection::open(dir.path().join(DB)).unwrap();
+    assert_eq!(count(&db), 1);
+}
+
+#[test]
 fn unexpectedly_displaced_ref_survives_reopen_and_prevents_finalize() {
     let (dir, mut journal, op) = claimed_fixture();
     let step = prepared(op);

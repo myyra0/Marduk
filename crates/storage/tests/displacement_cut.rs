@@ -228,9 +228,10 @@ fn unreadable_target_is_not_reported_as_displacement() {
     let status = recover_pending(&mut journal, &mut effects, &root(1), &root(2))
         .unwrap()
         .unwrap();
-    assert_eq!(status.blocker, Some(DeployError::TargetUnavailable));
+    assert_eq!(status.blocker, Some(DeployError::RecoveryConflict));
     // The unreadable target also hides the canonical retain; the observation
     // is kept but is not advertised as a retention or treated as a conflict.
+    assert!(journal.has_unresolved_displacement(op).unwrap());
     let preserved = journal.unexpected_displacements(op).unwrap();
     assert_eq!(preserved.len(), 1);
     assert_eq!(preserved[0].0, step.retain);
@@ -366,13 +367,21 @@ fn simultaneous_target_and_retain_unreadability_is_preserved() {
     let status = recover_pending(&mut journal, &mut effects, &root(1), &root(2))
         .unwrap()
         .unwrap();
-    assert_eq!(status.blocker, Some(DeployError::TargetUnavailable));
+    // The preserved unreadable slot is unresolved evidence, not a known
+    // retention, so status must not advertise it as known.
+    assert_eq!(status.blocker, Some(DeployError::RecoveryConflict));
     assert!(!status.retained.contains(&step.retain));
     let entries = journal.unexpected_displacements(op).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].0, step.retain);
     assert_eq!(entries[0].1.retained, Artifact::Unavailable);
     assert!(matches!(entries[0].1.target, Observation::Unavailable(_)));
+    assert!(journal.has_unresolved_displacement(op).unwrap());
+    journal.reopen().unwrap();
+    let after = journal.status(op).unwrap().unwrap();
+    assert_eq!(after.blocker, Some(DeployError::RecoveryConflict));
+    assert!(!after.retained.contains(&step.retain));
+    assert!(journal.has_unresolved_displacement(op).unwrap());
     assert_eq!(effects.mutations, 0);
 }
 
@@ -477,7 +486,8 @@ fn repeated_recovery_replaces_an_earlier_unreadable_observation() {
     let first = recover_pending(&mut journal, &mut effects, &root(1), &root(2))
         .unwrap()
         .unwrap();
-    assert_eq!(first.blocker, Some(DeployError::TargetUnavailable));
+    assert_eq!(first.blocker, Some(DeployError::RecoveryConflict));
+    assert!(!first.retained.contains(&step.retain));
     let entries = journal.unexpected_displacements(op).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].1.retained, Artifact::Unavailable);
@@ -502,5 +512,77 @@ fn repeated_recovery_replaces_an_earlier_unreadable_observation() {
         entries[0].1.retained,
         Artifact::Regular(displaced.fingerprint.clone())
     );
+    assert_eq!(effects.mutations, 0);
+}
+
+fn slot_history(dir: &TempDir, op: OperationId) -> i64 {
+    Connection::open(dir.path().join("catalog.sqlite3"))
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM displacement_observations WHERE operation_id = ?1",
+            [op.get() as i64],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn attempting_fixture() -> (TempDir, OperationJournal, PreparedStep) {
+    let dir = fixture_v1();
+    let mut journal = open_fixture(&dir);
+    let plan = save_plan(&mut journal);
+    let op = journal.claim(Claim::Deploy(plan)).unwrap();
+    let step = deploy_step(op);
+    journal.seal(op, vec![step.clone()]).unwrap();
+    journal
+        .set_phase(op, Phase::Prepared, Phase::Applying)
+        .unwrap();
+    journal
+        .record_step(op, 0, StepPhase::Ready, StepPhase::Attempting, None)
+        .unwrap();
+    (dir, journal, step)
+}
+
+#[test]
+fn readability_degrading_keeps_history_and_advertises_only_a_latest_positive_read() {
+    let (dir, mut journal, step) = attempting_fixture();
+    let op = step.op;
+    let mut effects = MemEffects::new();
+    let displaced = MemFile {
+        bytes: EDIT.to_vec(),
+        fingerprint: fingerprint(EDIT, 42),
+    };
+    effects.backups.insert(step.retain, displaced);
+
+    drop(journal);
+    let mut journal = OperationJournal::open(dir.path()).unwrap();
+    let first = recover_pending(&mut journal, &mut effects, &root(1), &root(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.blocker, Some(DeployError::RecoveryConflict));
+    assert!(first.retained.contains(&step.retain));
+    assert!(journal.has_unresolved_displacement(op).unwrap());
+    assert_eq!(slot_history(&dir, op), 1);
+
+    // The same slot now reads unreadable. The readable row stays durable as
+    // history, but only the latest observation may decide status.
+    effects.backups.remove(&step.retain);
+    effects.unreadable_retains.insert(step.retain);
+    let second = recover_pending(&mut journal, &mut effects, &root(1), &root(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.blocker, Some(DeployError::RecoveryConflict));
+    assert!(!second.retained.contains(&step.retain));
+    assert!(journal.has_unresolved_displacement(op).unwrap());
+    assert_eq!(
+        slot_history(&dir, op),
+        2,
+        "the earlier readable observation remains durable history"
+    );
+
+    journal.reopen().unwrap();
+    let after = journal.status(op).unwrap().unwrap();
+    assert_eq!(after.blocker, Some(DeployError::RecoveryConflict));
+    assert!(!after.retained.contains(&step.retain));
+    assert!(journal.has_unresolved_displacement(op).unwrap());
     assert_eq!(effects.mutations, 0);
 }
