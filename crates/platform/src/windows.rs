@@ -217,10 +217,10 @@ mod root {
         GetSecurityDescriptorGroup, GetSecurityDescriptorOwner, GetSecurityDescriptorSacl,
         GetTokenInformation, INHERIT_ONLY_ACE, INHERITED_ACE, InitializeAcl,
         InitializeSecurityDescriptor, IsValidAcl, IsValidSid, LABEL_SECURITY_INFORMATION,
-        MakeSelfRelativeSD, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSID,
-        SCOPE_SECURITY_INFORMATION, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR,
-        SetSecurityDescriptorControl, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner,
-        TOKEN_OWNER, TOKEN_QUERY, TokenOwner,
+        MakeSelfRelativeSD, NO_PROPAGATE_INHERIT_ACE, OBJECT_INHERIT_ACE,
+        OWNER_SECURITY_INFORMATION, PSID, SCOPE_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+        SECURITY_DESCRIPTOR, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+        SetSecurityDescriptorOwner, TOKEN_OWNER, TOKEN_QUERY, TokenOwner,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_ARCHIVE,
@@ -1196,21 +1196,152 @@ mod root {
         }
     }
 
+    /// Digest what a descriptor grants: owner SID, group SID and the DACL as a
+    /// sorted list of (ACE type, inheritance flags, mask, object GUIDs, SID).
+    /// Self-relative layout, ACE order, padding and control/provenance bits are
+    /// ignored, so two descriptors that grant the same access hash equal; that
+    /// is intended. Observation uses `READ_CONTROL`, not privileged SACL access.
     fn security_sha256(file: &File) -> Result<[u8; 32], RootError> {
-        // Observation uses READ_CONTROL, not privileged SACL access.
         let requested =
             OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
-        let (descriptor, used) = query_security(file, requested)?;
-        if !complete_security(descriptor.as_ptr().cast_mut().cast()) {
+        let (descriptor, _) = query_security(file, requested)?;
+        security_digest(descriptor.as_ptr().cast_mut().cast())
+    }
+
+    fn security_digest(descriptor: *mut std::ffi::c_void) -> Result<[u8; 32], RootError> {
+        let mut owner: PSID = ptr::null_mut();
+        let mut group: PSID = ptr::null_mut();
+        let mut present = 0;
+        let mut acl: *mut ACL = ptr::null_mut();
+        let mut defaulted = 0;
+        if unsafe {
+            GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted) == 0
+                || GetSecurityDescriptorGroup(descriptor, &mut group, &mut defaulted) == 0
+                || GetSecurityDescriptorDacl(descriptor, &mut present, &mut acl, &mut defaulted)
+                    == 0
+                || present == 0
+                || acl.is_null()
+                || IsValidAcl(acl) == 0
+        } {
             return Err(RootError::Io);
         }
-        let mut sha256 = [0u8; 32];
+        let owner = canonical_sid(owner)?;
+        let group = canonical_sid(group)?;
+
+        let mut information = ACL_SIZE_INFORMATION::default();
+        if unsafe {
+            GetAclInformation(
+                acl,
+                (&mut information as *mut ACL_SIZE_INFORMATION).cast(),
+                size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        } == 0
+        {
+            return Err(RootError::Io);
+        }
+        let mut entries = Vec::with_capacity(information.AceCount as usize);
+        for index in 0..information.AceCount {
+            let mut ace: *mut std::ffi::c_void = ptr::null_mut();
+            if unsafe { GetAce(acl, u32::from(index), &mut ace) } == 0 || ace.is_null() {
+                return Err(RootError::Io);
+            }
+            entries.push(canonical_ace(ace)?);
+        }
+        entries.sort();
+
         let mut hasher = Sha256::new();
-        let bytes =
-            unsafe { std::slice::from_raw_parts(descriptor.as_ptr().cast::<u8>(), used as usize) };
-        hasher.update(bytes);
+        hasher.update(b"windows-security-v1\0");
+        for chunk in [&owner, &group] {
+            hasher.update((chunk.len() as u32).to_le_bytes());
+            hasher.update(chunk);
+        }
+        hasher.update((entries.len() as u32).to_le_bytes());
+        for entry in &entries {
+            hasher.update((entry.len() as u32).to_le_bytes());
+            hasher.update(entry);
+        }
+        let mut sha256 = [0u8; 32];
         sha256.copy_from_slice(&hasher.finalize());
         Ok(sha256)
+    }
+
+    fn canonical_sid(sid: PSID) -> Result<Vec<u8>, RootError> {
+        if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
+            return Err(RootError::Io);
+        }
+        let length = unsafe { GetLengthSid(sid) } as usize;
+        if length == 0 {
+            return Err(RootError::Io);
+        }
+        Ok(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), length) }.to_vec())
+    }
+
+    /// One DACL entry: type, effective inheritance flags, mask, object GUIDs
+    /// and SID. `INHERITED_ACE` and the audit-only flag bits record provenance,
+    /// not access, and are dropped. ACE classes this parser cannot read fail
+    /// closed instead of being hashed at face value.
+    fn canonical_ace(ace: *mut std::ffi::c_void) -> Result<Vec<u8>, RootError> {
+        const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+        const ACCESS_ALLOWED_OBJECT_ACE_TYPE: u8 = 5;
+        const ACCESS_DENIED_OBJECT_ACE_TYPE: u8 = 6;
+        const ACE_OBJECT_TYPE_PRESENT: u32 = 1;
+        const ACE_INHERITED_OBJECT_TYPE_PRESENT: u32 = 2;
+        const ACE_INHERITANCE_FLAGS: u8 = (OBJECT_INHERIT_ACE
+            | CONTAINER_INHERIT_ACE
+            | NO_PROPAGATE_INHERIT_ACE
+            | INHERIT_ONLY_ACE) as u8;
+
+        let header = unsafe { ptr::read(ace.cast::<ACE_HEADER>()) };
+        let size = header.AceSize as usize;
+        if size < size_of::<ACE_HEADER>() {
+            return Err(RootError::Io);
+        }
+        let raw = unsafe { std::slice::from_raw_parts(ace.cast::<u8>(), size) };
+        let read_u32 = |offset: usize| -> Result<u32, RootError> {
+            raw.get(offset..offset + 4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four bytes")))
+                .ok_or(RootError::Io)
+        };
+        let mask = read_u32(4)?;
+
+        let sid_offset = match header.AceType {
+            ACCESS_ALLOWED_ACE_TYPE | ACCESS_DENIED_ACE_TYPE => 8,
+            ACCESS_ALLOWED_OBJECT_ACE_TYPE | ACCESS_DENIED_OBJECT_ACE_TYPE => {
+                let flags = read_u32(8)?;
+                let mut offset = 12;
+                if flags & ACE_OBJECT_TYPE_PRESENT != 0 {
+                    offset += 16;
+                }
+                if flags & ACE_INHERITED_OBJECT_TYPE_PRESENT != 0 {
+                    offset += 16;
+                }
+                offset
+            }
+            _ => return Err(RootError::Io),
+        };
+        if sid_offset + 8 > size {
+            return Err(RootError::Io);
+        }
+        let sid: PSID = unsafe { ace.cast::<u8>().add(sid_offset).cast() };
+        if unsafe { IsValidSid(sid) } == 0 {
+            return Err(RootError::Io);
+        }
+        let sid_length = unsafe { GetLengthSid(sid) } as usize;
+        if sid_length == 0 || sid_offset + sid_length > size {
+            return Err(RootError::Io);
+        }
+
+        let object_fields = &raw[8..sid_offset];
+        let mut entry = Vec::with_capacity(9 + object_fields.len() + sid_length);
+        entry.push(header.AceType);
+        entry.push(header.AceFlags & ACE_INHERITANCE_FLAGS);
+        entry.extend_from_slice(&mask.to_le_bytes());
+        entry.extend_from_slice(&(object_fields.len() as u8).to_le_bytes());
+        entry.extend_from_slice(object_fields);
+        entry.extend_from_slice(&(sid_length as u32).to_le_bytes());
+        entry.extend_from_slice(&raw[sid_offset..sid_offset + sid_length]);
+        Ok(entry)
     }
 
     /// Mandatory-label, resource-attribute and scoped-policy ACEs are readable
@@ -1286,27 +1417,6 @@ mod root {
             return Err(RootError::Io);
         }
         Ok((descriptor, needed))
-    }
-
-    fn complete_security(descriptor: *mut std::ffi::c_void) -> bool {
-        let mut owner = ptr::null_mut();
-        let mut group = ptr::null_mut();
-        let mut dacl: *mut ACL = ptr::null_mut();
-        let mut present = 0;
-        let mut defaulted = 0;
-        unsafe {
-            GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted) != 0
-                && !owner.is_null()
-                && IsValidSid(owner) != 0
-                && GetSecurityDescriptorGroup(descriptor, &mut group, &mut defaulted) != 0
-                && !group.is_null()
-                && IsValidSid(group) != 0
-                && GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
-                    != 0
-                && present != 0
-                && !dacl.is_null()
-                && IsValidAcl(dacl) != 0
-        }
     }
 
     fn is_sharing(code: u32) -> bool {
@@ -2447,6 +2557,137 @@ mod root {
             return Err(RootError::Io);
         }
         Ok(self_relative)
+    }
+
+    #[cfg(test)]
+    mod security_digest_tests {
+        use super::*;
+        use windows_sys::Win32::Security::{
+            AddAccessAllowedAceEx, SetSecurityDescriptorDacl, SetSecurityDescriptorGroup,
+            SetSecurityDescriptorOwner,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{FILE_ALL_ACCESS, FILE_GENERIC_READ};
+
+        /// A 4-byte-aligned local SID with one subauthority.
+        fn sid(subauth: u32) -> Vec<u32> {
+            let mut words = vec![0u32; 3];
+            let bytes =
+                unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), 12) };
+            bytes[0] = 1; // SID_REVISION
+            bytes[1] = 1; // one subauthority
+            bytes[7] = 5; // SECURITY_NT_AUTHORITY, big-endian
+            bytes[8..12].copy_from_slice(&subauth.to_le_bytes());
+            words
+        }
+
+        /// `slack` extra words are allocated inside `AclSize`, so the stored
+        /// descriptor differs by padding without changing any ACE.
+        fn acl(entries: &[(u8, u32, &[u32])], slack: usize) -> Vec<u32> {
+            let bytes = size_of::<ACL>() + entries.len() * (8 + 12) + slack * size_of::<u32>();
+            let mut words = vec![0u32; bytes.div_ceil(size_of::<u32>())];
+            let acl: *mut ACL = words.as_mut_ptr().cast();
+            assert_ne!(unsafe { InitializeAcl(acl, bytes as u32, ACL_REVISION) }, 0);
+            for (flags, mask, sid) in entries {
+                assert_ne!(
+                    unsafe {
+                        AddAccessAllowedAceEx(
+                            acl,
+                            ACL_REVISION,
+                            u32::from(*flags),
+                            *mask,
+                            sid.as_ptr().cast_mut().cast(),
+                        )
+                    },
+                    0
+                );
+            }
+            words
+        }
+
+        fn descriptor(owner: &[u32], group: &[u32], acl: &[u32]) -> SECURITY_DESCRIPTOR {
+            let mut descriptor = SECURITY_DESCRIPTOR::default();
+            let base = (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast();
+            assert_ne!(
+                unsafe { InitializeSecurityDescriptor(base, SECURITY_DESCRIPTOR_REVISION) },
+                0
+            );
+            assert_ne!(
+                unsafe { SetSecurityDescriptorOwner(base, owner.as_ptr().cast_mut().cast(), 0) },
+                0
+            );
+            assert_ne!(
+                unsafe { SetSecurityDescriptorGroup(base, group.as_ptr().cast_mut().cast(), 0) },
+                0
+            );
+            assert_ne!(
+                unsafe { SetSecurityDescriptorDacl(base, 1, acl.as_ptr().cast(), 0) },
+                0
+            );
+            descriptor
+        }
+
+        fn digest(descriptor: &mut SECURITY_DESCRIPTOR) -> [u8; 32] {
+            security_digest((descriptor as *mut SECURITY_DESCRIPTOR).cast()).unwrap()
+        }
+
+        #[test]
+        fn equivalent_storage_hashes_equal() {
+            let owner = sid(18);
+            let group = sid(18);
+            let system = sid(18);
+            let user = sid(544);
+            let first_acl = acl(
+                &[(0, FILE_ALL_ACCESS, &user), (0, FILE_ALL_ACCESS, &system)],
+                0,
+            );
+            // Same grants, different ACE order, different padding and the
+            // provenance-only inherited flag set on one ACE.
+            let mut second_acl = acl(
+                &[(0, FILE_ALL_ACCESS, &system), (0, FILE_ALL_ACCESS, &user)],
+                8,
+            );
+            let second_bytes =
+                unsafe { std::slice::from_raw_parts_mut(second_acl.as_mut_ptr().cast::<u8>(), 10) };
+            second_bytes[9] |= INHERITED_ACE as u8;
+
+            let mut first = descriptor(&owner, &group, &first_acl);
+            let mut second = descriptor(&owner, &group, &second_acl);
+            assert_eq!(digest(&mut first), digest(&mut second));
+        }
+
+        #[test]
+        fn widened_dacl_hashes_differently() {
+            let owner = sid(18);
+            let group = sid(18);
+            let user = sid(544);
+            let everyone = sid(545);
+            let base_acl = acl(&[(0, FILE_GENERIC_READ, &user)], 0);
+            let widened_mask = acl(&[(0, FILE_ALL_ACCESS, &user)], 0);
+            let added_ace = acl(
+                &[
+                    (0, FILE_GENERIC_READ, &user),
+                    (0, FILE_GENERIC_READ, &everyone),
+                ],
+                0,
+            );
+
+            let mut base = descriptor(&owner, &group, &base_acl);
+            let mut mask = descriptor(&owner, &group, &widened_mask);
+            let mut added = descriptor(&owner, &group, &added_ace);
+            assert_ne!(digest(&mut base), digest(&mut mask));
+            assert_ne!(digest(&mut base), digest(&mut added));
+        }
+
+        #[test]
+        fn changed_owner_hashes_differently() {
+            let group = sid(18);
+            let user = sid(544);
+            let acl = acl(&[(0, FILE_ALL_ACCESS, &user)], 0);
+
+            let mut first = descriptor(&sid(18), &group, &acl);
+            let mut second = descriptor(&sid(544), &group, &acl);
+            assert_ne!(digest(&mut first), digest(&mut second));
+        }
     }
 }
 

@@ -1,0 +1,5 @@
+# Hash Windows security semantics, not descriptor bytes
+
+**Status: proposed.** The Windows file fingerprint's security digest covers the owner SID, the group SID and the DACL as a sorted list of effective entries (ACE type, normalised inheritance flags, mask, object GUIDs, SID). Self-relative layout, ACE order, padding, and descriptor control and provenance flags are excluded, and the copy path (`copy_file`) still applies the source descriptor to the destination.
+
+`SetKernelObjectSecurity` normalises the descriptor it stores, so hashing the raw self-relative bytes made every staged copy and backup differ from its source in a semantically identical DACL; Restore and backup validation would refuse every Windows file. The cost if this is wrong: a descriptor that differs only in stored layout, protection state or inherited-ACE provenance is no longer detected as a mismatch. That difference does not change effective access on the object; if a future guarantee needs protection or inheritance provenance, it must be witnessed explicitly rather than inferred from this digest.
