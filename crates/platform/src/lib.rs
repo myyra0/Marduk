@@ -68,8 +68,10 @@ pub fn open_private_directory(path: &Path) -> Result<std::fs::File, RootError> {
     native::open_private_directory(path)
 }
 
-/// Whether the adapter has recorded runtime evidence for private-library
-/// staging on the volume holding `root`. Unqualified volumes must not stage.
+/// Whether the availability record proves private-library staging on the volume
+/// holding `root`. `marduk_core::qualification` is the decision owner; this
+/// function only observes the volume and asks. Unqualified volumes must not
+/// stage.
 pub fn library_volume_qualified(root: &Path) -> bool {
     native::library_volume_qualified(root)
 }

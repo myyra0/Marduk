@@ -330,9 +330,10 @@ pub fn fingerprint_path(path: &std::path::Path) -> Result<Fingerprint, RootError
     }
 }
 
-/// Whether the adapter has recorded runtime evidence for native effect writes on
-/// the volume holding `root`. Deployment composition refuses an unqualified
-/// installation or library root.
+/// Whether the availability record proves the composed native effect adapter on
+/// the volume holding `root`. `marduk_core::qualification` is the decision
+/// owner; this function only observes the volume and asks. Deployment
+/// composition refuses an unqualified installation or library root.
 pub fn volume_qualified(root: &std::path::Path) -> bool {
     crate::native::effects_volume_qualified(root)
 }

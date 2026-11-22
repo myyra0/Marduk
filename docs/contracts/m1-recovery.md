@@ -34,6 +34,10 @@ Expose these operations from the shared core service, with typed wrappers in CLI
 
 The operation owner validates a new plan under the root lease before the first write. For an already claimed plan ID, return the recorded operation before evaluating current active-generation or stale-profile checks; replay is not a fresh deployment. Use stable codes for `StalePlan`, `ActiveDeployment`, `Busy`, `TargetUnavailable`, `UnsupportedTarget`, `InvalidPath`, `RecoveryConflict`, and `Io`. Native detail may be included only in safely redacted diagnostics. Keep false success and ambiguous late failure separate.
 
+## Availability is a recorded fact
+
+Which `(capability, operating system, volume class)` configurations may run is decided in one place: the qualification record in `crates/core/src/qualification.rs`. Each proof names the witness tests, the date and the revision that produced it. `crates/core/tests/availability_guard.rs` parses the evidence matrices in `docs/research/m1-native-results.md` and fails when the record and the document disagree in either direction, so availability cannot move without a run behind it. Gates query the record; platform code reports only the observed volume class and whether its code exists for that operating system. Deploy- and restore-level rows are unproven on every configuration today.
+
 ## Phases and effect boundaries
 
 1. **Planning/preflight:** validate identities, paths, source digests and expected targets. Refuse mixed existing directory aliases, unsupported metadata or missing parents. An existing active deployment is `ActiveDeployment` in M1; only Restore may change it. If recovery evidence is unresolved, do not write that root.

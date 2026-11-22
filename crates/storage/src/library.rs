@@ -118,10 +118,10 @@ impl Catalog {
         })
     }
 
-    /// Connect native staging only on volume classes with recorded runtime
-    /// evidence (`docs/research/m1-native-results.md`). A qualified volume whose
-    /// private boundary will not bind stays refused; the bind is the final gate,
-    /// never a downgrade to a weaker write.
+    /// Connect native staging only where the availability record
+    /// (`marduk_core::qualification`) proves the catalog layer. A qualified
+    /// volume whose private boundary will not bind stays refused; the bind is
+    /// the final gate, never a downgrade to a weaker write.
     fn select_stage(qualified: bool, root: &Path) -> StageAdapter {
         if !qualified {
             return StageAdapter::Unavailable(UnavailableStage);

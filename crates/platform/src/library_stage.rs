@@ -487,6 +487,9 @@ mod fsops {
 
     pub(crate) use crate::linux::{StagedDirectory, StagingTree};
 
+    /// The private staging adapter may run where the record proves the staging
+    /// layer; `marduk_core::qualification` decides. The import gate is a higher
+    /// rung.
     pub fn qualified(root: &Path) -> bool {
         crate::native::library_volume_qualified(root)
     }
@@ -511,10 +514,9 @@ mod fsops {
 
     pub(crate) use crate::windows::{StagedDirectory, StagingTree};
 
-    /// NTFS is qualified for private staging, decided from the opened root's
-    /// volume. This is narrower than the workspace-level
-    /// `library_volume_qualified` gate, which stays closed until deploy-level
-    /// NTFS evidence exists.
+    /// The private staging adapter may run where the record proves the staging
+    /// layer (NTFS today); `marduk_core::qualification` decides, not this seam.
+    /// The product import gate is a higher rung and stays closed.
     pub fn qualified(root: &Path) -> bool {
         crate::windows::staging_volume_qualified(root)
     }

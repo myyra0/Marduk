@@ -80,9 +80,10 @@ impl std::fmt::Debug for NativeEffects {
 impl NativeEffects {
     /// Bind the selected installation and prepare the app-owned effect area.
     ///
-    /// Both roots are checked for recorded runtime evidence. A refused volume
-    /// returns `UnsupportedTarget` before the binding is opened or any
-    /// directory is created.
+    /// Both roots are checked against the availability record
+    /// (`marduk_core::qualification`). A refused volume returns
+    /// `UnsupportedTarget` before the binding is opened or any directory is
+    /// created.
     pub fn open(app_data: &Path, locator: &Path, layout: GameLayout) -> Result<Self, DeployError> {
         if !effects::volume_qualified(app_data) || !effects::volume_qualified(locator) {
             return Err(DeployError::UnsupportedTarget);

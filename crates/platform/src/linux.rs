@@ -10,6 +10,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
 use crate::GateError;
+use marduk_core::qualification::{Capability, Os, Route, VolumeClass, available};
 
 /// Stable lock object for one application-owned root.
 #[derive(Debug)]
@@ -161,6 +162,7 @@ use std::os::fd::RawFd;
 
 const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
 const TMPFS_SUPER_MAGIC: u64 = 0x0102_1994;
+const EXT4_SUPER_MAGIC: u64 = 0xEF53;
 const PROC_SUPER_MAGIC: u64 = 0x9fa0;
 const BTRFS_FIRST_FREE_OBJECTID: u64 = 256;
 /// `_IOR('f', 1, long)` from `linux/fs.h`.
@@ -1558,28 +1560,48 @@ pub(crate) fn renameat2(
     }
 }
 
-/// Volume classes with recorded runtime evidence for private-library staging.
-/// The qualified set and refusal rule are owned by
-/// `docs/research/m1-native-results.md`; every other magic is unqualified.
+/// Volume class of the observed root's filesystem. The adapter reports the
+/// class only; `marduk_core::qualification` decides what it is good for.
+fn volume_class(magic: u64) -> VolumeClass {
+    match magic {
+        BTRFS_SUPER_MAGIC => VolumeClass::Btrfs,
+        TMPFS_SUPER_MAGIC => VolumeClass::Tmpfs,
+        EXT4_SUPER_MAGIC => VolumeClass::Ext4,
+        _ => VolumeClass::Other,
+    }
+}
+
+fn observed_volume_class(root: &Path) -> Option<VolumeClass> {
+    let file = open_directory(root).ok()?;
+    let (magic, _) = statfs_of(&file).ok()?;
+    Some(volume_class(magic))
+}
+
+/// Whether the availability record proves private-library staging on this
+/// filesystem class. Decided by `marduk_core::qualification`; this function only
+/// maps the observed magic and asks.
 fn library_filesystem_qualified(magic: u64) -> bool {
-    matches!(magic, BTRFS_SUPER_MAGIC | TMPFS_SUPER_MAGIC)
+    available(
+        Capability::LibraryStaging,
+        Route::Import,
+        Os::Linux,
+        volume_class(magic),
+    )
 }
 
-/// Library staging is connected only on a volume class with runtime proof; the
-/// observed root's `fstatfs` magic decides, and an unreadable root is unqualified.
+/// Library import is connected only where the record proves a catalog-layer
+/// run; the observed root's `fstatfs` magic supplies the class, and an
+/// unreadable root is unqualified.
 pub(crate) fn library_volume_qualified(root: &Path) -> bool {
-    let Ok(file) = open_directory(root) else {
-        return false;
-    };
-    let Ok((magic, _)) = statfs_of(&file) else {
-        return false;
-    };
-    library_filesystem_qualified(magic)
+    observed_volume_class(root)
+        .is_some_and(|class| available(Capability::LibraryStaging, Route::Import, Os::Linux, class))
 }
 
-/// Native effect writes use the same recorded volume classes as private staging.
+/// The composed native effect adapter runs only where the record proves the
+/// adapter layer; platform reports the class and does not decide availability.
 pub(crate) fn effects_volume_qualified(root: &Path) -> bool {
-    library_volume_qualified(root)
+    observed_volume_class(root)
+        .is_some_and(|class| available(Capability::NativeEffects, Route::Adapter, Os::Linux, class))
 }
 
 /// The effective group and every supplementary group can be restored without

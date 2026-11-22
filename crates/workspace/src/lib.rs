@@ -1142,8 +1142,9 @@ fn phase(phase: Phase) -> &'static str {
 
 /// One decision point for client-visible deploy/restore availability.
 ///
-/// Real Apply and Restore stay closed until the C1 proof lane records its rows in
-/// `docs/research/m1-native-results.md`. Synthetic runs reach the adapter only
+/// Real Apply and Restore stay closed until the availability record
+/// (`marduk_core::qualification`, deploy layer) proves them; every
+/// configuration is unproven there today. Synthetic runs reach the adapter only
 /// through the `proof_*` methods; the write-authority rule is owned by
 /// `docs/contracts/m1-clients.md`.
 fn native_effects_gate() -> Result<(), WireError> {

@@ -18,6 +18,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use crate::GateError;
+use marduk_core::qualification::{Capability, Os, Route, VolumeClass, available};
 
 /// Stable lock object for one application-owned root.
 #[derive(Debug)]
@@ -186,6 +187,7 @@ mod root {
     use std::ptr;
     use std::sync::Mutex;
 
+    use marduk_core::qualification::{Capability, Os, Route, VolumeClass, available};
     use marduk_core::root_identity::{
         FileMetadata, Fingerprint, GameLayout, NativeIdentity, RootError, RootIdentity,
         TargetObservation, UnsupportedReason,
@@ -1924,29 +1926,42 @@ mod root {
         }
     }
 
-    /// Whether the opened root lives on NTFS. The volume that owns the handle
-    /// decides, never the path spelling; a reparse final component is refused.
-    ///
-    /// This feeds `library_stage::fsops::qualified` only. The workspace-level
-    /// `library_volume_qualified` gate stays closed until deploy-level NTFS
-    /// evidence exists.
-    pub(crate) fn staging_volume_qualified(root: &Path) -> bool {
+    /// Volume class of the opened root, read from the volume that owns the
+    /// handle, never from the path spelling; a reparse final component is
+    /// refused. The adapter reports the class only:
+    /// `marduk_core::qualification` decides what it is good for.
+    pub(crate) fn volume_class(root: &Path) -> VolumeClass {
         let Some(text) = root.to_str() else {
-            return false;
+            return VolumeClass::Other;
         };
         let Ok(file) = open_existing_directory(Path::new(text)) else {
-            return false;
+            return VolumeClass::Other;
         };
         let Ok(tag) = attribute_tag(&file) else {
-            return false;
+            return VolumeClass::Other;
         };
         let Ok(standard) = standard_info(&file) else {
-            return false;
+            return VolumeClass::Other;
         };
         if is_reparse(&tag) || !standard.Directory || identity(&file).is_err() {
-            return false;
+            return VolumeClass::Other;
         }
-        filesystem_name(&file).is_ok_and(|name| name.eq_ignore_ascii_case("NTFS"))
+        match filesystem_name(&file) {
+            Ok(name) if name.eq_ignore_ascii_case("NTFS") => VolumeClass::Ntfs,
+            _ => VolumeClass::Other,
+        }
+    }
+
+    /// Whether the private staging adapter may run on this volume. The record
+    /// proves the staging layer on NTFS; the import gate is a higher rung and
+    /// stays closed.
+    pub(crate) fn staging_volume_qualified(root: &Path) -> bool {
+        available(
+            Capability::LibraryStaging,
+            Route::Adapter,
+            Os::Windows,
+            volume_class(root),
+        )
     }
 
     /// Witness-only privacy proof for one staged path. It re-reads the
@@ -2417,22 +2432,28 @@ pub(crate) use root::{
     directory_identity, fingerprint_path, observe_target, open_or_create_private_file,
     open_private_child_directory, open_private_directory, private_child_path, reopen_installation,
     resolve_existing_parent, staged_entry_is_private, staging_volume_qualified,
-    verify_private_directory,
+    verify_private_directory, volume_class,
 };
 
-/// Product availability stays closed on Windows: no deploy-level NTFS evidence
-/// exists. The private staging adapter has its own NTFS predicate in
-/// `library_stage::fsops::qualified`, which does not enable workspace imports or
-/// deploys. Availability and refusal rule:
-/// `docs/research/m1-native-results.md`, `docs/contracts/m1-recovery.md`.
-pub(crate) fn library_volume_qualified(_root: &Path) -> bool {
-    false
+/// Product library import is closed on Windows: the record proves the staging
+/// adapter on NTFS, not the catalog layer. The class comes from the opened root;
+/// `marduk_core::qualification` decides.
+pub(crate) fn library_volume_qualified(root: &Path) -> bool {
+    available(
+        Capability::LibraryStaging,
+        Route::Import,
+        Os::Windows,
+        volume_class(root),
+    )
 }
 
-/// Native effect writes stay unqualified on Windows: the file-level primitives
-/// pass on hosted NTFS, but no deploy-level rows exist and the durability barrier
-/// remains `Unavailable`. `staging_volume_qualified` is kept for the private
-/// staging lane; being on NTFS is not deploy qualification.
-pub(crate) fn effects_volume_qualified(_root: &Path) -> bool {
-    false
+/// The composed native effect adapter is closed on Windows: the record proves
+/// the effect primitives on NTFS, not the adapter or deploy layer.
+pub(crate) fn effects_volume_qualified(root: &Path) -> bool {
+    available(
+        Capability::NativeEffects,
+        Route::Adapter,
+        Os::Windows,
+        volume_class(root),
+    )
 }

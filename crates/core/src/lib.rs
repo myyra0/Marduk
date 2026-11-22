@@ -4,6 +4,7 @@ pub mod deployment;
 pub mod ids;
 pub mod import;
 pub mod profiles;
+pub mod qualification;
 pub mod recovery;
 pub mod resolve;
 pub mod root_identity;
