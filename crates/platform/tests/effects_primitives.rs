@@ -330,7 +330,8 @@ fn refuse_widened_dacl(mask: u32) {
             SetNamedSecurityInfoW(
                 path.as_ptr(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
+                windows_sys::Win32::Security::PROTECTED_DACL_SECURITY_INFORMATION
+                    | windows_sys::Win32::Security::DACL_SECURITY_INFORMATION,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 acl.as_ptr().cast(),
@@ -389,6 +390,106 @@ fn refuse_widened_dacl(mask: u32) {
         "a refused copy must leave no artifact in the private effect area"
     );
     assert_eq!(fs::read(&source).unwrap(), STAGED);
+}
+
+#[cfg(windows)]
+#[test]
+fn copy_succeeds_for_an_inherited_current_user_only_dacl() {
+    let directory = tempfile::tempdir().unwrap();
+    let parent = directory.path().join("parent");
+    fs::create_dir(&parent).unwrap();
+    set_current_user_only_dacl(&parent);
+
+    let source = parent.join("source");
+    fs::write(&source, STAGED).unwrap();
+    let destination = directory.path().join("destination");
+
+    let (len, _) = copy_file(&source, &destination)
+        .expect("a source whose inherited DACL grants only the current user must copy");
+    assert_eq!(len, STAGED.len() as u64);
+    assert_eq!(fs::read(&destination).unwrap(), STAGED);
+}
+
+#[cfg(windows)]
+fn set_current_user_only_dacl(path: &Path) {
+    use std::mem::{offset_of, size_of};
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, GetTokenInformation, InitializeAcl,
+        TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_GENERIC_WRITE};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token: HANDLE = std::ptr::null_mut();
+    assert_ne!(
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) },
+        0
+    );
+    let mut needed = 0u32;
+    unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+    let mut buffer = vec![0u32; (needed as usize).div_ceil(size_of::<u32>())];
+    assert_ne!(
+        unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        },
+        0
+    );
+    let sid = unsafe { (*(buffer.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+    let sid_len = unsafe { windows_sys::Win32::Security::GetLengthSid(sid) } as usize;
+    unsafe { CloseHandle(token) };
+
+    let ace_size = offset_of!(ACCESS_ALLOWED_ACE, SidStart) + sid_len;
+    let acl_len = size_of::<ACL>() + ace_size;
+    let mut acl = vec![0u8; acl_len];
+    assert_ne!(
+        unsafe { InitializeAcl(acl.as_mut_ptr().cast(), acl_len as u32, ACL_REVISION) },
+        0
+    );
+    let ace = unsafe { acl.as_mut_ptr().add(size_of::<ACL>()) };
+    unsafe {
+        let header = ace.cast::<ACE_HEADER>();
+        (*header).AceType = 0;
+        (*header).AceFlags = 0;
+        (*header).AceSize = ace_size as u16;
+        let allowed = ace.cast::<ACCESS_ALLOWED_ACE>();
+        (*allowed).Mask = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+        std::ptr::copy_nonoverlapping(
+            sid.cast::<u8>(),
+            ace.add(offset_of!(ACCESS_ALLOWED_ACE, SidStart)),
+            sid_len,
+        );
+    }
+    unsafe {
+        (*acl.as_mut_ptr().cast::<ACL>()).AceCount = 1;
+        (*acl.as_mut_ptr().cast::<ACL>()).AclSize = acl_len as u16;
+    }
+
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    assert_eq!(
+        unsafe {
+            SetNamedSecurityInfoW(
+                path.as_ptr(),
+                SE_FILE_OBJECT,
+                windows_sys::Win32::Security::PROTECTED_DACL_SECURITY_INFORMATION
+                    | windows_sys::Win32::Security::DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                acl.as_ptr().cast(),
+                std::ptr::null_mut(),
+            )
+        },
+        0,
+        "could not set the current-user-only DACL"
+    );
 }
 
 #[cfg(windows)]
