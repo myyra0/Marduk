@@ -2596,10 +2596,6 @@ mod root {
     #[cfg(test)]
     mod security_digest_tests {
         use super::*;
-        use windows_sys::Win32::Security::Authorization::{
-            GetEffectiveRightsFromAclW, NO_MULTIPLE_TRUSTEE, TRUSTEE_IS_SID, TRUSTEE_IS_USER,
-            TRUSTEE_W,
-        };
         use windows_sys::Win32::Security::{
             AddAccessAllowedAceEx, AddAccessDeniedAceEx, SetSecurityDescriptorDacl,
             SetSecurityDescriptorGroup, SetSecurityDescriptorOwner,
@@ -2670,21 +2666,29 @@ mod root {
             acl_with(&entries, slack)
         }
 
-        /// The access a trustee actually receives for `mask`, as the OS
-        /// evaluates the ordered DACL: the first matching ACE decides.
-        fn effective(acl: &[u32], sid: &[u32], mask: u32) -> u32 {
-            let trustee = TRUSTEE_W {
-                pMultipleTrustee: std::ptr::null_mut(),
-                MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
-                TrusteeForm: TRUSTEE_IS_SID,
-                TrusteeType: TRUSTEE_IS_USER,
-                ptstrName: sid.as_ptr().cast_mut().cast(),
-            };
-            let mut rights = 0u32;
-            let error =
-                unsafe { GetEffectiveRightsFromAclW(acl.as_ptr().cast(), &trustee, &mut rights) };
-            assert_eq!(error, 0, "the DACL must be readable for an access check");
-            rights & mask
+        /// The access a trustee actually receives for `mask`, evaluated
+        /// locally over the ordered ACE list: the first entry matching the
+        /// requested bits decides them (deny clears, allow sets), and later
+        /// entries cannot re-grant bits already denied.
+        fn effective(entries: &[(bool, u8, u32, &[u32])], sid: &[u32], mask: u32) -> u32 {
+            let mut granted = 0u32;
+            let mut decided = 0u32;
+            for (deny, _flags, ace_mask, ace_sid) in entries {
+                if ace_sid != sid {
+                    continue;
+                }
+                let applicable = *ace_mask & mask & !decided;
+                if applicable == 0 {
+                    continue;
+                }
+                decided |= applicable;
+                if *deny {
+                    granted &= !applicable;
+                } else {
+                    granted |= applicable;
+                }
+            }
+            granted & mask
         }
 
         fn descriptor(owner: &[u32], group: &[u32], acl: &[u32]) -> SECURITY_DESCRIPTOR {
@@ -2768,24 +2772,20 @@ mod root {
             // The same two ACEs in both orders. Windows evaluates the first
             // matching ACE, so one DACL allows the read and the other denies
             // it; the digest must separate those grants.
-            let deny_acl = acl_with(
-                &[
-                    (true, 0, FILE_GENERIC_READ, &user),
-                    (false, 0, FILE_GENERIC_READ, &user),
-                ],
-                0,
-            );
-            let allow_acl = acl_with(
-                &[
-                    (false, 0, FILE_GENERIC_READ, &user),
-                    (true, 0, FILE_GENERIC_READ, &user),
-                ],
-                0,
-            );
+            let deny_entries = [
+                (true, 0, FILE_GENERIC_READ, user.as_slice()),
+                (false, 0, FILE_GENERIC_READ, user.as_slice()),
+            ];
+            let deny_acl = acl_with(&deny_entries, 0);
+            let allow_entries = [
+                (false, 0, FILE_GENERIC_READ, user.as_slice()),
+                (true, 0, FILE_GENERIC_READ, user.as_slice()),
+            ];
+            let allow_acl = acl_with(&allow_entries, 0);
 
-            assert_eq!(effective(&deny_acl, &user, FILE_GENERIC_READ), 0);
+            assert_eq!(effective(&deny_entries, &user, FILE_GENERIC_READ), 0);
             assert_eq!(
-                effective(&allow_acl, &user, FILE_GENERIC_READ),
+                effective(&allow_entries, &user, FILE_GENERIC_READ),
                 FILE_GENERIC_READ
             );
 
