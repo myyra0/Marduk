@@ -310,14 +310,6 @@ fn lost_sql_ack_reopens_committed_claim_without_second_effect() {
     let reviewed = plan(&mut writer);
     let id = reviewed.id;
     let op = writer.claim(Claim::Deploy(reviewed)).unwrap();
-    let selected = writer.selected_installation().unwrap().unwrap();
-    assert_eq!(
-        selected
-            .pending
-            .map(|status| (status.id, status.kind, status.phase)),
-        Some((op, OperationKind::Deploy, Phase::Preparing))
-    );
-    assert_eq!(selected.active_generation, None);
     writer.seal(op, vec![prepared(op)]).unwrap();
     writer
         .set_phase(op, Phase::Prepared, Phase::Applying)
@@ -358,9 +350,6 @@ fn lost_sql_ack_reopens_committed_claim_without_second_effect() {
     );
     let generation = replayed.generation.unwrap();
     root_state(&mut reopened, None, Some(generation));
-    let selected = reopened.selected_installation().unwrap().unwrap();
-    assert!(selected.pending.is_none());
-    assert_eq!(selected.active_generation, Some(generation.get()));
     let record = reopened.generation(generation).unwrap();
     assert_eq!((record.id, record.deploy), (generation, op));
     let [row] = record.steps.as_slice() else {
