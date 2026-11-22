@@ -427,3 +427,79 @@ fn ids_and_revisions_serialize_as_exact_decimal_strings() {
     assert_eq!(status["activeGenerationId"], json!(large_id));
     assert!(status["profile"]["revision"].is_string());
 }
+
+#[test]
+fn desktop_setup_refuses_a_replacement_at_the_picked_path() {
+    let mut fixture = Fixture::new();
+    let picked = fixture.game.clone();
+    let selection = fixture
+        .workspace
+        .remember_selection(Purpose::Installation, picked.clone())
+        .unwrap();
+
+    std::fs::rename(&picked, fixture.temp.path().join("original-game")).unwrap();
+    std::fs::create_dir_all(picked.join("Data")).unwrap();
+    std::fs::write(picked.join("SkyrimSE.exe"), b"").unwrap();
+
+    let error = expect_error(fixture.send(json!({
+        "op": "setup",
+        "args": { "selectionId": selection.to_string() },
+    })));
+    assert_eq!(error["code"], "TargetUnavailable");
+    assert_eq!(fixture.status()["installation"], Value::Null);
+
+    // The replacement is usable only through a fresh pick that binds it.
+    let replacement = fixture
+        .workspace
+        .remember_selection(Purpose::Installation, picked)
+        .unwrap();
+    let status = expect_ok(fixture.send(json!({
+        "op": "setup",
+        "args": { "selectionId": replacement.to_string() },
+    })));
+    assert_eq!(
+        status["installation"]["label"],
+        fixture.game.file_name().unwrap().to_str().unwrap()
+    );
+}
+
+#[test]
+fn setup_returns_the_installation_committed_by_that_request() {
+    let mut fixture = Fixture::new();
+    let other = fixture.temp.path().join("Other Skyrim");
+    std::fs::create_dir_all(other.join("Data")).unwrap();
+    std::fs::write(other.join("SkyrimSE.exe"), b"").unwrap();
+
+    let first_selection = fixture
+        .workspace
+        .remember_selection(Purpose::Installation, fixture.game.clone())
+        .unwrap();
+    let first = expect_ok(fixture.send(json!({
+        "op": "setup",
+        "args": { "selectionId": first_selection.to_string() },
+    })));
+
+    // A second client changes the shared selected installation.
+    let mut second = Workspace::open(&fixture.app).unwrap();
+    let second_selection = second
+        .remember_selection(Purpose::Installation, other.clone())
+        .unwrap();
+    let second_status = match second.dispatch(Request::new(
+        Op::Setup,
+        json!({ "selectionId": second_selection.to_string() }),
+    )) {
+        Envelope::Ok { result } => result,
+        Envelope::Error { error } => panic!("unexpected error: {error:?}"),
+    };
+    assert_eq!(second_status["installation"]["label"], "Other Skyrim");
+
+    // The first response already named the pair its own request committed.
+    assert_eq!(
+        first["installation"]["label"],
+        fixture.game.file_name().unwrap().to_str().unwrap()
+    );
+    assert_ne!(
+        first["installation"]["id"],
+        second_status["installation"]["id"]
+    );
+}

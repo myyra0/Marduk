@@ -46,32 +46,14 @@ pub fn app_data_root_in(data_dir: &Path) -> PathBuf {
 
 /// The one application data root used by every client.
 ///
-/// This mirrors Tauri 2's `app_data_dir()` base directories: the user's data
-/// directory (`$XDG_DATA_HOME` or `$HOME/.local/share` on Linux, `%APPDATA%`
-/// on Windows, `~/Library/Application Support` on macOS) plus the bundle
-/// identifier. No client may derive a different catalog location.
+/// This is exactly Tauri 2's `app_data_dir()` resolution for
+/// [`APP_IDENTIFIER`]: `dirs::data_dir()` plus the bundle identifier. It uses
+/// the Windows known-folder roaming data directory (not the `APPDATA`
+/// environment variable), and on Linux it ignores a relative `XDG_DATA_HOME` in
+/// favour of `$HOME/.local/share`. No client may derive a different location.
 pub fn app_data_root() -> Result<PathBuf, WireError> {
-    #[cfg(windows)]
-    let base = std::env::var_os("APPDATA")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
-
-    #[cfg(target_os = "macos")]
-    let base = std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(|home| PathBuf::from(home).join("Library/Application Support"));
-
-    #[cfg(not(any(windows, target_os = "macos")))]
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|value| !value.is_empty())
-                .map(|home| PathBuf::from(home).join(".local/share"))
-        });
-
-    base.map(|base| app_data_root_in(&base))
+    dirs::data_dir()
+        .map(|base| app_data_root_in(&base))
         .ok_or_else(|| WireError::new(Code::Storage))
 }
 
@@ -331,6 +313,9 @@ pub enum Slot {
     Original,
     Step,
     Displaced,
+    /// Detection-only location positively observed during recovery. It is a
+    /// report location, never a publication destination.
+    Alternate,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -457,14 +442,26 @@ impl Workspace {
     }
 
     /// Record one native picker result and mint the only handle the renderer
-    /// may see. Archive inputs are opened now, so a later command consumes the
-    /// exact file that was selected instead of reopening a pathname.
+    /// may see. Archive inputs are opened now, and an installation binds its
+    /// verified identity pair now, so a later command consumes the exact object
+    /// that was picked instead of rebinding a pathname.
     pub fn remember_selection(
         &mut self,
         purpose: Purpose,
         path: PathBuf,
     ) -> Result<SelectionId, WireError> {
-        self.selections.insert(purpose, path)
+        match purpose {
+            Purpose::Archive => self.selections.insert_archive(path),
+            Purpose::Installation => {
+                let resolved =
+                    std::fs::canonicalize(&path).map_err(|_| WireError::new(Code::InvalidPath))?;
+                let binding = marduk_platform::bind_installation(&resolved, &skyrim_se::LAYOUT)
+                    .map_err(root_error)?;
+                let (installation, data) = binding.identities();
+                self.selections
+                    .insert_installation(resolved, installation.clone(), data.clone())
+            }
+        }
     }
 
     /// Dispatch one request. One result per invocation.
@@ -479,12 +476,12 @@ impl Workspace {
         match request.op {
             Op::Setup => {
                 let args: SetupArgs = decode(request.args)?;
-                self.setup(args.selection()?)?;
-                self.status_value()
+                let selected = self.setup(args.selection()?)?;
+                Ok(json(self.status_from(Some(selected))?)?)
             }
             Op::Status => {
                 let _: NoArgs = decode(request.args)?;
-                self.status_value()
+                Ok(json(self.status()?)?)
             }
             Op::ImportPreview => {
                 let args: ImportPreviewArgs = decode(request.args)?;
@@ -523,11 +520,11 @@ impl Workspace {
         }
     }
 
-    fn setup(&mut self, selection: Selection) -> Result<(), WireError> {
-        let path = match selection {
-            Selection::CliPath(path) => path,
+    fn setup(&mut self, selection: Selection) -> Result<SelectedInstallation, WireError> {
+        let (path, picked) = match selection {
+            Selection::CliPath(path) => (path, None),
             Selection::Desktop(id) => match self.selections.take(id, Purpose::Installation)? {
-                Source::Installation(path) => path,
+                Source::Installation(picked) => (picked.path.clone(), Some(picked)),
                 Source::Archive(_) => return Err(WireError::new(Code::InvalidRequest)),
             },
         };
@@ -542,21 +539,30 @@ impl Workspace {
         let binding = marduk_platform::bind_installation(&selection, &skyrim_se::LAYOUT)
             .map_err(root_error)?;
         let (installation, data) = binding.identities();
+        if picked
+            .as_ref()
+            .is_some_and(|picked| picked.installation != *installation || picked.data != *data)
+        {
+            return Err(WireError::new(Code::TargetUnavailable));
+        }
         self.journal
             .select_verified_installation(&selection, installation, data)
             .map_err(deploy_error)
     }
 
-    fn status_value(&mut self) -> Result<Value, WireError> {
-        Ok(json(self.status()?)?)
+    fn status(&mut self) -> Result<WorkspaceStatus, WireError> {
+        let selected = self.journal.selected_installation().map_err(deploy_error)?;
+        self.status_from(selected)
     }
 
-    fn status(&mut self) -> Result<WorkspaceStatus, WireError> {
+    fn status_from(
+        &mut self,
+        selected: Option<SelectedInstallation>,
+    ) -> Result<WorkspaceStatus, WireError> {
         let named = self
             .catalog
             .named_profile(profile())
             .map_err(import_error)?;
-        let selected = self.journal.selected_installation().map_err(deploy_error)?;
 
         let mut installation = None;
         let mut target = Availability {
@@ -862,8 +868,7 @@ fn retained(retained: BackupRef) -> Option<Retained> {
         BackupSlot::Original => Slot::Original,
         BackupSlot::Step => Slot::Step,
         BackupSlot::Displaced => Slot::Displaced,
-        // Detection-only: never a retained location and never a wire slot.
-        BackupSlot::AlternateDisplaced => return None,
+        BackupSlot::AlternateDisplaced => Slot::Alternate,
     };
     Some(Retained {
         operation_id: decimal(retained.operation().get()),
@@ -1119,8 +1124,12 @@ mod tests {
     }
 
     #[test]
-    fn alternate_displacement_is_detection_only_not_a_retained_slot() {
-        assert!(retained(backup(BackupSlot::AlternateDisplaced)).is_none());
+    fn alternate_displacement_is_a_distinct_reported_location() {
+        let dto = retained(backup(BackupSlot::AlternateDisplaced)).unwrap();
+        assert_eq!(
+            serde_json::to_value(dto).unwrap()["slot"],
+            serde_json::Value::String("alternate".into())
+        );
         for (slot, expected) in [
             (BackupSlot::Original, Slot::Original),
             (BackupSlot::Step, Slot::Step),
@@ -1237,12 +1246,20 @@ mod wire_fixture {
             phase: "completed".to_owned(),
             generation_id: Some("9223372036854775802".to_owned()),
             blocker: None,
-            retained: vec![Retained {
-                operation_id: "9223372036854775701".to_owned(),
-                ordinal: 3,
-                direction: Direction::Undo,
-                slot: Slot::Displaced,
-            }],
+            retained: vec![
+                Retained {
+                    operation_id: "9223372036854775701".to_owned(),
+                    ordinal: 3,
+                    direction: Direction::Undo,
+                    slot: Slot::Displaced,
+                },
+                Retained {
+                    operation_id: "9223372036854775702".to_owned(),
+                    ordinal: 4,
+                    direction: Direction::Forward,
+                    slot: Slot::Alternate,
+                },
+            ],
         }
     }
 

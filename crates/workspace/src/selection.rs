@@ -11,6 +11,8 @@ use std::fmt;
 use std::fs::File;
 use std::path::PathBuf;
 
+use marduk_core::root_identity::RootIdentity;
+
 use crate::{Code, WireError};
 
 /// Why a native selection was recorded. A handle from one picker is never
@@ -55,9 +57,17 @@ pub enum Selection {
     Desktop(SelectionId),
 }
 
+/// A picked installation plus the identity pair verified when it was picked.
+#[derive(Debug)]
+pub(crate) struct PickedInstallation {
+    pub path: PathBuf,
+    pub installation: RootIdentity,
+    pub data: RootIdentity,
+}
+
 #[derive(Debug)]
 pub(crate) enum Source {
-    Installation(PathBuf),
+    Installation(PickedInstallation),
     Archive(File),
 }
 
@@ -82,21 +92,30 @@ impl SelectionStore {
         }
     }
 
-    pub(crate) fn insert(
+    pub(crate) fn insert_archive(&mut self, path: PathBuf) -> Result<SelectionId, WireError> {
+        let source = Source::Archive(File::open(&path).map_err(|_| WireError::new(Code::Io))?);
+        Ok(self.insert(Purpose::Archive, source))
+    }
+
+    pub(crate) fn insert_installation(
         &mut self,
-        purpose: Purpose,
         path: PathBuf,
+        installation: RootIdentity,
+        data: RootIdentity,
     ) -> Result<SelectionId, WireError> {
-        let source = match purpose {
-            Purpose::Archive => {
-                Source::Archive(File::open(&path).map_err(|_| WireError::new(Code::Io))?)
-            }
-            Purpose::Installation => {
-                let resolved =
-                    std::fs::canonicalize(&path).map_err(|_| WireError::new(Code::InvalidPath))?;
-                Source::Installation(resolved)
-            }
-        };
+        let resolved =
+            std::fs::canonicalize(&path).map_err(|_| WireError::new(Code::InvalidPath))?;
+        Ok(self.insert(
+            Purpose::Installation,
+            Source::Installation(PickedInstallation {
+                path: resolved,
+                installation,
+                data,
+            }),
+        ))
+    }
+
+    fn insert(&mut self, purpose: Purpose, source: Source) -> SelectionId {
         if self.entries.len() >= MAX_SELECTIONS
             && let Some(oldest) = self.entries.keys().next().copied()
         {
@@ -105,7 +124,7 @@ impl SelectionStore {
         let id = self.next;
         self.next += 1;
         self.entries.insert(id, Entry { purpose, source });
-        Ok(SelectionId(id))
+        SelectionId(id)
     }
 
     pub(crate) fn take(
@@ -128,7 +147,17 @@ impl SelectionStore {
 mod tests {
     use std::fs;
 
+    use marduk_core::root_identity::NativeIdentity;
+
     use super::*;
+
+    fn root(id: u8) -> RootIdentity {
+        RootIdentity::from_adapter_evidence(NativeIdentity::Windows {
+            volume_serial: 1,
+            file_id: [id; 16],
+            creation_100ns: 1,
+        })
+    }
 
     #[test]
     fn handles_are_single_use() {
@@ -137,9 +166,14 @@ mod tests {
         fs::create_dir(&game).unwrap();
         let mut store = SelectionStore::new();
 
-        let id = store.insert(Purpose::Installation, game.clone()).unwrap();
+        let id = store
+            .insert_installation(game.clone(), root(1), root(2))
+            .unwrap();
         match store.take(id, Purpose::Installation).unwrap() {
-            Source::Installation(path) => assert_eq!(path, fs::canonicalize(&game).unwrap()),
+            Source::Installation(picked) => {
+                assert_eq!(picked.path, fs::canonicalize(&game).unwrap());
+                assert_eq!((picked.installation, picked.data), (root(1), root(2)));
+            }
             Source::Archive(_) => panic!("wrong source kind"),
         }
         assert_eq!(
@@ -155,7 +189,7 @@ mod tests {
         fs::write(&archive, b"not a zip").unwrap();
         let mut store = SelectionStore::new();
 
-        let id = store.insert(Purpose::Archive, archive).unwrap();
+        let id = store.insert_archive(archive).unwrap();
         assert!(matches!(
             store.take(id, Purpose::Archive).unwrap(),
             Source::Archive(_)
@@ -169,7 +203,7 @@ mod tests {
         fs::write(&archive, b"not a zip").unwrap();
         let mut store = SelectionStore::new();
 
-        let id = store.insert(Purpose::Archive, archive).unwrap();
+        let id = store.insert_archive(archive).unwrap();
         assert_eq!(
             store.take(id, Purpose::Installation).unwrap_err(),
             WireError::new(Code::InvalidRequest)
@@ -197,7 +231,7 @@ mod tests {
         for index in 0..=MAX_SELECTIONS {
             let archive = temp.path().join(format!("{index}.zip"));
             fs::write(&archive, b"not a zip").unwrap();
-            ids.push(store.insert(Purpose::Archive, archive).unwrap());
+            ids.push(store.insert_archive(archive).unwrap());
         }
         assert!(store.take(ids[0], Purpose::Archive).is_err());
         assert!(

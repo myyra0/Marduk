@@ -12,6 +12,12 @@
         "operationId": "9223372036854775701",
         "ordinal": 3,
         "slot": "displaced"
+      },
+      {
+        "direction": "forward",
+        "operationId": "9223372036854775702",
+        "ordinal": 4,
+        "slot": "alternate"
       }
     ]
   }

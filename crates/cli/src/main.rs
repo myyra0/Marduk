@@ -113,12 +113,16 @@ fn main() {
     process::exit(run(cli));
 }
 
+fn resolved_app_data() -> Result<std::path::PathBuf, WireError> {
+    app_data_root()
+}
+
 fn run(cli: Cli) -> i32 {
     let request = match request(cli.command) {
         Ok(request) => request,
         Err(error) => return report(Envelope::error(error), cli.json),
     };
-    let app_data = match app_data_root() {
+    let app_data = match resolved_app_data() {
         Ok(path) => path,
         Err(error) => return report(Envelope::error(error), cli.json),
     };
@@ -221,5 +225,20 @@ fn exit_code(envelope: &Envelope<Value>) -> i32 {
                 1
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_resolves_the_shared_app_data_root() {
+        let root = resolved_app_data().expect("an OS data directory is available");
+        assert_eq!(
+            root.file_name(),
+            Some(std::ffi::OsStr::new(marduk_workspace::APP_IDENTIFIER))
+        );
+        assert_eq!(root, app_data_root().unwrap());
     }
 }
