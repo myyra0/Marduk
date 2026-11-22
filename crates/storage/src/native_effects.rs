@@ -266,22 +266,7 @@ impl NativeEffects {
         let stage_observation = artifact(&directory.join("stage"));
         let displaced = artifact(&directory.join("displaced"));
         let (stage, retained) = if exchange {
-            // A completed exchange leaves the displaced object in the stage
-            // alias; an exchange cut between its renames leaves it in the
-            // canonical intermediate instead. Both are the retained slot.
-            match &stage_observation {
-                Artifact::Regular(actual) if staged == Some(actual) => {
-                    (Artifact::Regular(actual.clone()), displaced)
-                }
-                other => (
-                    Artifact::Absent,
-                    if displaced == Artifact::Absent {
-                        other.clone()
-                    } else {
-                        displaced
-                    },
-                ),
-            }
+            exchange_slots(stage_observation, displaced, staged)
         } else {
             (stage_observation, displaced)
         };
@@ -1138,6 +1123,39 @@ impl DeploymentInputs for NativeEffects {
     }
 }
 
+/// Split an exchange's stage and canonical retain observations.
+///
+/// Only the Linux exchange leaves the displaced target in the stage slot. A
+/// Windows exchange retains it at the distinct `displaced` path, so a stage
+/// file there is never evidence of a retained original.
+fn exchange_slots(
+    stage: Artifact,
+    displaced: Artifact,
+    staged: Option<&Fingerprint>,
+) -> (Artifact, Artifact) {
+    #[cfg(target_os = "linux")]
+    {
+        match &stage {
+            Artifact::Regular(actual) if staged == Some(actual) => {
+                (Artifact::Regular(actual.clone()), displaced)
+            }
+            other => (
+                Artifact::Absent,
+                if displaced == Artifact::Absent {
+                    other.clone()
+                } else {
+                    displaced
+                },
+            ),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = staged;
+        (stage, displaced)
+    }
+}
+
 fn artifact(path: &Path) -> Artifact {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -1218,5 +1236,65 @@ fn gate_error(error: GateError) -> DeployError {
     match error {
         GateError::Busy => DeployError::Busy,
         _ => DeployError::TargetUnavailable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fingerprint(byte: u8) -> Fingerprint {
+        Fingerprint {
+            identity: NativeIdentity::Linux {
+                fs_magic: 0x0102_1994,
+                fs_id: [0; 16],
+                view_id: 0,
+                tree_id: None,
+                ino: u64::from(byte),
+                birth: (0, 0),
+            },
+            len: 1,
+            sha256: [byte; 32],
+            metadata: FileMetadata::Linux {
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: (0, 0),
+                nlink: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn exchange_reports_a_stage_copy_separately_from_the_retain_slot() {
+        let staged = fingerprint(1);
+        let (stage, retained) = exchange_slots(
+            Artifact::Regular(staged.clone()),
+            Artifact::Absent,
+            Some(&staged),
+        );
+        assert_eq!(stage, Artifact::Regular(staged));
+        assert_eq!(retained, Artifact::Absent);
+    }
+
+    #[test]
+    fn changed_stage_is_retained_only_in_the_linux_exchange_alias() {
+        let staged = fingerprint(1);
+        let changed = fingerprint(2);
+        let (stage, retained) = exchange_slots(
+            Artifact::Regular(changed.clone()),
+            Artifact::Absent,
+            Some(&staged),
+        );
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(stage, Artifact::Absent);
+            assert_eq!(retained, Artifact::Regular(changed));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(stage, Artifact::Regular(changed));
+            assert_eq!(retained, Artifact::Absent);
+        }
     }
 }
