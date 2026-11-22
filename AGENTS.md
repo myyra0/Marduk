@@ -59,10 +59,10 @@ Rules:
 - Adding a game, source, deploy method or loader means adding a module and registering it, never editing a central switch.
 - Define interfaces from present requirements, not hypothetical ones. No large multi-purpose modules.
 - UI and backend talk only through the typed API (commands and events). No UI types in core, no backend internals in the UI.
-- Every module must be testable alone with fakes (synthetic game dirs, archives, profiles), and every extension point (game handler, source, deploy method, loader) has a fake.
+- Every module must be testable alone with fakes (synthetic game dirs, archives, profiles). Each extension point that exists has a fake; add one with the seam, not ahead of it.
 
-Provisional layout (finalised by the Phase 0 audit): `crates/{core, platform, games, sources, archive, storage, cli}`,
-`app/` (Tauri 2 + frontend). Frontend stack is chosen in Phase 0.
+Provisional layout (finalised by the Phase 0 audit): `crates/{core, platform, games, archive, storage, workspace, cli}`,
+`app/` (Tauri 2 + frontend, separate workspace). Frontend stack is chosen in Phase 0.
 
 ## Language allocation
 
