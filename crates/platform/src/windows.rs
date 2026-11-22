@@ -2674,7 +2674,7 @@ mod root {
             let mut granted = 0u32;
             let mut decided = 0u32;
             for (deny, _flags, ace_mask, ace_sid) in entries {
-                if ace_sid != sid {
+                if *ace_sid != sid {
                     continue;
                 }
                 let applicable = *ace_mask & mask & !decided;
