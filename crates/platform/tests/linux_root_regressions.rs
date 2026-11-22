@@ -239,9 +239,11 @@ fn post_open_reverification_refuses_a_substituted_root_and_leaf() {
     verify_private_directory(&root, &pinned).unwrap();
     catalog.verify(&pinned).unwrap();
 
-    // SQLite opens the pathname after this point. A replaced directory makes
-    // every name-resolved open (main file and sidecars) land elsewhere; the
-    // re-proof after the open must refuse rather than keep writing.
+    // SQLite opens the pathname after this point. The path goes through the
+    // pinned directory inode under `/proc/self/fd`, so renaming the verified
+    // directory cannot redirect it; the root re-proof must still refuse the
+    // changed pathname. The reachable substitution is a leaf or sidecar name
+    // inside the pinned directory, proven below.
     fs::rename(&root, base.path().join("app-data-old")).unwrap();
     fs::create_dir(&root).unwrap();
     assert_eq!(

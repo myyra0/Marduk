@@ -106,12 +106,16 @@ pub fn verify_private_directory(path: &Path, handle: &std::fs::File) -> Result<(
 /// The held handle is the authority for the leaf's identity. On Windows it
 /// deliberately does not share delete access, so the operating system refuses
 /// a rename or replacement of the leaf while the catalog is open. On Linux the
-/// handle is an `openat2`-pinned descriptor; SQLite still resolves the main
-/// file and its `-wal`/`-shm`/`-journal` sidecars by pathname, so a
-/// same-privilege substitution of the verified directory between the final
-/// re-proof and SQLite's own open is the documented residual window. Callers
-/// re-prove the directory and this leaf immediately after every pathname-based
-/// SQLite open.
+/// handle is an `openat2`-pinned descriptor, and SQLite's
+/// `/proc/self/fd/<dirfd>/catalog.sqlite3` pathname resolves through that
+/// directory inode, so renaming the verified directory cannot redirect it.
+/// The reachable vector is replacing `catalog.sqlite3` or planting a
+/// `-wal`/`-shm`/`-journal` name inside the pinned directory between the final
+/// re-proof and SQLite's own open; SQLite is not opened with
+/// `SQLITE_OPEN_NOFOLLOW`, so a symlinked leaf is followed before the
+/// post-open proof refuses. `journal_reopen_refuses_a_catalog_replaced_by_a_link`
+/// witnesses that leaf substitution. Callers re-prove the directory and this
+/// leaf immediately after every pathname-based SQLite open.
 pub struct PrivateFile {
     inner: native::PrivateFile,
 }

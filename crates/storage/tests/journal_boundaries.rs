@@ -440,13 +440,25 @@ fn journal_reopen_refuses_a_substituted_app_root() {
     std::fs::rename(&moved, &root).unwrap();
 }
 
+/// Plant a symlinked catalog leaf before any handle pins it.
+///
+/// A rename failure other than a fresh root's missing catalog means the leaf
+/// was already held open (on Windows the non-deleting handle refuses the
+/// rename), so the substitution would be silently skipped. Panic instead of
+/// letting a witness pass without it.
 #[cfg(windows)]
 fn redirected_catalog(dir: &Path) -> Option<std::path::PathBuf> {
     let outside = dir.join("outside.sqlite3");
     std::fs::write(&outside, b"outside").unwrap();
     let catalog = dir.join(DB);
-    if std::fs::rename(&catalog, dir.join("moved.sqlite3")).is_err() {
+    match std::fs::rename(&catalog, dir.join("moved.sqlite3")) {
+        Ok(()) => {}
         // A fresh root has no catalog yet.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!(
+            "the leaf substitution must be planted before the catalog handle exists, \
+             but renaming the catalog failed: {error}"
+        ),
     }
     match std::os::windows::fs::symlink_file(&outside, &catalog) {
         Ok(()) => Some(outside),
@@ -470,16 +482,19 @@ fn bootstrap_refuses_a_redirected_catalog_leaf() {
     assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
 }
 
+/// A swap inside the reopen window is not testable in-process on Windows: the
+/// held catalog handle refuses the rename that would plant it. Plant the leaf
+/// substitution before any handle exists and prove the open refuses it, so the
+/// witness cannot pass without substituting.
 #[cfg(windows)]
 #[test]
 fn reopen_refuses_a_redirected_catalog_leaf() {
     let dir = fixture_v1();
-    let mut journal = open_fixture(&dir);
     let Some(outside) = redirected_catalog(dir.path()) else {
         return;
     };
 
-    assert!(journal.reopen().is_err());
+    assert!(OperationJournal::open(dir.path()).is_err());
     assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
 }
 

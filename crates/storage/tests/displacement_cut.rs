@@ -229,8 +229,9 @@ fn unreadable_target_is_not_reported_as_displacement() {
         .unwrap()
         .unwrap();
     assert_eq!(status.blocker, Some(DeployError::RecoveryConflict));
-    // The unreadable target also hides the canonical retain; the observation
-    // is kept but is not advertised as a retention or treated as a conflict.
+    // An unreadable slot is not advertised as a retention, and any
+    // non-readable latest observation is unresolved evidence, so status
+    // reports `RecoveryConflict`.
     assert!(journal.has_unresolved_displacement(op).unwrap());
     let preserved = journal.unexpected_displacements(op).unwrap();
     assert_eq!(preserved.len(), 1);
@@ -630,6 +631,105 @@ fn alternate_slot_later_unreadability_supersedes_an_earlier_report() {
     let after = journal.status(op).unwrap().unwrap();
     assert_eq!(after.blocker, Some(DeployError::RecoveryConflict));
     assert!(!after.retained.contains(&alternate));
+    assert_eq!(effects.mutations, 0);
+}
+
+#[test]
+fn reported_canonical_displacement_survives_a_later_readable_inspection() {
+    let (dir, journal, step) = attempting_fixture();
+    let op = step.op;
+    let mut effects = MemEffects::new();
+    let displaced = MemFile {
+        bytes: EDIT.to_vec(),
+        fingerprint: fingerprint(EDIT, 42),
+    };
+    effects.backups.insert(step.retain, displaced.clone());
+    drop(journal);
+
+    let mut journal = OperationJournal::open(dir.path()).unwrap();
+    let first = recover_pending(&mut journal, &mut effects, &root(1), &root(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.blocker, Some(DeployError::RecoveryConflict));
+    assert!(first.retained.contains(&step.retain));
+
+    // The slot now reads exactly as the step expects. A clean inspection may
+    // supersede only an unreadable latest observation, so this positive report
+    // stays authoritative until it is reviewed.
+    effects.backups.insert(
+        step.retain,
+        MemFile {
+            bytes: BASE.to_vec(),
+            fingerprint: fingerprint(BASE, 10),
+        },
+    );
+    let second = recover_pending(&mut journal, &mut effects, &root(1), &root(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.blocker, Some(DeployError::RecoveryConflict));
+    assert!(second.retained.contains(&step.retain));
+    assert!(journal.has_unresolved_displacement(op).unwrap());
+    let entries = journal.unexpected_displacements(op).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].0, step.retain);
+    assert_eq!(
+        entries[0].1.retained,
+        Artifact::Regular(displaced.fingerprint.clone())
+    );
+    assert_eq!(
+        journal.finish(op, Finalize::RolledBack),
+        Err(DeployError::RecoveryConflict)
+    );
+    assert_eq!(effects.mutations, 0);
+}
+
+#[test]
+fn reported_alternate_displacement_survives_a_later_absent_inspection() {
+    let (dir, journal, step) = attempting_fixture();
+    let op = step.op;
+    let alternate = step.alternate_displacement();
+    let mut effects = MemEffects::new();
+    effects.backups.insert(
+        step.retain,
+        MemFile {
+            bytes: BASE.to_vec(),
+            fingerprint: fingerprint(BASE, 10),
+        },
+    );
+    let displaced = MemFile {
+        bytes: EDIT.to_vec(),
+        fingerprint: fingerprint(EDIT, 42),
+    };
+    effects.backups.insert(alternate, displaced.clone());
+    drop(journal);
+
+    let mut journal = OperationJournal::open(dir.path()).unwrap();
+    let first = recover_pending(&mut journal, &mut effects, &root(1), &root(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.blocker, Some(DeployError::RecoveryConflict));
+    assert!(first.retained.contains(&alternate));
+
+    // The detection slot now reads absent as expected. That clean inspection
+    // must not erase the earlier positive report.
+    effects.backups.remove(&alternate);
+    let second = recover_pending(&mut journal, &mut effects, &root(1), &root(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.blocker, Some(DeployError::RecoveryConflict));
+    assert!(second.retained.contains(&alternate));
+    assert!(journal.has_unresolved_displacement(op).unwrap());
+    let entries = journal.unexpected_displacements(op).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].0, alternate);
+    assert_eq!(
+        entries[0].1.retained,
+        Artifact::Regular(displaced.fingerprint.clone())
+    );
+    assert_eq!(
+        journal.finish(op, Finalize::RolledBack),
+        Err(DeployError::RecoveryConflict)
+    );
     assert_eq!(effects.mutations, 0);
 }
 

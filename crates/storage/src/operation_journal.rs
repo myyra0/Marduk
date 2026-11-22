@@ -31,8 +31,10 @@ use sha2::{Digest, Sha256};
 
 pub struct OperationJournal {
     root: PathBuf,
-    /// Pins the verified app-owned root for this journal's lifetime, so the
-    /// SQLite path cannot be redirected by a substituted ancestor.
+    /// Pins the verified app-owned root for this journal's lifetime. The
+    /// `/proc/self/fd` pathname resolves through the pinned directory inode on
+    /// Linux, so renaming that directory cannot redirect SQLite; the leaf and
+    /// sidecar names inside it remain name-resolved.
     _root_handle: File,
     /// Pins the catalog leaf across bootstrap and reopen.
     catalog: marduk_platform::PrivateFile,
@@ -1668,8 +1670,9 @@ fn write_displacement(
 }
 
 /// Keep a readable, expected inspection of a slot only when that slot already
-/// has history. A slot that was never reported needs no row, and the absence of
-/// history keeps normal recovery writes unchanged.
+/// has history and its latest row is unreadable. A slot that was never
+/// reported needs no row, and a positive displacement report stays
+/// authoritative until an operator reviews it.
 fn write_readable_slot(
     transaction: &Transaction<'_>,
     op: i64,
@@ -1682,10 +1685,11 @@ fn write_readable_slot(
             "INSERT INTO displacement_observations
              (operation_id, ordinal, direction, reported_ref, evidence, slot_state)
          SELECT ?1, ?2, ?3, ?4, ?5, ?6
-         WHERE EXISTS (
-             SELECT 1 FROM displacement_observations
+         WHERE ?7 = (
+             SELECT slot_state FROM displacement_observations
              WHERE operation_id = ?1 AND ordinal = ?2 AND direction = ?3
                AND reported_ref = ?4
+             ORDER BY seq DESC LIMIT 1
          )",
             params![
                 op,
@@ -1693,7 +1697,8 @@ fn write_readable_slot(
                 direction_tag(step.direction),
                 encode_backup(at),
                 encode_evidence(evidence),
-                SlotState::Readable as i64
+                SlotState::Readable as i64,
+                SlotState::Unknown as i64
             ],
         )
         .map_err(|_| DeployError::Io)?;
