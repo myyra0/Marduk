@@ -72,7 +72,21 @@ Wired: private staging (private archive snapshot, admitted member set, hashed pa
 | `crates/workspace/tests/workflow.rs::import_preview_and_apply_round_trip_on_a_qualified_volume` | tmpfs or Btrfs | `TMPDIR=/tmp cargo test --locked -p marduk-workspace` | passed; preview stages, apply publishes the recorded revision once, replay returns the same snapshot |
 | `library_catalog_never_names_missing_payload` (`tests/platform/m1/native-publication/library.rs:134`) | tmpfs or Btrfs | `python tests/platform/m1/native-publication/run.py <scratch>` | `not run` in this continuation; the table row above stays `not run` |
 
-The runtime evidence behind the accepted magic set is the tmpfs/Btrfs effect table at the top of this document plus the catalog staging witnesses above. No ext4 or native NTFS catalog run exists; those cells stay `not run`.
+Library-staging witnesses. The Linux row is the catalog witness the record proves; the eight Windows rows are the recorded `library_staging_witnesses` suite, of which the record names two.
+
+| Staging witness | Linux Btrfs | Linux tmpfs | Hosted `windows-2025` NTFS |
+|---|---|---|---|
+| `qualified_volume_stages_the_payload_through_the_production_catalog` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run |
+| `staged_revision_keeps_real_bytes_private_and_reobserves_after_reopen` | not run | not run | ran 2026-11-22, passed |
+| `redirected_revisions_is_refused_without_writes` | not run | not run | ran 2026-11-22, passed |
+| `redirected_revision_path_is_refused_without_writes` | not run | not run | ran 2026-11-22, passed |
+| `redirected_payload_during_owner_record_is_refused_without_writes` | not run | not run | ran 2026-11-22, passed |
+| `reclaim_removes_a_verified_private_stage` | not run | not run | ran 2026-11-22, passed |
+| `reobserve_refuses_a_changed_bound_entry` | not run | not run | ran 2026-11-22, passed |
+| `reobserve_refuses_an_added_payload_file` | not run | not run | ran 2026-11-22, passed |
+| `reobserve_refuses_a_revision_redirected_while_unbound` | not run | not run | ran 2026-11-22, passed |
+
+The runtime evidence behind the accepted magic set is the tmpfs/Btrfs effect table at the top of this document plus the catalog staging witnesses above. No ext4 or native NTFS catalog run exists; those cells stay `not run`. `VolumeClass::Other` is the catch-all: a new filesystem needs a `volume_class` mapping branch, a `PROOFS` row and a staging-matrix row; an unmapped magic stays unproven for every capability (`crates/platform/src/linux_root_tests.rs`).
 
 Windows product availability stays closed: the record's NTFS proofs reach only the staging and primitive layers, so `library_volume_qualified` and `effects_volume_qualified` are `false` and deploy-level NTFS rows remain `not run`. The private staging adapter itself is implemented and was re-run on NTFS after the 2026-11-22 review fixes:
 

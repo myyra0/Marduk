@@ -75,6 +75,24 @@ fn library_staging_refuses_an_unrecognised_magic() {
 }
 
 #[test]
+fn an_unrecognised_magic_maps_to_other_and_stays_unproven() {
+    let class = volume_class(0x1234_5678);
+    assert_eq!(class, VolumeClass::Other);
+    for capability in [
+        Capability::LibraryStaging,
+        Capability::EffectPrimitives,
+        Capability::NativeEffects,
+    ] {
+        for route in [Route::Adapter, Route::Import, Route::Deploy, Route::Restore] {
+            assert!(
+                !available(capability, route, Os::Linux, class),
+                "{capability} {route:?} on an unrecognised Linux magic"
+            );
+        }
+    }
+}
+
+#[test]
 fn library_volume_qualification_reads_the_observed_root() {
     let directory = scratch();
     let file = open_directory(directory.path()).expect("scratch directory");

@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use marduk_core::qualification::{Os, PROOFS, Proof, VolumeClass, missing_witness};
+use marduk_core::qualification::{Capability, Os, PROOFS, Proof, VolumeClass, missing_witness};
 
 const EVIDENCE: &str = "docs/research/m1-native-results.md";
 
@@ -88,6 +88,7 @@ fn collect_defined_names(directory: &Path, names: &mut BTreeSet<String>) {
 
 /// A parsed evidence matrix: header columns mapped to configurations.
 struct Matrix {
+    first_header: String,
     columns: Vec<(usize, Option<(Os, VolumeClass)>)>,
     rows: Vec<(usize, Vec<String>)>,
 }
@@ -193,7 +194,11 @@ fn matrices(text: &str) -> Vec<Matrix> {
                 (column, configuration)
             })
             .collect();
-        matrices.push(Matrix { columns, rows });
+        matrices.push(Matrix {
+            first_header: header_cells.first().cloned().unwrap_or_default(),
+            columns,
+            rows,
+        });
     }
     matrices
 }
@@ -347,6 +352,72 @@ fn primitive_cells(text: &str) -> BTreeMap<(String, Os, VolumeClass), Status> {
     observed
 }
 
+/// The `LibraryStaging` witness matrix. It is the only matrix whose first
+/// header is the staging-witness column, and it must carry a column for every
+/// configuration a staging proof names today.
+fn staging_cells(text: &str) -> BTreeMap<(String, Os, VolumeClass), (usize, Status)> {
+    let mut selected: Vec<Matrix> = matrices(text)
+        .into_iter()
+        .filter(|matrix| matrix.first_header.eq_ignore_ascii_case("Staging witness"))
+        .collect();
+    assert_eq!(
+        selected.len(),
+        1,
+        "{EVIDENCE}: expected exactly one staging witness matrix, found {}",
+        selected.len()
+    );
+    let matrix = selected.pop().expect("one selected matrix");
+    for required in [
+        (Os::Linux, VolumeClass::Btrfs),
+        (Os::Linux, VolumeClass::Tmpfs),
+        (Os::Windows, VolumeClass::Ntfs),
+    ] {
+        assert!(
+            matrix
+                .columns
+                .iter()
+                .any(|(_, config)| *config == Some(required)),
+            "{EVIDENCE}: the staging matrix has no {} {} column",
+            required.0,
+            required.1
+        );
+    }
+    let mut observed = BTreeMap::new();
+    for (line, row) in &matrix.rows {
+        assert_eq!(
+            row.len(),
+            matrix.columns.len(),
+            "{EVIDENCE}:{line}: row has {} cells, header has {}",
+            row.len(),
+            matrix.columns.len()
+        );
+        let witness = witness_name(&row[0]).unwrap_or_else(|| {
+            panic!(
+                "{EVIDENCE}:{line}: first cell must be one backticked witness name, found {:?}",
+                row[0]
+            )
+        });
+        assert!(
+            !witness.is_empty() && !witness.contains(' '),
+            "{EVIDENCE}:{line}: first cell must be one backticked witness name, found {:?}",
+            row[0]
+        );
+        let witness = witness.to_string();
+        for (column, config) in &matrix.columns {
+            let Some((os, volume)) = config else {
+                continue;
+            };
+            let status = parse_status(*line, &witness, &row[*column]);
+            let previous = observed.insert((witness.clone(), *os, *volume), (*line, status));
+            assert!(
+                previous.is_none(),
+                "{EVIDENCE}:{line}: `{witness}` appears twice in the staging matrix for {os} {volume}"
+            );
+        }
+    }
+    observed
+}
+
 fn proofs_naming(witness: &str) -> Vec<&'static Proof> {
     PROOFS
         .iter()
@@ -416,6 +487,66 @@ fn the_record_and_the_evidence_document_agree() {
                  does not record a pass for it; run the test or withdraw the proof"
             ),
         }
+    }
+}
+
+#[test]
+fn staging_evidence_matches_the_library_staging_proofs() {
+    let text = evidence_text();
+    let cells = staging_cells(&text);
+    let proofs: Vec<&Proof> = PROOFS
+        .iter()
+        .filter(|proof| proof.capability == Capability::LibraryStaging)
+        .collect();
+
+    for proof in &proofs {
+        for witness in proof.witnesses {
+            assert!(
+                cells.keys().any(|(name, _, _)| name == witness),
+                "{EVIDENCE} has no staging matrix row for `{witness}`, which the availability \
+                 record proves for {} on {} {}; add the row or withdraw the proof",
+                proof.capability,
+                proof.os,
+                proof.volume
+            );
+        }
+    }
+
+    for proof in &proofs {
+        for witness in proof.witnesses {
+            let (line, status) = cells
+                .get(&(witness.to_string(), proof.os, proof.volume))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{EVIDENCE}: the staging matrix has no `{witness}` cell for {} {}",
+                        proof.os, proof.volume
+                    )
+                });
+            assert!(
+                *status != Status::Unrun,
+                "{EVIDENCE}:{line}: `{witness}` is `not run` on {} {}, but the availability \
+                 record proves {} there; run the test or withdraw the proof",
+                proof.os,
+                proof.volume,
+                proof.capability
+            );
+        }
+    }
+
+    for ((witness, os, volume), (line, status)) in &cells {
+        if *status != Status::Ran {
+            continue;
+        }
+        let recorded = proofs
+            .iter()
+            .any(|proof| proof.os == *os && proof.volume == *volume);
+        assert!(
+            recorded,
+            "{EVIDENCE}:{line}: the staging matrix records `{witness}` as ran and passed on \
+             {os} {volume}, but the availability record has no {} proof for that configuration; \
+             add the proof or correct the row",
+            Capability::LibraryStaging
+        );
     }
 }
 
