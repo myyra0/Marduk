@@ -92,7 +92,7 @@ Base `8110c38`. `NativeStage` now keeps every archive and payload effect on the 
 - `MARDUK_M1_BTRFS_SCRATCH=/var/tmp cargo test -p marduk-platform --test library_boundary` — 8 witnesses ignored without `--ignored` (none pass silently); with `--ignored --test-threads=1`, 8 passed. (The suite has since grown to 10 witnesses; the qualified re-run records 10 passed.)
 - New witnesses redirect a staged revision after its handle was opened and require `StageChanged`/`StageUnavailable` from `reobserve` and `reclaim` with the redirect target untouched and the original revision retained.
 - `TMPDIR=/tmp cargo test -p marduk-platform`, `TMPDIR=/tmp cargo test -p marduk-storage`, `cargo fmt --all -- --check`, `cargo build --workspace --locked`, `TMPDIR=/tmp cargo test --workspace --locked` — passed.
-- Windows compile check passed; Windows/NTFS staging remains `Unsupported(Configuration)`. `Catalog::open` connects native staging on qualified Linux volumes only (see above); no native Apply is connected.
+- Windows compile check passed; Windows/NTFS staging remains `Unsupported(Configuration)`. `Catalog::open` connects native staging on qualified Linux volumes only (see above). Apply/Restore status is stated once in the Task 6 section below.
 
 **Known limitation (accepted by the 2026-11-22 user ruling):** On Linux and Windows, a same-privilege process can substitute the parent or leaf between the final live-handle check and the syscall. The [R02 contract](../contracts/m1-recovery.md#native-seam-that-r03-must-qualify) requires post-effect reobservation to detect divergence, retention of actually displaced bytes, and refusal to retry automatically on divergence. It does not claim prevention. A syscall error is not evidence of no change.
 
@@ -131,8 +131,12 @@ classes.
 | `unqualified_installation_root_is_refused_before_any_write` | ran 2026-11-22 at `101b4f7`, passed (procfs installation) | ran 2026-11-22 at `101b4f7`, passed (procfs installation) | not run | not run |
 | `unqualified_app_root_is_refused_before_any_write` | ran 2026-11-22 at `101b4f7`, passed (sysfs app root) | ran 2026-11-22 at `101b4f7`, passed (sysfs app root) | not run | not run |
 | `unreadable_private_slot_is_unavailable_not_absent` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
-| `prepare_persists_private_artifacts_before_publication` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
-| `dispatch_stays_typed_unavailable_after_native_composition` (preview, apply and restore) | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
+| `prepared_private_artifacts_are_durable_and_unpublished` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run |
+| `private_chain_is_synced_before_the_first_public_effect` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run |
+| `sync_chain_stops_at_the_resolved_root_for_a_symlinked_library_spelling` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run |
+| `unqualified_root_answers_a_claimed_plan_and_pending_restore` (workspace) | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run |
+| `clean_unqualified_root_answers_before_opening_a_native_port` (workspace) | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run |
+| `dispatch_stays_typed_unavailable_after_native_composition` (preview, apply and restore) | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run |
 
 The workspace round trip uses disposable synthetic roots only. It verifies the
 deployed bytes, the retained `original` backups for replaced files, the absent
@@ -181,10 +185,10 @@ both qualified volumes afterwards: 7 passed on each.
 
 ### Commands
 
-- `TMPDIR=/tmp cargo test -p marduk-storage --test native_effects -- --ignored --test-threads=1` — 10 passed at `101b4f7`.
-- `TMPDIR=/var/tmp cargo test -p marduk-storage --test native_effects -- --ignored --test-threads=1` — 10 passed at `101b4f7`.
-- `TMPDIR=/tmp cargo test -p marduk-workspace --test native_deployment -- --ignored --test-threads=1` — 2 passed at `101b4f7`.
-- `TMPDIR=/var/tmp cargo test -p marduk-workspace --test native_deployment -- --ignored --test-threads=1` — 2 passed at `101b4f7`.
+- `TMPDIR=/tmp cargo test -p marduk-storage --test native_effects -- --ignored --test-threads=1` — 12 passed after the re-review fix.
+- `TMPDIR=/var/tmp cargo test -p marduk-storage --test native_effects -- --ignored --test-threads=1` — 12 passed after the re-review fix.
+- `TMPDIR=/tmp cargo test -p marduk-workspace --test native_deployment -- --ignored --test-threads=1` — 4 passed after the re-review fix.
+- `TMPDIR=/var/tmp cargo test -p marduk-workspace --test native_deployment -- --ignored --test-threads=1` — 4 passed after the re-review fix.
 - `TMPDIR=/tmp` and `TMPDIR=/var/tmp cargo test -p marduk-storage --test qualified_stage -- --ignored` — 1 passed on each.
 - `MARDUK_R03_SCRATCH=/tmp` and `/var/tmp cargo test -p marduk-platform --test native_proof_evidence -- --test-threads=1` — 7 passed on each.
 - `MARDUK_R03_SCRATCH=/tmp` and `/var/tmp cargo test -p marduk-platform --test native_publication -- --test-threads=1` — 8 passed, 1 ignored on each after the `futimens` correction.

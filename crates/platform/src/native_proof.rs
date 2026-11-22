@@ -69,8 +69,8 @@ fn key(op: OperationId, ordinal: u32, direction: StepDirection) -> StepKey {
 
 struct StepRecord {
     staged: Option<Fingerprint>,
-    /// A replace uses `RENAME_EXCHANGE`/`ReplaceFileW`, so its former stage
-    /// slot is the canonical displaced-retain alias.
+    /// A replace uses `RENAME_EXCHANGE`; Windows refuses the configuration.
+    /// Its former stage slot is the canonical displaced-retain alias.
     exchange: bool,
     pre: PreState,
 }

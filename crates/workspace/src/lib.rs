@@ -19,7 +19,7 @@ use selection::{SelectionStore, Source};
 use marduk_core::deployment::{
     DeployError, OperationKind, OperationStatus, Phase, PlanId, PreState,
 };
-use marduk_core::ids::{InstalledRevisionId, MemberId, ProfileId, ProfileRevision};
+use marduk_core::ids::{MemberId, ProfileId, ProfileRevision};
 use marduk_core::import::NamedProfile;
 use marduk_core::import::{
     ArchiveError, BeginImport, ImportError, ImportId, ImportTarget, LimitKind, PreparedImport,
@@ -720,26 +720,41 @@ impl Workspace {
             &selected.data,
         )
         .map_err(deploy_error)?;
-        let members = &named.snapshot.members;
-        let member_for = |installed: InstalledRevisionId| {
-            members
-                .iter()
-                .find(|member| member.installed == installed)
-                .map(|member| member.id)
-                .ok_or_else(|| WireError::new(Code::StalePlan))
-        };
+        // Rebuild the candidate list from the same resolver inputs. The plan
+        // carries only the winning source, so this is where losing candidates
+        // (including two members that share one installed revision) stay
+        // visible in the preview.
+        let resolved = marduk_core::resolve::resolve_files(&named.snapshot, &inputs)
+            .map_err(|_| WireError::new(Code::StalePlan))?;
         let files = plan
             .intents
             .iter()
             .map(|intent| {
-                let winner = member_for(intent.source.installed)?;
+                let entry = resolved
+                    .entries
+                    .iter()
+                    .find(|entry| {
+                        entry.target.relative.as_str() == intent.target.target.relative.as_str()
+                    })
+                    .ok_or_else(|| WireError::new(Code::StalePlan))?;
+                let winner = entry
+                    .candidates
+                    .last()
+                    .ok_or_else(|| WireError::new(Code::StalePlan))?;
+                if winner.installed != intent.source.installed {
+                    return Err(WireError::new(Code::StalePlan));
+                }
                 Ok(PreviewFile {
                     target: Target {
                         role: Role::Data,
                         path: intent.target.target.relative.as_str().to_owned(),
                     },
-                    winner: decimal(winner.get()),
-                    candidates: vec![decimal(winner.get())],
+                    winner: decimal(winner.member.get()),
+                    candidates: entry
+                        .candidates
+                        .iter()
+                        .map(|candidate| decimal(candidate.member.get()))
+                        .collect(),
                     needs_backup: matches!(intent.original, PreState::Regular(_)),
                 })
             })
@@ -862,6 +877,16 @@ impl Workspace {
     #[doc(hidden)]
     pub fn proof_recover_pending(&mut self) -> Result<Option<Operation>, WireError> {
         let selected = self.selected_pair()?;
+        // No pending operation means no native work. Answer before opening the
+        // port so a clean but unqualified root reports `None`, not a volume
+        // refusal.
+        let state = self
+            .journal
+            .root_state(&selected.data)
+            .map_err(deploy_error)?;
+        if state.pending.is_none() {
+            return Ok(None);
+        }
         let mut port = self.native_effects(&selected)?;
         marduk_core::recovery::recover_pending(
             &mut self.journal,

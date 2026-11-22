@@ -155,8 +155,9 @@ impl Catalog {
 
     /// Load the installed-revision manifests for one profile, in the shape the
     /// deployment resolver consumes. Membership is read from the same
-    /// transaction as the files; a revision with no recorded files yields an
-    /// empty manifest rather than being silently omitted.
+    /// transaction as the files. A revision with no recorded files yields an
+    /// empty manifest; a revision absent from the catalog is omitted, so the
+    /// resolver reports `MissingManifest` for it.
     pub fn resolved_inputs(&mut self, profile: ProfileId) -> Result<ResolvedInputs, ImportError> {
         let transaction = self.connection.transaction().map_err(storage_error)?;
         let snapshot = read_snapshot(&transaction, profile)?;

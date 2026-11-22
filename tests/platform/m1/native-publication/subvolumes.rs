@@ -113,9 +113,9 @@ fn prove(game: &Path, library: &Path, substitute: &Path, old_game: &Path) {
                 );
                 observed_calls.set(observed_calls.get() + 1);
             }
-            Checkpoint::AfterNativeEffect {
-                raw_error: Some(libc::EXDEV),
-            } => panic!("port received EXDEV"),
+            // `effects::replace` maps its error to `RootError`, so this
+            // checkpoint no longer carries `raw_error`; an EXDEV-style raw
+            // error cannot reach this callback.
             _ => {}
         }
         Fault::None

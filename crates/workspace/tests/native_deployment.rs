@@ -15,7 +15,11 @@ use std::path::{Path, PathBuf};
 
 use marduk_core::deployment::PlanId;
 use marduk_core::ids::ProfileRevision;
-use marduk_workspace::{Code, Envelope, RestoreResult, Workspace, WorkspaceStatus};
+use marduk_core::recovery::{Claim, Journal};
+use marduk_storage::operation_journal::OperationJournal;
+use marduk_workspace::{
+    Code, Envelope, Kind, Operation, RestoreResult, Workspace, WorkspaceStatus,
+};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use zip_fixture::{ClassicZip, Record};
@@ -111,6 +115,49 @@ impl Fixture {
         .bytes;
         fs::write(&path, bytes).unwrap();
         path
+    }
+
+    /// Setup, import and deploy one pair, returning the reviewed plan and the
+    /// committed operation.
+    fn apply_one(&mut self) -> (PlanId, Operation) {
+        self.setup();
+        let zip = self.zip();
+        let prepared = expect_ok(self.send(json!({
+            "op": "import_preview",
+            "args": {
+                "zip": zip.to_str().unwrap(),
+                "name": "Native pair",
+                "atRevision": "0",
+            },
+        })));
+        let imported = expect_ok(self.send(json!({
+            "op": "import_apply",
+            "args": { "importId": prepared["id"] },
+        })));
+        let ordered = expect_ok(self.send(json!({
+            "op": "order",
+            "args": {
+                "atRevision": imported["revision"],
+                "memberIds": [imported["members"][0]["id"].as_str().unwrap()],
+            },
+        })));
+        let revision: u64 = ordered["revision"].as_str().unwrap().parse().unwrap();
+        let preview = self
+            .workspace
+            .proof_preview_deployment(ProfileRevision::new(revision))
+            .unwrap();
+        let plan = PlanId::try_from_u64(preview.id.as_ref().unwrap().parse().unwrap()).unwrap();
+        let operation = self.workspace.proof_apply_deployment(plan).unwrap();
+        (plan, operation)
+    }
+
+    /// Replace the app-data root with a link the effect probe refuses. Open
+    /// handles keep working; only a new port asks for the volume class.
+    fn make_root_unqualified(&self) -> PathBuf {
+        let real = self.temp.path().join("app-real");
+        fs::rename(&self.app, &real).unwrap();
+        std::os::unix::fs::symlink("/sys/kernel", &self.app).unwrap();
+        real
     }
 }
 
@@ -221,6 +268,71 @@ fn qualified_native_round_trip_retains_backups_and_restores_the_original_tree() 
         RestoreResult::NoActiveDeployment { code } if code == Code::NoActiveDeployment
     ));
     assert_eq!(tree(&fixture.game), fixture.initial);
+}
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn unqualified_root_answers_a_claimed_plan_and_pending_restore() {
+    let mut fixture = Fixture::new();
+    let (plan, applied) = fixture.apply_one();
+    assert_eq!(applied.phase, "completed");
+
+    // Leave a claimed Restore in the journal without running it, then make any
+    // new native port refuse the app root.
+    let binding =
+        marduk_platform::bind_installation(&fixture.game, &marduk_games::skyrim_se::LAYOUT)
+            .unwrap();
+    let (installation, data) = binding.identities();
+    let (installation, data) = (installation.clone(), data.clone());
+    drop(binding);
+    let mut journal = OperationJournal::open(&fixture.app).unwrap();
+    let generation = journal
+        .root_state(&data)
+        .unwrap()
+        .active
+        .expect("apply leaves an active generation");
+    let pending = journal
+        .claim(Claim::Restore {
+            installation,
+            data,
+            generation,
+        })
+        .unwrap();
+    let _real = fixture.make_root_unqualified();
+
+    // The recorded plan and its terminal status come from the journal, not a
+    // reopened volume.
+    let replay = fixture.workspace.proof_apply_deployment(plan).unwrap();
+    assert_eq!(replay.id, applied.id);
+    assert_eq!(replay.phase, "completed");
+
+    // The pending Restore is reported by id instead of `UnsupportedTarget`.
+    let restore = fixture.workspace.proof_restore().unwrap();
+    let RestoreResult::Operation { operation } = restore else {
+        panic!("expected the recorded pending restore, got {restore:?}");
+    };
+    assert_eq!(operation.id, pending.get().to_string());
+    assert!(matches!(operation.kind, Kind::Restore));
+}
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn clean_unqualified_root_answers_before_opening_a_native_port() {
+    let mut fixture = Fixture::new();
+    fixture.apply_one();
+    let restored = fixture.workspace.proof_restore().unwrap();
+    assert!(matches!(
+        restored,
+        RestoreResult::Operation { operation } if operation.phase == "completed"
+    ));
+    let _real = fixture.make_root_unqualified();
+
+    let restore = fixture.workspace.proof_restore().unwrap();
+    assert!(matches!(
+        restore,
+        RestoreResult::NoActiveDeployment { code } if code == Code::NoActiveDeployment
+    ));
+    assert!(fixture.workspace.proof_recover_pending().unwrap().is_none());
 }
 
 #[test]

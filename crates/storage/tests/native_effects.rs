@@ -9,7 +9,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use marduk_core::deployment::{BoundTarget, DeployError, DeploymentInputs, OperationId, PreState};
+use marduk_core::deployment::{
+    BoundTarget, DeployError, DeploymentInputs, OperationId, PreState, commit_deployment,
+};
 use marduk_core::ids::{InstalledRevisionId, MemberId, ProfileId, ProfileRevision};
 use marduk_core::profiles::{ProfileMember, ProfileSnapshot};
 use marduk_core::recovery::{
@@ -19,7 +21,7 @@ use marduk_core::recovery::{
 use marduk_core::resolve::ResolvedInputs;
 use marduk_core::root_identity::{Fingerprint, GameLayout, RootIdentity};
 use marduk_core::targets::{RelativePath, RootRole, TargetFile};
-use marduk_storage::native_effects::NativeEffects;
+use marduk_storage::native_effects::{NativeEffects, ProofEvent};
 use marduk_storage::operation_journal::OperationJournal;
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -739,7 +741,7 @@ fn unreadable_private_slot_is_unavailable_not_absent() {
 
 #[test]
 #[ignore = "requires TMPDIR on tmpfs or Btrfs"]
-fn prepare_persists_private_artifacts_before_publication() {
+fn prepared_private_artifacts_are_durable_and_unpublished() {
     let fixture = Fixture::new();
     let mut journal = fixture.journal();
     let mut port = fixture.adapter();
@@ -806,6 +808,97 @@ fn prepare_persists_private_artifacts_before_publication() {
     .unwrap();
     assert_eq!(status.phase, marduk_core::deployment::Phase::Cancelled);
     assert_eq!(fs::read(fixture.target(WINNER)).unwrap(), BASE);
+}
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn private_chain_is_synced_before_the_first_public_effect() {
+    let fixture = Fixture::new();
+    let mut journal = fixture.journal();
+    let mut port = fixture.adapter();
+    port.proof_record_events();
+    let plan = marduk_core::deployment::preview_deployment(
+        &mut journal,
+        &mut port,
+        &profile(),
+        &inputs(),
+        &fixture.installation,
+        &fixture.data,
+    )
+    .unwrap();
+    let status = commit_deployment(&mut journal, &mut port, plan.id, || false).unwrap();
+    assert_eq!(status.phase, marduk_core::deployment::Phase::Completed);
+
+    let events = port.proof_events().expect("recording was enabled");
+    let first_effect = events
+        .iter()
+        .position(|event| matches!(event, ProofEvent::PublicEffect))
+        .expect("the commit publishes at least one file");
+    let before = &events[..first_effect];
+    let app = fs::canonicalize(&fixture.app).unwrap();
+    for ordinal in 0..plan.intents.len() {
+        let directory = fixture.effect_dir(status.id, u32::try_from(ordinal).unwrap());
+        let mut current = Some(directory.as_path());
+        while let Some(path) = current {
+            let resolved = fs::canonicalize(path).unwrap();
+            assert!(
+                before.iter().any(
+                    |event| matches!(event, ProofEvent::Synced(synced) if *synced == resolved)
+                ),
+                "{} was not synced before the first public effect",
+                path.display()
+            );
+            if resolved == app {
+                break;
+            }
+            current = path.parent();
+        }
+    }
+    // The chain never crosses the app-owned root.
+    for event in events {
+        if let ProofEvent::Synced(path) = event {
+            assert!(
+                path.starts_with(&app),
+                "synced outside the app root: {}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn sync_chain_stops_at_the_resolved_root_for_a_symlinked_library_spelling() {
+    let fixture = Fixture::new();
+    let mut port = fixture.adapter();
+    let alias = fixture.temp_path().join("app-alias");
+    std::os::unix::fs::symlink(&fixture.app, &alias).unwrap();
+    let op = OperationId::try_from_u64(1).unwrap();
+    let directory = fixture.effect_dir(op, 0);
+    fs::create_dir_all(&directory).unwrap();
+
+    port.proof_record_events();
+    port.proof_sync_chain_with_library_spelling(&directory, &alias)
+        .unwrap();
+
+    let app = fs::canonicalize(&fixture.app).unwrap();
+    let above = app.parent().unwrap();
+    let synced: Vec<&Path> = port
+        .proof_events()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            ProofEvent::Synced(path) => Some(path.as_path()),
+            ProofEvent::PublicEffect => None,
+        })
+        .collect();
+    assert_eq!(synced.last().copied(), Some(app.as_path()));
+    assert!(
+        !synced.iter().any(|path| *path == above),
+        "the chain continued above the app root into {}",
+        above.display()
+    );
+    assert!(!synced.iter().any(|path| *path == Path::new("/")));
 }
 
 #[test]

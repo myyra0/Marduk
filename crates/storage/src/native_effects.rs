@@ -34,6 +34,17 @@ use marduk_platform::effects;
 use marduk_platform::{GateError, InstallationBinding, WriterGate, WriterGuard};
 use rusqlite::{Connection, OpenFlags};
 
+/// A test seam for observing the order of private durability work relative to
+/// public effects. Recording is off unless a test asks for it.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProofEvent {
+    /// `sync_directory_chain` fsynced this directory.
+    Synced(PathBuf),
+    /// A public publish, replace or detach was about to run.
+    PublicEffect,
+}
+
 /// Live native effect session for one deployment or recovery call.
 pub struct NativeEffects {
     root_handle: File,
@@ -41,6 +52,9 @@ pub struct NativeEffects {
     layout: GameLayout,
     binding: InstallationBinding,
     private: PathBuf,
+    /// The app-owned root as the pinned handle resolves it, not the spelling
+    /// the caller supplied. Directory fsyncs stop here.
+    resolved_root: PathBuf,
     library: PathBuf,
     root_gate: WriterGate,
     library_gate: WriterGate,
@@ -49,6 +63,7 @@ pub struct NativeEffects {
     /// value is copied from the sealed step whenever recovery or apply inspects
     /// it, so a restart does not depend on the map that `prepare` built.
     staged: BTreeMap<(u64, u32, StepDirection), Fingerprint>,
+    proof_events: Option<Vec<ProofEvent>>,
 }
 
 impl std::fmt::Debug for NativeEffects {
@@ -76,6 +91,10 @@ impl NativeEffects {
         );
         let private = marduk_platform::private_child_path(&root_handle, "effects")
             .map_err(|_| DeployError::Io)?;
+        let resolved_root = private
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or(DeployError::Io)?;
         let root_gate =
             WriterGate::open_at(&root_handle, crate::schema::ROOT_LOCK_FILE).map_err(gate_error)?;
         let library_gate =
@@ -86,11 +105,44 @@ impl NativeEffects {
             layout,
             binding,
             private,
+            resolved_root,
             library: app_data.to_path_buf(),
             root_gate,
             library_gate,
             staged: BTreeMap::new(),
+            proof_events: None,
         })
+    }
+
+    /// Start recording [`ProofEvent`]s. Only tests call this.
+    #[doc(hidden)]
+    pub fn proof_record_events(&mut self) {
+        self.proof_events = Some(Vec::new());
+    }
+
+    /// The recorded events, when recording was enabled.
+    #[doc(hidden)]
+    pub fn proof_events(&self) -> Option<&[ProofEvent]> {
+        self.proof_events.as_deref()
+    }
+
+    /// Run the real directory chain against an alternate library spelling.
+    /// The witness uses this to reproduce a data root reached by a symlink
+    /// without making the production entry point accept a redirected root.
+    #[doc(hidden)]
+    pub fn proof_sync_chain_with_library_spelling(
+        &mut self,
+        directory: &Path,
+        library_spelling: &Path,
+    ) -> Result<(), RootError> {
+        self.library = library_spelling.to_path_buf();
+        self.sync_directory_chain(directory)
+    }
+
+    fn trace(&mut self, event: ProofEvent) {
+        if let Some(events) = &mut self.proof_events {
+            events.push(event);
+        }
     }
 
     fn op_dir(&self, operation: u64, ordinal: u32, direction: StepDirection) -> PathBuf {
@@ -340,6 +392,7 @@ impl NativeEffects {
             Err(error) => return EffectOutcome::Unavailable(error),
         };
 
+        self.trace(ProofEvent::PublicEffect);
         let result = effects::publish(
             &stage_dir,
             "stage",
@@ -476,6 +529,7 @@ impl NativeEffects {
 
         // The exchange alias puts the actually displaced file in the stage
         // slot; that slot is the canonical retain evidence.
+        self.trace(ProofEvent::PublicEffect);
         let result = effects::replace(
             &stage_dir,
             "stage",
@@ -603,6 +657,7 @@ impl NativeEffects {
             Err(error) => return EffectOutcome::Unavailable(error),
         };
 
+        self.trace(ProofEvent::PublicEffect);
         let result = effects::detach(
             &target_directory,
             &leaf,
@@ -642,14 +697,18 @@ impl NativeEffects {
         }
     }
 
-    /// Flush an operation directory and every ancestor up to the app data root.
-    /// A new entry is only durable once its parent directory is.
-    fn sync_directory_chain(&self, directory: &Path) -> Result<(), RootError> {
+    /// Flush an operation directory and every ancestor up to the resolved
+    /// app-owned root. A new entry is only durable once its parent directory is.
+    /// The caller's spelling of the root may be relative or redirected; the
+    /// bound comes from the pinned handle, so a mismatch never walks to `/`.
+    fn sync_directory_chain(&mut self, directory: &Path) -> Result<(), RootError> {
         effects::sync_directory(directory)?;
+        self.trace(ProofEvent::Synced(directory.to_path_buf()));
         let mut current = directory.parent();
         while let Some(path) = current {
             effects::sync_directory(path)?;
-            if path == self.library {
+            self.trace(ProofEvent::Synced(path.to_path_buf()));
+            if path == self.resolved_root || path.parent().is_none() {
                 break;
             }
             current = path.parent();
@@ -657,7 +716,7 @@ impl NativeEffects {
         Ok(())
     }
 
-    fn sync_effect(&self, step: &PreparedStep) -> Result<(), RootError> {
+    fn sync_effect(&mut self, step: &PreparedStep) -> Result<(), RootError> {
         let directory = self.op_dir(step.op.get(), step.ordinal, step.direction);
         for name in ["stage", "displaced", "original", "step"] {
             let path = directory.join(name);
