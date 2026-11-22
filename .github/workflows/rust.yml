@@ -116,17 +116,23 @@ jobs:
       - run: cargo test --manifest-path app/src-tauri/Cargo.toml --locked
 
   desktop-smoke:
-    # Advisory, not a required check: this is the first run that starts the
-    # shell under a real WebKit webview, so it stays a separate job until it
-    # has been green a few times. It never gates the Rust or frontend jobs.
+    # Advisory, not a required check: this is the first job that starts the
+    # shell under a real webview on each host, so it stays a separate job until
+    # it has been green a few times. It never gates the Rust or frontend jobs.
+    # The Windows entry is advisory on the same terms and is not evidence until
+    # the hosted job has actually passed.
     #
-    # Ubuntu only for now. The environment, not the test, is the variable:
-    # xvfb supplies the display, WebKitWebDriver supplies the automation
-    # session, and libwebkit2gtk-4.1-dev supplies the build headers and the
-    # runtime. A driver that cannot attach fails the job; nothing skips.
-    name: Desktop shell smoke (ubuntu-24.04)
-    runs-on: ubuntu-24.04
+    # The environment, not the test, is the variable: on Ubuntu xvfb supplies
+    # the display and WebKitWebDriver supplies the automation session; on
+    # Windows the Edge WebDriver must match the installed WebView2 runtime.
+    # A driver that cannot attach fails the job; nothing skips.
+    name: Desktop shell smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
     defaults:
       run:
         shell: bash
@@ -140,6 +146,7 @@ jobs:
           cache: npm
           cache-dependency-path: app/package-lock.json
       - name: Install WebKitGTK build and WebDriver dependencies
+        if: matrix.os == 'ubuntu-24.04'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -156,7 +163,87 @@ jobs:
         run: cargo build --manifest-path app/src-tauri/Cargo.toml --locked --features tauri/custom-protocol
       - name: Install tauri-driver
         run: cargo install tauri-driver --locked
+      - name: Resolve and download the matching Edge WebDriver
+        if: matrix.os == 'windows-2025'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # The shell hosts the installed WebView2 runtime, so the driver must
+          # match that runtime, not the separate Edge browser build. The runtime
+          # registers its version under EdgeUpdate; the directory scan is the
+          # fallback for an install that did not write the key.
+          $clients = @(
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}',
+            'HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}',
+            'HKCU:\Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+          )
+          $version = $null
+          foreach ($key in $clients) {
+            if (Test-Path $key) {
+              $version = (Get-ItemProperty $key -Name pv -ErrorAction SilentlyContinue).pv
+              if ($version) { break }
+            }
+          }
+          if (-not $version) {
+            $runtime = Get-ChildItem 'C:\Program Files (x86)\Microsoft\EdgeWebView\Application' `
+              -Filter msedgewebview2.exe -Recurse -ErrorAction SilentlyContinue |
+              Sort-Object { [version]$_.VersionInfo.ProductVersion } -Descending |
+              Select-Object -First 1
+            if ($runtime) { $version = $runtime.VersionInfo.ProductVersion }
+          }
+          if (-not $version) {
+            throw 'WebView2 runtime version could not be resolved; cannot select a matching msedgedriver.'
+          }
+
+          Write-Host "WebView2 runtime version: $version"
+          # The driver only has to share the runtime's major version. Try the
+          # exact runtime build first, then the published driver for that major,
+          # because not every runtime patch gets its own driver zip.
+          $major = ($version -split '\.')[0]
+          $candidates = [System.Collections.Generic.List[string]]::new()
+          $candidates.Add($version)
+          $meta = Join-Path $env:RUNNER_TEMP 'edge-latest.txt'
+          try {
+            Invoke-WebRequest -Uri "https://msedgedriver.microsoft.com/LATEST_RELEASE_${major}_WINDOWS" -OutFile $meta
+            $latest = (Get-Content -Path $meta -Encoding Unicode -Raw).Trim()
+            if ($latest) { $candidates.Add($latest) }
+          } catch {
+            Write-Host "No LATEST_RELEASE_${major}_WINDOWS entry: $($_.Exception.Message)"
+          }
+
+          $driverDir = Join-Path $env:RUNNER_TEMP 'msedgedriver'
+          New-Item -ItemType Directory -Force -Path $driverDir | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP 'edgedriver_win64.zip'
+          $downloaded = $false
+          foreach ($candidate in $candidates) {
+            $url = "https://msedgedriver.microsoft.com/$candidate/edgedriver_win64.zip"
+            try {
+              Write-Host "Downloading $url"
+              Invoke-WebRequest -Uri $url -OutFile $zip
+              $downloaded = $true
+              break
+            } catch {
+              Write-Host "No driver at $url"
+            }
+          }
+          if (-not $downloaded) { throw "No msedgedriver build available for WebView2 $version (major $major)." }
+          Expand-Archive -Path $zip -DestinationPath $driverDir -Force
+
+          $driver = Join-Path $driverDir 'msedgedriver.exe'
+          if (-not (Test-Path $driver)) { throw "msedgedriver.exe was not extracted to $driver" }
+          "MSEDGEDRIVER=$driver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Clear the catalog root
+        if: matrix.os == 'windows-2025'
+        shell: pwsh
+        run: |
+          # Fresh state per run: the smoke asserts the real empty workspace.
+          # Windows resolves the roaming known folder, not the APPDATA variable,
+          # so remove the identifier directory the app will actually open.
+          $root = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'com.marduk.desktop'
+          Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
       - name: Drive the shell under a virtual display
+        if: matrix.os == 'ubuntu-24.04'
         run: |
           set -euo pipefail
           # A fresh catalog root per run: the smoke asserts the real empty state.
@@ -167,6 +254,14 @@ jobs:
           export WEBKIT_DISABLE_COMPOSITING_MODE=1
           xvfb-run --auto-servernum --server-args="-screen 0 1280x900x24" \
             tauri-driver --native-driver /usr/bin/WebKitWebDriver &
+          driver=$!
+          trap 'kill "$driver" 2>/dev/null || true' EXIT
+          npm --prefix app run smoke:desktop
+      - name: Drive the shell on Windows
+        if: matrix.os == 'windows-2025'
+        run: |
+          set -euo pipefail
+          tauri-driver --native-driver "$MSEDGEDRIVER" &
           driver=$!
           trap 'kill "$driver" 2>/dev/null || true' EXIT
           npm --prefix app run smoke:desktop

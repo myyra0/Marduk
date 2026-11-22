@@ -35,5 +35,5 @@ to retry automatically. It does not claim prevention. See the contract's "Known 
 - **ext4.** Excluded by decision. Linux deployment is qualified on Btrfs and tmpfs only.
 - **Btrfs cross-subvolume (`EXDEV`).** The subvolume case could not be torn down in the test environment, so the
   two-subvolume layout is `not run`.
-- **Windows desktop smoke.** The packaged desktop smoke runs on Ubuntu only; Windows has a native build and unit
-  tests, not a launched-shell smoke.
+- **Windows desktop smoke.** The packaged desktop smoke now has a Windows job, but the job is advisory and has not
+  been green yet. Windows launched-shell behaviour stays unproven until that hosted job passes.
