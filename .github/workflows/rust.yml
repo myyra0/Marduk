@@ -40,7 +40,15 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo build --workspace --locked
       - run: cargo test --workspace --locked
-
+      - name: Run qualified staging on tmpfs
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          sudo mkdir -p /mnt/marduk-tmpfs
+          sudo mount -t tmpfs -o size=512m tmpfs /mnt/marduk-tmpfs
+          TMPDIR=/mnt/marduk-tmpfs cargo test -p marduk-storage --test qualified_stage -- --ignored --test-threads=1
+      - name: Unmount tmpfs
+        if: always()
+        run: sudo umount /mnt/marduk-tmpfs || true
   desktop-frontend:
     name: Desktop frontend (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

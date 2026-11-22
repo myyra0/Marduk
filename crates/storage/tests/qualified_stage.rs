@@ -40,6 +40,7 @@ fn revision_dir(root: &Path, id: ImportId) -> PathBuf {
 }
 
 #[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
 fn qualified_volume_stages_the_payload_through_the_production_catalog() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();

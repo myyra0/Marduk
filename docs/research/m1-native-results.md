@@ -51,6 +51,7 @@ The Task 5 gate blocked native library wiring at that revision: `Catalog::open` 
 
 ### Qualified library staging (connected 2026-11-22)
 
+Tested at commit `a2250e9`, base `252ce26`.
 Continuation of Task 5 after the 2026-11-22 ruling. `Catalog::open` now selects native staging only when `marduk_platform::library_volume_qualified` reports a volume class with recorded runtime evidence: **Linux Btrfs** and **Linux tmpfs**. The predicate reads the observed private library root with the crate's existing `fstatfs` path (`crates/platform/src/linux.rs`), not a `statfs` type string. Refused and staying `StageUnavailable`:
 
 - Linux ext4 and every other unrecognised magic, including `FUSE` (ntfs-3g) and `ntfs3`.
@@ -96,3 +97,7 @@ Base `8110c38`. `NativeStage` now keeps every archive and payload effect on the 
 **Known limitation (accepted by the 2026-11-22 user ruling):** On Linux and Windows, a same-privilege process can substitute the parent or leaf between the final live-handle check and the syscall. The [R02 contract](../contracts/m1-recovery.md#native-seam-that-r03-must-qualify) requires post-effect reobservation to detect divergence, retention of actually displaced bytes, and refusal to retry automatically on divergence. It does not claim prevention. A syscall error is not evidence of no change.
 
 The ruling changes the qualification criterion; it supplies no runtime evidence. Native staging is now wired only on Linux Btrfs and Linux tmpfs, and remains unqualified and unwired on ext4 and native NTFS. Publication into a game directory, Apply, Restore and power-cut behaviour remain unqualified and unwired.
+
+## Test-oracle correction
+
+`crates/storage/tests/library_contract.rs` was changed at `a2250e9` from an unconditional `StageUnavailable` assertion to a both-branch assertion because the 2026-11-22 user ruling connected native staging on qualified volumes; the refusal branch still asserts `StageUnavailable`, the initial profile and zero `revisions/` entries, and the qualified branch asserts a prepared receipt plus reopen/`reconcile`; approved by the orchestrator as scope-mandated; `qualified_stage` is the positive guard and must not become a silent skip.
