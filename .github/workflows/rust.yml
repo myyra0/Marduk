@@ -111,6 +111,9 @@ jobs:
       # Links the real shell: this is the first gate that proves the desktop
       # binary builds, not just that the crate type-checks.
       - run: cargo build --manifest-path app/src-tauri/Cargo.toml --locked
+      # The command fixtures only run under `cargo test`; building the shell
+      # does not compile or execute them.
+      - run: cargo test --manifest-path app/src-tauri/Cargo.toml --locked
 
   desktop-smoke:
     # Advisory, not a required check: this is the first run that starts the

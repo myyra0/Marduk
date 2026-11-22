@@ -297,13 +297,8 @@ mod tests {
             state.dispatch(Request::new(Op::Restore, json!({})));
         match envelope {
             Envelope::Error { error } => {
-                assert_eq!(error.code, Code::UnsupportedTarget);
-                assert_eq!(
-                    error.detail,
-                    Some(marduk_workspace::Detail::Reason {
-                        reason: marduk_workspace::ReasonDto::Configuration
-                    })
-                );
+                assert_eq!(error.code, Code::TargetUnavailable);
+                assert_eq!(error.detail, None);
             }
             Envelope::Ok { .. } => panic!("restore must not simulate success"),
         }
