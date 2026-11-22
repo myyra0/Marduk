@@ -266,18 +266,24 @@ pub const PROOFS: &[Proof] = &[
         os: Os::Linux,
         volume: VolumeClass::Btrfs,
         layer: Layer::Composition,
-        witnesses: &["qualified_native_round_trip_retains_backups_and_restores_the_original_tree"],
+        witnesses: &[
+            "qualified_native_round_trip_retains_backups_and_restores_the_original_tree",
+            "visible_xattr_on_an_original_is_refused_before_any_write",
+        ],
         date: "2026-11-22",
-        revision: "2b6b51d",
+        revision: "af0fc6d",
     },
     Proof {
         capability: Capability::NativeEffects,
         os: Os::Linux,
         volume: VolumeClass::Tmpfs,
         layer: Layer::Composition,
-        witnesses: &["qualified_native_round_trip_retains_backups_and_restores_the_original_tree"],
+        witnesses: &[
+            "qualified_native_round_trip_retains_backups_and_restores_the_original_tree",
+            "visible_xattr_on_an_original_is_refused_before_any_write",
+        ],
         date: "2026-11-22",
-        revision: "2b6b51d",
+        revision: "af0fc6d",
     },
 ];
 

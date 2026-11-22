@@ -1,6 +1,6 @@
 # M1-R03 native results
 
-Runtime evidence from 2026-11-22 (IST), code commit `29e587d`, base `ebd9e07`. Task 6 native-adapter rows were re-tested at `101b4f7` (recovery fix `7feb64b`), and the composition round trip was re-run at `2b6b51d` with the evidence-lane review fix in the working tree. `not run` is never a pass. No power-cut or VM evidence exists.
+Runtime evidence from 2026-11-22 (IST), code commit `29e587d`, base `ebd9e07`. Task 6 native-adapter rows were re-tested at `101b4f7` (recovery fix `7feb64b`), and the composition round trip was re-run at `af0fc6d` with scoped metadata that differs between the original and the staged payload (`2b6b51d` recorded the earlier composition run). `not run` is never a pass. No power-cut or VM evidence exists.
 
 Close-out 2026-11-22: the Task 5 gate blocked native wiring; a later Task 5 continuation connected private-library staging on the two Linux volume classes with runtime evidence (Btrfs and tmpfs), and the Windows staging adapter is implemented and witnessed on NTFS while its product gate stays closed; see [Qualified library staging](#qualified-library-staging-connected-2026-11-22). Native game-directory preview, Apply and Restore are connected in the workspace proof lane on the two Linux volume classes (Task 6), but client `dispatch` still refuses them behind the closed C1 gate. `not run` rows stay `not run`.
 
@@ -124,11 +124,68 @@ object into its own sealed retain slot. The earlier harness only read the
 pre-image `original` copy, so a broken retain path could pass.
 
 `TMPDIR=/tmp` (tmpfs) and `TMPDIR=/var/tmp` (Btrfs) `cargo test -p
-marduk-workspace --locked --test native_deployment -- --ignored` → 4 passed.
+marduk-workspace --locked --test native_deployment -- --ignored
+--test-threads=1` → 5 passed on each at `af0fc6d`.
 Windows deploy remains unproven: the adapter refuses at the durability barrier
 (`UnsupportedTarget`/`Configuration`) before any effect, so the pathname effect
 branch described in [R02](../contracts/m1-recovery.md#native-seam-that-r03-must-qualify)
 has no Windows runtime witness until Windows deploy is qualified.
+
+### Scoped metadata witnesses (`af0fc6d`)
+
+`qualified_native_round_trip_retains_backups_and_restores_the_original_tree`
+now gives the install target and the staged payload different admitted metadata
+before preview, so equal fingerprints on identical fixtures cannot stand in for
+preservation. The run used `TMPDIR=/tmp` (tmpfs) and `TMPDIR=/var/tmp` (Btrfs)
+with `--ignored --test-threads=1 --nocapture`, 5 passed on each, 2026-11-22:
+
+| Observation (identical on tmpfs and Btrfs) | Value |
+|---|---|
+| Original target before apply | mode `0640`, mtime `(1500000000, 123456789)`, uid/gid `1000:1000` |
+| Staged payload before apply | mode `0600`, mtime `(1600000000, 987654321)` |
+| Public target after apply | bytes `b\n`, mode `0600`, mtime `(1600000000, 987654321)`, uid/gid `1000:1000` |
+| Retained displaced original after apply | bytes `base\n`, mode `0640`, mtime `(1500000000, 123456789)`, uid/gid `1000:1000` |
+| Public target after Restore | bytes `base\n`, mode `0640`, mtime `(1500000000, 123456789)`, uid/gid `1000:1000` |
+| Second Restore | `NoActiveDeployment`, tree unchanged |
+
+Each row asserts bytes next to the metadata comparison, so a metadata pass
+cannot mask a byte failure and a byte pass cannot mask a metadata failure. This
+is the composition layer: production catalog, journal and native adapter through
+`proof_preview_deployment`/`proof_apply_deployment`/`proof_restore`, with client
+`dispatch` still refusing deploy and Restore.
+
+`visible_xattr_on_an_original_is_refused_before_any_write` attaches
+`user.marduk` to the admitted original before preview. Preview refuses with
+`UnsupportedTarget`; the game tree, original mode/mtime and all bytes are
+unchanged, and no operation directory is created. The composed error carries no
+`Metadata` reason detail (`DeployError::UnsupportedTarget` is a unit variant),
+so the typed code is the whole refusal promise at this layer. The platform root
+suite separately returns `UnsupportedTarget`/`Metadata` for the same condition.
+
+Two limits belong to the contract, not to this run:
+
+- A `user.*` xattr is **refused** metadata, not preserved metadata
+  ([M1 metadata scope](../contracts/m1-root-verification.md#m1-metadata-scope-approved-2026-11-22)).
+  The differential witness therefore preserves the admitted fields
+  (owner/group/mode/mtime) and proves the xattr class by refusal, which is what
+  the policy says. No policy text was changed.
+- `trusted.*` is unobserved by an ordinary user: `setxattr` returns `EPERM`
+  (os error 1), so the excluded class cannot be attached for a runtime observation
+  here. The contract already classes `trusted.*` as unobserved and outside the
+  verified Restore guarantee; it does not promise a typed refusal for it. That
+  sub-case stays `not run`; no privilege was enabled.
+
+Windows staging: `crates/platform/tests/effects_primitives.rs::staged_copy_preserves_owner_group_dacl_attributes_and_last_write`
+is a Windows-only witness for the copy used to stage a payload. It tightens the
+source DACL to the current user, sets `FILE_ATTRIBUTE_HIDDEN` on top of the
+default archive attribute, and sets a distinct last-write, asserts that this
+metadata really differs from an ordinary file, then copies and asserts the
+destination fingerprint (owner, group, DACL digest, attributes, last-write),
+bytes and attributes match the source. It compiles for
+`x86_64-pc-windows-msvc`. It is **not run**: the VM was power-cycled by another
+experiment, so no Windows runtime, NTFS volume or deploy-level claim is made.
+This witness is the primitive copy behind staging; the Windows row stays
+`not run`.
 
 ### Detach and classification witnesses
 
@@ -177,7 +234,8 @@ classes.
 
 | Witness | Linux Btrfs | Linux tmpfs | Linux ext4 | Hosted `windows-2025` NTFS |
 |---|---|---|---|---|
-| `qualified_native_round_trip_retains_backups_and_restores_the_original_tree` (workspace: setup → import → order → preview → apply → restart → replay → restore) | ran 2026-11-22 at `2b6b51d`, passed | ran 2026-11-22 at `2b6b51d`, passed | not run | not run |
+| `qualified_native_round_trip_retains_backups_and_restores_the_original_tree` (workspace: setup → import → order → preview → apply → restart → replay → restore) | ran 2026-11-22 at `af0fc6d`, passed | ran 2026-11-22 at `af0fc6d`, passed | not run | not run |
+| `visible_xattr_on_an_original_is_refused_before_any_write` (workspace preview) | ran 2026-11-22 at `af0fc6d`, passed (`user.*`); `trusted.*` not run | ran 2026-11-22 at `af0fc6d`, passed (`user.*`); `trusted.*` not run | not run | not run |
 | `restart_after_apply_before_ack_rolls_back_and_never_reapplies` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
 | `restart_after_record_undo_uses_the_sealed_stage_fingerprint` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
 | `restart_mid_restore_continues_in_reverse_order` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
