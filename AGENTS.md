@@ -13,6 +13,24 @@ the combined work); record what was adapted and why in the owning packet's repor
 weaker guarantee than this project's contracts — that includes delete-then-rename replacement, which destroys displaced
 bytes. Trivial logic is still written fresh.
 
+## Documentation and claims
+
+One source per rule. A guarantee lives in one contract, is enforced by a test or a named syscall/flag, and code comments describe
+only what that function does plus a pointer to the contract. Never restate the same rule in a second file: two copies drift and the
+wrong one is what people read.
+
+State a guarantee only if it is enforced. If the code detects a condition after the fact, write "detects" and name the residual.
+"Cannot", "never", "always", "only" and "prevents" require a test or a syscall mode behind them; otherwise they are a defect to fix,
+not wording to soften.
+
+Evidence belongs in committed docs (`docs/research/`), never in the gitignored ledger. A packet ledger records progress and rulings;
+it is not proof and must not be cited as one. Decisions that change a guarantee, licence or supported configuration get a dated ADR
+with the cost if the decision is wrong.
+
+Availability is evidence-backed: a capability is `available` only where a recorded runtime result exists for that exact configuration.
+A static check (filesystem type, target OS, compile success) is never sufficient on its own, and an evidence row may not move from
+`not run` to `passed` without the run behind it.
+
 ## Scope (current phase)
 
 - Goal: functional parity with legacy. Nothing else is required.
