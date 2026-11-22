@@ -89,11 +89,9 @@ impl Catalog {
             .path(&root_handle)
             .map_err(|_| ImportError::Storage)?;
         // The pathname starts at the pinned directory descriptor, so our own
-        // opens follow no substituted ancestor. SQLite resolves that pathname
-        // itself and derives `-wal`/`-shm`/`-journal` from the resolved
-        // spelling, so the leaf is proved by `PrivateFile` and the root is
-        // re-proved by pathname before and after the open and after the first
-        // SQLite writes (see `PrivateFile` for the documented residual window).
+        // opens follow no substituted ancestor. SQLite resolves the leaf and
+        // sidecars itself; the substitution residual is owned by
+        // `docs/contracts/m1-recovery.md` (catalog file containment).
         let mut connection = Connection::open_with_flags(&catalog_path, OpenFlags::default())
             .map_err(storage_error)?;
         catalog
@@ -121,10 +119,9 @@ impl Catalog {
     }
 
     /// Connect native staging only on volume classes with recorded runtime
-    /// evidence (`docs/research/m1-native-results.md`: Linux Btrfs, Linux tmpfs).
-    /// A qualified volume whose private boundary will not bind — a redirect, an
-    /// owner or mount mismatch, or a cross-subvolume `EXDEV` layout — stays
-    /// refused; the bind is the final gate, never a downgrade to a weaker write.
+    /// evidence (`docs/research/m1-native-results.md`). A qualified volume whose
+    /// private boundary will not bind stays refused; the bind is the final gate,
+    /// never a downgrade to a weaker write.
     fn select_stage(qualified: bool, root: &Path) -> StageAdapter {
         if !qualified {
             return StageAdapter::Unavailable(UnavailableStage);

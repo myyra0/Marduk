@@ -1,8 +1,8 @@
 //! Marduk desktop shell.
 //!
 //! Every command decodes a frozen request, calls the shared [`Workspace`]
-//! service and returns the same envelope the CLI prints. The catalog root is
-//! Tauri's application data directory for the frozen bundle identifier.
+//! service and returns the same envelope the CLI prints. The catalog root is the
+//! shared `marduk_workspace::app_data_root()` location.
 
 mod commands;
 

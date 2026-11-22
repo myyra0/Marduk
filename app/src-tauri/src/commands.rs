@@ -13,8 +13,8 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
-/// Shared desktop state. The catalog root is resolved once by Tauri from the
-/// bundle identifier; no client input can change it.
+/// Shared desktop state. The catalog root is resolved once by
+/// `marduk_workspace::app_data_root()`; no client input can change it.
 pub struct DesktopState {
     app_data: PathBuf,
     workspace: Mutex<Option<Workspace>>,

@@ -19,7 +19,7 @@ use marduk_core::recovery::{
     StepOutput, StepPhase, StepSpec,
 };
 use marduk_core::resolve::ResolvedInputs;
-use marduk_core::root_identity::{Fingerprint, GameLayout, RootIdentity};
+use marduk_core::root_identity::{Fingerprint, GameLayout, RootError, RootIdentity};
 use marduk_core::targets::{RelativePath, RootRole, TargetFile};
 use marduk_storage::native_effects::{NativeEffects, ProofEvent};
 use marduk_storage::operation_journal::OperationJournal;
@@ -899,6 +899,42 @@ fn sync_chain_stops_at_the_resolved_root_for_a_symlinked_library_spelling() {
         above.display()
     );
     assert!(!synced.iter().any(|path| *path == Path::new("/")));
+}
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn sync_chain_refuses_a_directory_outside_the_resolved_root() {
+    let fixture = Fixture::new();
+    let mut port = fixture.adapter();
+    let outside = fixture.temp_path().join("outside-root");
+    fs::create_dir_all(&outside).unwrap();
+
+    port.proof_record_events();
+    assert_eq!(
+        port.proof_sync_chain_with_library_spelling(&outside, &fixture.app),
+        Err(RootError::OutsideBoundary)
+    );
+    assert!(
+        port.proof_events().unwrap().is_empty(),
+        "a directory outside the app root was synced"
+    );
+}
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn profile_revision_refuses_a_catalog_replaced_by_a_link() {
+    let fixture = Fixture::new();
+    let journal = fixture.journal();
+    drop(journal);
+    let mut port = fixture.adapter();
+    let catalog = fixture.app.join("catalog.sqlite3");
+    fs::rename(&catalog, fixture.app.join("catalog.original")).unwrap();
+    std::os::unix::fs::symlink("/dev/null", &catalog).unwrap();
+
+    assert_eq!(
+        port.profile_revision(ProfileId::new(1)),
+        Err(DeployError::Io)
+    );
 }
 
 #[test]

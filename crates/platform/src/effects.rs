@@ -23,24 +23,29 @@
 //!   attributes and alternate data streams are not copied. A source DACL that
 //!   grants write-class access to any principal outside the current user and
 //!   the SYSTEM/Administrators baseline is refused before the descriptor is
-//!   applied, so the private effect area never inherits a grant to another local
-//!   user. A destination that appears first is refused,
-//!   never overwritten, and every post-create failure removes the partial
-//!   artifact.
+//!   applied, so the private effect area never inherits a write-class grant to
+//!   another local user. Read and execute grants are copied verbatim; the
+//!   private area's own DACL is what limits access to those bytes. A destination
+//!   that appears first is refused, never overwritten, and every post-create
+//!   failure removes the partial artifact.
 //! - `publish` is one `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`, so an
 //!   existing target makes the call fail; the target bytes are untouched. The
 //!   move is refused across volumes (`MOVEFILE_COPY_ALLOWED` is not set).
-//! - `replace` is an exchange of three no-replace renames: the target object
-//!   moves to the retain slot, then the staged object moves onto the target
-//!   name. The target briefly has no name between those two moves, so this is
-//!   not an atomic exchange. `ReplaceFileW` is deliberately not used: it merges
-//!   the replaced file's creation time and DACL into the replacement, so the
-//!   public target would no longer carry the sealed staged fingerprint. NTFS
-//!   tunneling would also give each object the creation time of the name it
-//!   lands on, so both birth times are captured before the moves and restored,
-//!   then re-read, before success is reported. Every failed step returns an
-//!   error and the caller must re-observe; a failed exchange is never reported
-//!   as a no-op.
+//! - `replace` is an exchange of two no-replace renames in production: the
+//!   target object moves to the canonical `<operation>/displaced` slot, then the
+//!   staged object moves onto the target name. The target briefly has no name
+//!   between those two moves, so this is not an atomic exchange. A caller that
+//!   retains the displaced object at a different path performs a third no-replace
+//!   rename from that slot. A cut after the first rename leaves the target
+//!   absent, the staged bytes in the stage slot and the displaced bytes in the
+//!   canonical slot; the next call resumes that shape. `ReplaceFileW` is
+//!   deliberately not used: it merges the replaced file's creation time and
+//!   DACL into the replacement, so the public target would no longer carry the
+//!   sealed staged fingerprint. NTFS tunneling would also give each object the
+//!   creation time of the name it lands on, so both birth times are captured
+//!   before the moves and restored, then re-read, before success is reported.
+//!   Every failed step returns an error and the caller must re-observe; a failed
+//!   exchange is never reported as a no-op.
 //! - `detach` is one no-replace rename into the retain slot. Unknown bytes in
 //!   the slot make the call fail rather than be replaced.
 //! - `sync_directory` flushes a directory handle opened with
@@ -50,9 +55,10 @@
 //!   closed on Windows.
 //!
 //! None of these primitives prevents a same-privilege process from substituting
-//! a parent or leaf between the caller's live-handle check and the native call;
-//! see the accepted limitation in `docs/contracts/m1-recovery.md`. Divergence is
-//! detected by post-effect reobservation and the displaced bytes are retained.
+//! a parent or leaf between the caller's live-handle check and the native call.
+//! Divergence is detected by post-effect reobservation and the displaced bytes
+//! are retained; the accepted limitation and the rule that an error is not proof
+//! of no change are owned by `docs/contracts/m1-recovery.md`.
 
 use std::fs::File;
 use std::io;
@@ -200,8 +206,8 @@ pub fn publish(
 }
 
 /// Exchange `stage_dir/stage_name` with `target_dir/leaf`, so the target name
-/// holds the staged bytes and the stage slot holds the actually displaced file.
-/// A missing target fails the exchange; bytes are never discarded.
+/// holds the staged bytes and the actually displaced file is retained at
+/// `retain_path`. A missing target fails the exchange; bytes are never discarded.
 #[allow(unused_variables)]
 pub fn replace(
     stage_dir: &File,

@@ -74,9 +74,9 @@ pub fn library_volume_qualified(root: &Path) -> bool {
     native::library_volume_qualified(root)
 }
 
-/// Open an application-owned child directory through the pinned parent handle,
-/// refusing a final link and every redirected ancestor, and creating only that
-/// one missing child when absent.
+/// Open an application-owned child directory beneath the verified parent path,
+/// re-proving each component, refusing a final link and every redirected
+/// ancestor, and creating only that one missing child when absent.
 pub fn open_private_child_directory(
     parent: &std::fs::File,
     name: &str,
@@ -103,19 +103,10 @@ pub fn verify_private_directory(path: &Path, handle: &std::fs::File) -> Result<(
 /// A regular file opened or created directly beneath a pinned app-owned
 /// directory, with the leaf's native identity kept for later re-proof.
 ///
-/// The held handle is the authority for the leaf's identity. On Windows it
-/// deliberately does not share delete access, so the operating system refuses
-/// a rename or replacement of the leaf while the catalog is open. On Linux the
-/// handle is an `openat2`-pinned descriptor, and SQLite's
-/// `/proc/self/fd/<dirfd>/catalog.sqlite3` pathname resolves through that
-/// directory inode, so renaming the verified directory cannot redirect it.
-/// The reachable vector is replacing `catalog.sqlite3` or planting a
-/// `-wal`/`-shm`/`-journal` name inside the pinned directory between the final
-/// re-proof and SQLite's own open; SQLite is not opened with
-/// `SQLITE_OPEN_NOFOLLOW`, so a symlinked leaf is followed before the
-/// post-open proof refuses. `journal_reopen_refuses_a_catalog_replaced_by_a_link`
-/// witnesses that leaf substitution. Callers re-prove the directory and this
-/// leaf immediately after every pathname-based SQLite open.
+/// The held handle is the authority for the leaf's identity. Callers re-prove
+/// the directory and this leaf around every pathname-based SQLite open. The
+/// Linux leaf/sidecar substitution residual and the Windows rename residual are
+/// owned by `docs/contracts/m1-recovery.md` (catalog file containment).
 pub struct PrivateFile {
     inner: native::PrivateFile,
 }

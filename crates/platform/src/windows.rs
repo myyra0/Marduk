@@ -1508,26 +1508,13 @@ mod root {
     //
     // The library root, `revisions/` and every bound revision are opened as
     // no-follow directory handles that deny delete sharing, so the operating
-    // system refuses to rename or replace any of them while a stage is bound.
-    // Every child open below uses `NtCreateFile` with
-    // `OBJECT_ATTRIBUTES.RootDirectory` set to one of those handles: a
-    // substituted pathname cannot redirect the open, and no operation joins a
-    // caller path onto a spelling.
-    //
-    // Revision directories are created with a protected DACL that grants only
-    // the current user, with an inherit-only Owner Rights ACE for descendants
-    // (the Windows analogue of mode `0700`). Identity is re-proved from the
-    // live handle on every re-observe; a renamed, replaced or re-ACLed object
-    // is refused rather than adopted.
-    //
-    // Residual: the directory names in the verified chain cannot be renamed or
-    // replaced while the handles are live, but a same-privilege process can
-    // still add, remove or rewrite files *inside* a revision between the last
-    // re-proof and receipt issuance. The next re-observe proves the change and
-    // refuses to continue; the accepted limitation is that those bytes were
-    // reachable inside that window. Durability uses `FlushFileBuffers` on the
-    // revision, `revisions/` and root handles, because Windows has no
-    // directory entry fsync distinct from the handle flush.
+    // system refuses to rename or replace them while a stage is bound. Every
+    // child open below uses `NtCreateFile` with
+    // `OBJECT_ATTRIBUTES.RootDirectory` set to one of those handles. Revision
+    // directories are created with a protected owner-only DACL (the Windows
+    // analogue of mode `0700`); identity is re-proved from the live handle on
+    // every re-observe. The residual and the durability contract are owned by
+    // `docs/contracts/m1-recovery.md`.
     // -----------------------------------------------------------------------
 
     const STAGE_DIRECTORY_ACCESS: u32 =
@@ -1790,8 +1777,8 @@ mod root {
         pub(crate) fn open(root: &Path) -> Result<Self, RootError> {
             let text = root.to_str().ok_or(RootError::TargetUnavailable)?;
             // No delete sharing: while this handle is bound the root name cannot
-            // be renamed or replaced. Durability flushes this same handle, so
-            // the root is never reopened by pathname.
+            // be renamed or replaced. `sync_root` flushes this handle; this open
+            // does not flush it.
             let file = open_shared_path(text, STAGE_DIRECTORY_ACCESS)
                 .map_err(|_| RootError::TargetUnavailable)?;
             let root_directory = verify_root(file)?;
@@ -2433,21 +2420,19 @@ pub(crate) use root::{
     verify_private_directory,
 };
 
-/// Private-library staging has no deploy-level Windows evidence yet; the
-/// workspace gate stays closed even on NTFS. Private staging itself is admitted
-/// through `library_stage::fsops::qualified`, which reads the opened root's
-/// volume and requires NTFS; that narrower predicate does not enable imports or
-/// deploys through the workspace catalog.
+/// Product availability stays closed on Windows: no deploy-level NTFS evidence
+/// exists. The private staging adapter has its own NTFS predicate in
+/// `library_stage::fsops::qualified`, which does not enable workspace imports or
+/// deploys. Availability and refusal rule:
+/// `docs/research/m1-native-results.md`, `docs/contracts/m1-recovery.md`.
 pub(crate) fn library_volume_qualified(_root: &Path) -> bool {
     false
 }
 
-/// Native effect writes stay unqualified on Windows. The six file-level
-/// primitives pass the hosted `windows-2025` CI job, but that is primitive-level
-/// evidence only: no deploy-level NTFS rows exist, and the durability barrier
+/// Native effect writes stay unqualified on Windows: the file-level primitives
+/// pass on hosted NTFS, but no deploy-level rows exist and the durability barrier
 /// remains `Unavailable`. `staging_volume_qualified` is kept for the private
-/// staging lane and for a future deploy-level gate; being on NTFS is not
-/// qualification.
+/// staging lane; being on NTFS is not deploy qualification.
 pub(crate) fn effects_volume_qualified(_root: &Path) -> bool {
     false
 }

@@ -884,12 +884,8 @@ impl Workspace {
 
     /// Restart reconciliation behind the [`Op::Recover`] wire route.
     ///
-    /// This is deliberately not gated by [`native_effects_gate`]: a crash
-    /// mid-apply leaves recorded pending work that must be reconciled even
-    /// while client-visible Apply/Restore stay closed. Core verifies the
-    /// recorded installation/data pair and the adapter still refuses an
-    /// unqualified volume with a typed error, so the request can never report a
-    /// simulated success and never creates work.
+    /// `Recover` settles an already-recorded pending operation and creates no
+    /// work; the write-authority rule is owned by `docs/contracts/m1-clients.md`.
     fn recover_pending(&mut self) -> Result<Option<Operation>, WireError> {
         let selected = self.selected_pair()?;
         // No pending operation means no native work. Answer before opening the
@@ -1146,15 +1142,10 @@ fn phase(phase: Phase) -> &'static str {
 
 /// One decision point for client-visible deploy/restore availability.
 ///
-/// The native copy adapter is wired, but real Apply and Restore stay closed
-/// until the C1 proof lane records its rows in
+/// Real Apply and Restore stay closed until the C1 proof lane records its rows in
 /// `docs/research/m1-native-results.md`. Synthetic runs reach the adapter only
-/// through the `proof_*` methods.
-///
-/// `Op::Recover` is the one normal route that reaches the adapter. It only
-/// settles an already-recorded pending operation and must never create work.
-/// The exemption depends on no other client route being able to create a
-/// pending row while this gate is closed.
+/// through the `proof_*` methods; the write-authority rule is owned by
+/// `docs/contracts/m1-clients.md`.
 fn native_effects_gate() -> Result<(), WireError> {
     Err(unsupported_effect())
 }

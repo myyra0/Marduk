@@ -1,21 +1,26 @@
 //! Verified private-library staging.
 //!
 //! One concrete adapter issues opaque [`NativeReceipt`]s. Storage consumes the
-//! receipt; no caller can construct evidence, and an unqualified volume yields
-//! a typed refusal instead of a fake success.
+//! receipt; no caller can construct a receipt, and an unqualified volume yields
+//! a typed refusal instead of a fake success. Availability is recorded in
+//! `docs/research/m1-native-results.md`; the refusal rule is owned by
+//! `docs/contracts/m1-recovery.md`.
 //!
 //! The archive snapshot, admitted member set and staged payload are all inside
 //! one owned revision directory. Publication never reopens a caller-selected
 //! ZIP path.
 //!
-//! On Windows the library root and `revisions/` are bound as no-follow handles
-//! that deny delete sharing, and every child operation is a relative
-//! `NtCreateFile` (or handle disposition) beneath one of those handles. The
-//! verified directory names therefore cannot be renamed or replaced while the
-//! stage is bound. The remaining residual is inside a revision: a same-privilege
+//! On Windows the library root, `revisions/` and every bound revision are opened
+//! as no-follow directory handles that deny delete sharing, and every child
+//! operation is a relative `NtCreateFile` (or handle disposition) beneath one of
+//! those handles. The verified directory names therefore cannot be renamed or
+//! replaced while the stage is bound. Payload and archive-entry operations are
+//! handle-relative; bookkeeping re-opens (`reverify_revisions`,
+//! `verify_revision_path`, `sync_dir`) are pathname-based and re-proved
+//! immediately. The remaining residual is inside a revision: a same-privilege
 //! process can still add, delete or rewrite payload files between the last
-//! re-proof and receipt issuance, which the next re-observe detects. See the
-//! Windows adapter module and `docs/contracts/m1-recovery.md`.
+//! re-proof and receipt issuance, which the next re-observe detects. See
+//! `docs/contracts/m1-recovery.md`.
 
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -52,9 +57,10 @@ pub struct NativeStage {
 }
 
 impl NativeStage {
-    /// Connect only the volume classes this packet qualifies. Everything else
-    /// stays disconnected with `StageUnavailable`. The catalog root alone is not
-    /// the staging boundary: `revisions/` is bound by a live no-follow handle.
+    /// Connect only volumes with recorded runtime evidence; everything else is
+    /// `StageUnavailable` (`docs/research/m1-native-results.md`). The catalog
+    /// root alone is not the staging boundary: `revisions/` is bound by a live
+    /// no-follow handle.
     pub fn open(root: &Path) -> Result<Self, ImportError> {
         if !fsops::qualified(root) {
             return Err(ImportError::StageUnavailable);

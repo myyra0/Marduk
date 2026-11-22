@@ -32,9 +32,8 @@ use sha2::{Digest, Sha256};
 pub struct OperationJournal {
     root: PathBuf,
     /// Pins the verified app-owned root for this journal's lifetime. The
-    /// `/proc/self/fd` pathname resolves through the pinned directory inode on
-    /// Linux, so renaming that directory cannot redirect SQLite; the leaf and
-    /// sidecar names inside it remain name-resolved.
+    /// pathname placement and the leaf/sidecar substitution residual are owned by
+    /// `docs/contracts/m1-recovery.md` (catalog file containment).
     _root_handle: File,
     /// Pins the catalog leaf across bootstrap and reopen.
     catalog: marduk_platform::PrivateFile,

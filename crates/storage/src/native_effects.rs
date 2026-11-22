@@ -2,14 +2,16 @@
 //!
 //! The journal owns the durable operation; this adapter owns the live
 //! installation binding, the operation gates and the native effect session. It
-//! is composed by the workspace only when both the installation and library
-//! roots report runtime evidence through [`marduk_platform::effects::volume_qualified`].
-//! An unqualified root is a typed refusal before any private or public write.
+//! is composed by the workspace only when both roots carry recorded runtime
+//! evidence ([`marduk_platform::effects::volume_qualified`]); an unqualified root
+//! is a typed refusal before any private or public write. The availability list
+//! and refusal rule are owned by `docs/research/m1-native-results.md` and
+//! `docs/contracts/m1-recovery.md`.
 //!
-//! Every public effect re-proves the bound root pair, re-observes the target and
-//! the operation-owned slots, and classifies an error by fresh evidence rather
-//! than treating it as "no change". A recorded installation locator mismatch is
-//! refused; the adapter never silently re-binds another installation.
+//! Every public effect re-proves the bound root pair and re-observes the target
+//! and operation-owned slots; an error is classified from fresh evidence, never
+//! treated as "no change" (`docs/contracts/m1-recovery.md`). A recorded locator
+//! mismatch is refused; the adapter never silently re-binds another installation.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -52,6 +54,9 @@ pub struct NativeEffects {
     layout: GameLayout,
     binding: InstallationBinding,
     private: PathBuf,
+    /// Pins the catalog leaf for `profile_revision`, which SQLite opens by
+    /// pathname. The handle is re-proved after that open.
+    catalog: marduk_platform::PrivateFile,
     /// The app-owned root as the pinned handle resolves it, not the spelling
     /// the caller supplied. Directory fsyncs stop here.
     resolved_root: PathBuf,
@@ -75,7 +80,7 @@ impl std::fmt::Debug for NativeEffects {
 impl NativeEffects {
     /// Bind the selected installation and prepare the app-owned effect area.
     ///
-    /// Both roots must carry recorded native effect evidence. A refused volume
+    /// Both roots are checked for recorded runtime evidence. A refused volume
     /// returns `UnsupportedTarget` before the binding is opened or any
     /// directory is created.
     pub fn open(app_data: &Path, locator: &Path, layout: GameLayout) -> Result<Self, DeployError> {
@@ -91,6 +96,9 @@ impl NativeEffects {
         );
         let private = marduk_platform::private_child_path(&root_handle, "effects")
             .map_err(|_| DeployError::Io)?;
+        let catalog =
+            marduk_platform::open_or_create_private_file(&root_handle, crate::schema::CATALOG_FILE)
+                .map_err(|_| DeployError::Io)?;
         let resolved_root = private
             .parent()
             .map(Path::to_path_buf)
@@ -105,6 +113,7 @@ impl NativeEffects {
             layout,
             binding,
             private,
+            catalog,
             resolved_root,
             library: app_data.to_path_buf(),
             root_gate,
@@ -546,9 +555,9 @@ impl NativeEffects {
             Err(error) => return EffectOutcome::Unavailable(error),
         };
 
-        // The exchange alias starts in the canonical `displaced` slot and, on
-        // success, moves the displaced object into the stage alias. Both names
-        // are observed as retained evidence by `evidence_for`.
+        // The displaced object is retained in the canonical `displaced` slot;
+        // the stage slot is vacated onto the target.
+        let retain_path = self.backup_path(retain);
         self.trace(ProofEvent::PublicEffect);
         let result = effects::replace(
             &stage_dir,
@@ -557,7 +566,7 @@ impl NativeEffects {
             &leaf,
             &stage_path,
             &target_path,
-            &stage_path,
+            &retain_path,
         );
         let evidence = self.evidence_for(
             target,
@@ -721,8 +730,12 @@ impl NativeEffects {
     /// app-owned root. This fsyncs each directory entry; on Windows it reports
     /// `FlushFileBuffers` only, which is not a documented namespace barrier. The
     /// caller's spelling of the root may be relative or redirected; the bound
-    /// comes from the pinned handle, so a mismatch never walks to `/`.
+    /// comes from the pinned handle, so a directory outside that root is refused
+    /// rather than walking to `/`.
     fn sync_directory_chain(&mut self, directory: &Path) -> Result<(), RootError> {
+        if !directory.starts_with(&self.resolved_root) {
+            return Err(RootError::OutsideBoundary);
+        }
         effects::sync_directory(directory)?;
         self.trace(ProofEvent::Synced(directory.to_path_buf()));
         let mut current = directory.parent();
@@ -1051,14 +1064,20 @@ impl DeploymentInputs for NativeEffects {
     }
 
     fn profile_revision(&mut self, profile: ProfileId) -> Result<ProfileRevision, DeployError> {
-        let path =
-            marduk_platform::private_child_path(&self.root_handle, crate::schema::CATALOG_FILE)
-                .map_err(|_| DeployError::Io)?;
+        let path = self
+            .catalog
+            .path(&self.root_handle)
+            .map_err(|_| DeployError::Io)?;
         let connection = Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(|_| DeployError::Io)?;
+        // SQLite follows the pathname itself; prove the leaf after that open
+        // still names the pinned catalog.
+        self.catalog
+            .verify(&self.root_handle)
+            .map_err(|_| DeployError::Io)?;
         connection
             .busy_timeout(Duration::from_secs(5))
             .map_err(|_| DeployError::Io)?;

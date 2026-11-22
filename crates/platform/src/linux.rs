@@ -1377,14 +1377,10 @@ pub(crate) struct PrivateFile {
 
 impl PrivateFile {
     pub(crate) fn path(&self, parent: &File) -> Result<PathBuf, RootError> {
-        // The descriptor keeps the directory component pinned: the kernel
-        // resolves `/proc/self/fd/<dirfd>` through the directory inode, so
+        // `/proc/self/fd/<dirfd>` resolves through the pinned directory inode, so
         // renaming the verified directory cannot redirect this path. SQLite
-        // still resolves the leaf and its `-wal`, `-shm` and `-journal` names
-        // inside that directory itself, and without `SQLITE_OPEN_NOFOLLOW` it
-        // follows a symlinked leaf. Callers re-prove the root and leaf after
-        // the open; `journal_reopen_refuses_a_catalog_replaced_by_a_link`
-        // witnesses the leaf substitution.
+        // resolves the leaf and sidecars itself; the substitution residual is
+        // owned by `docs/contracts/m1-recovery.md` (catalog file containment).
         Ok(PathBuf::from(format!(
             "/proc/self/fd/{}/{}",
             parent.as_raw_fd(),
@@ -1562,15 +1558,15 @@ pub(crate) fn renameat2(
     }
 }
 
-/// Volume classes with recorded runtime evidence for private-library staging,
-/// per `docs/research/m1-native-results.md`. ext4, native NTFS and any
-/// unrecognised magic stay unqualified and are never treated as equivalent.
+/// Volume classes with recorded runtime evidence for private-library staging.
+/// The qualified set and refusal rule are owned by
+/// `docs/research/m1-native-results.md`; every other magic is unqualified.
 fn library_filesystem_qualified(magic: u64) -> bool {
     matches!(magic, BTRFS_SUPER_MAGIC | TMPFS_SUPER_MAGIC)
 }
 
-/// Library staging is connected only on a volume class with runtime proof. The
-/// observed root's `fstatfs` magic decides; an unreadable root is unqualified.
+/// Library staging is connected only on a volume class with runtime proof; the
+/// observed root's `fstatfs` magic decides, and an unreadable root is unqualified.
 pub(crate) fn library_volume_qualified(root: &Path) -> bool {
     let Ok(file) = open_directory(root) else {
         return false;
@@ -1581,8 +1577,7 @@ pub(crate) fn library_volume_qualified(root: &Path) -> bool {
     library_filesystem_qualified(magic)
 }
 
-/// Native effect writes use the same recorded volume classes as private
-/// staging: only Btrfs and tmpfs have runtime evidence on Linux.
+/// Native effect writes use the same recorded volume classes as private staging.
 pub(crate) fn effects_volume_qualified(root: &Path) -> bool {
     library_volume_qualified(root)
 }
