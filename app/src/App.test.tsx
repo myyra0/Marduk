@@ -716,6 +716,100 @@ describe('workspace shell', () => {
     expect(screen.getByText(/Authoritative state reloaded/)).toBeInTheDocument();
   });
 
+  it('reconciles pending work once on the first status load and reloads status', async () => {
+    const pendingStatus = fixtureStatus();
+    const reconciled = { ...fixtureStatus(), pending: null };
+    const status = vi.fn<WorkspaceTransport['status']>();
+    status
+      .mockResolvedValueOnce({ ok: true as const, result: pendingStatus })
+      .mockResolvedValue({ ok: true as const, result: reconciled });
+    const recover = vi.fn(async () => ({
+      ok: true as const,
+      result: { ...fixtureOperation(), phase: 'completed' as const, blocker: null },
+    }));
+
+    await renderReady({ status, recover });
+
+    await waitFor(() => expect(recover).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(status).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText(/Pending operation/)).not.toBeInTheDocument();
+    expect(screen.getByText(/Interrupted work was reconciled/)).toBeInTheDocument();
+    expect(recover).toHaveBeenCalledTimes(1);
+  });
+
+  it('calls recover exactly once on reconnect and reloads authoritative status', async () => {
+    const user = userEvent.setup();
+    const pendingStatus = statusWithEffects();
+    const withPending = {
+      ...pendingStatus,
+      pending: { ...fixtureOperation(), phase: 'applying' as const },
+    };
+    const reconciled = { ...pendingStatus, pending: null };
+    const status = vi.fn<WorkspaceTransport['status']>();
+    status
+      .mockResolvedValueOnce({ ok: true as const, result: pendingStatus })
+      .mockResolvedValueOnce({ ok: true as const, result: withPending })
+      .mockResolvedValue({ ok: true as const, result: reconciled });
+    const recover = vi.fn(async () => ({
+      ok: true as const,
+      result: { ...fixtureOperation(), phase: 'rolled_back' as const, blocker: null },
+    }));
+
+    await renderReady({ status, recover });
+    expect(recover).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole('button', { name: /Reconnect/ }));
+
+    expect(await screen.findByText(/Interrupted work was reconciled/)).toBeInTheDocument();
+    expect(recover).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(status).toHaveBeenCalledTimes(3));
+    expect(screen.queryByText(/Pending operation/)).not.toBeInTheDocument();
+    expect(screen.getByText(/rolled_back/)).toBeInTheDocument();
+  });
+
+  it('shows a typed recovery refusal once without looping', async () => {
+    const user = userEvent.setup();
+    const pendingStatus = statusWithEffects();
+    const withPending = {
+      ...pendingStatus,
+      pending: { ...fixtureOperation(), phase: 'applying' as const },
+    };
+    const status = vi.fn<WorkspaceTransport['status']>();
+    status
+      .mockResolvedValueOnce({ ok: true as const, result: pendingStatus })
+      .mockResolvedValue({ ok: true as const, result: withPending });
+    const recover = vi.fn(async () => ({
+      ok: false as const,
+      error: { code: 'RecoveryConflict' as const },
+    }));
+
+    await renderReady({ status, recover });
+
+    await user.click(screen.getByRole('button', { name: /Reconnect/ }));
+
+    expect(await screen.findByText('Recovery refused')).toBeInTheDocument();
+    expect(screen.getByText('RecoveryConflict')).toBeInTheDocument();
+    expect(screen.getByText(/Recovery stopped: RecoveryConflict/)).toBeInTheDocument();
+    expect(recover).toHaveBeenCalledTimes(1);
+    expect(status).toHaveBeenCalledTimes(2);
+    expect(screen.getByText(/Pending operation/)).toBeInTheDocument();
+  });
+
+  it('does not call recover when status has no pending work', async () => {
+    const user = userEvent.setup();
+    const status = vi.fn<WorkspaceTransport['status']>(async () => ({
+      ok: true,
+      result: { ...fixtureStatus(), pending: null },
+    }));
+    const recover = vi.fn(async () => ({ ok: true as const, result: null }));
+
+    await renderReady({ status, recover });
+    await user.click(screen.getByRole('button', { name: /Reconnect/ }));
+
+    await waitFor(() => expect(status).toHaveBeenCalledTimes(2));
+    expect(recover).not.toHaveBeenCalled();
+  });
+
   it('shows NoActiveDeployment cleanly and never retries Restore', async () => {
     const user = userEvent.setup();
     const status = { ...statusWithEffects(), activeGenerationId: null };

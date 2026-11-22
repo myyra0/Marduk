@@ -14,6 +14,7 @@ import {
   parsePrepared,
   parsePreview,
   parseProgress,
+  parseRecover,
   parseRestoreResult,
   parseSelection,
   parseSnapshot,
@@ -24,6 +25,7 @@ import {
   type Prepared,
   type Preview,
   type Progress,
+  type Recover,
   type RestoreResult,
   type Revision,
   type Selection,
@@ -43,6 +45,7 @@ export const COMMANDS = [
   'deploy_preview',
   'deploy_apply',
   'restore',
+  'recover',
   'operation',
 ] as const;
 
@@ -93,6 +96,7 @@ export interface WorkspaceTransport {
     onProgress?: ProgressHandler,
     onProgressFault?: ProgressFaultHandler,
   ): Promise<Envelope<RestoreResult>>;
+  recover(): Promise<Envelope<Recover>>;
   operation(operationId: Id): Promise<Envelope<Operation>>;
 }
 
@@ -164,6 +168,7 @@ export function createTauriTransport(
         parseRestoreResult,
       ),
     operation: (operationId) => request('operation', { operationId }, parseOperation),
+    recover: () => request('recover', undefined, parseRecover),
   };
 }
 

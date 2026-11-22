@@ -167,6 +167,13 @@ pub fn restore(
     state.dispatch(Request::new(Op::Restore, json!({})))
 }
 
+/// Reconcile work recorded before an interrupted apply or restore. Returns the
+/// recorded operation, or `None` when nothing is pending.
+#[tauri::command(async)]
+pub fn recover(state: State<'_, DesktopState>) -> Envelope<Option<Operation>> {
+    state.dispatch(Request::new(Op::Recover, json!({})))
+}
+
 #[tauri::command(async)]
 pub fn operation(operation_id: String, state: State<'_, DesktopState>) -> Envelope<Operation> {
     state.dispatch(Request::new(
@@ -299,6 +306,17 @@ mod tests {
                 );
             }
             Envelope::Ok { .. } => panic!("restore must not simulate success"),
+        }
+    }
+
+    #[test]
+    fn recover_without_a_bound_root_is_a_typed_refusal() {
+        let (_dir, state) = state();
+        let envelope: Envelope<Option<Operation>> =
+            state.dispatch(Request::new(Op::Recover, json!({})));
+        match envelope {
+            Envelope::Error { error } => assert_eq!(error.code, Code::TargetUnavailable),
+            Envelope::Ok { .. } => panic!("recover must not simulate a clean unbound root"),
         }
     }
 }

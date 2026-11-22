@@ -14,6 +14,7 @@ fn main() {
             "deploy_preview",
             "deploy_apply",
             "restore",
+            "recover",
             "operation",
         ]),
     ))

@@ -85,6 +85,7 @@ describe('desktop capability surface', () => {
       'order',
       'pick_installation',
       'pick_zip',
+      'recover',
       'restore',
       'setup',
       'status',

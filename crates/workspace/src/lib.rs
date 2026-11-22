@@ -5,7 +5,9 @@
 //! [`Envelope`]; no storage, native or UI type crosses the wire.
 //!
 //! Operations that would need a qualified native effect port are refused with
-//! a typed unavailable reason. They never report simulated success.
+//! a typed unavailable reason. They never report simulated success. Recovery is
+//! reachable because a crash can leave recorded pending work that must be
+//! reconciled.
 
 use std::fmt::Write as _;
 use std::fs::File;
@@ -77,6 +79,7 @@ pub enum Op {
     DeployPreview,
     DeployApply,
     Restore,
+    Recover,
     Operation,
 }
 
@@ -525,6 +528,10 @@ impl Workspace {
                 native_effects_gate()?;
                 Ok(json(self.restore_generation()?)?)
             }
+            Op::Recover => {
+                let _: NoArgs = decode(request.args)?;
+                Ok(json(self.recover_pending()?)?)
+            }
             Op::Operation => {
                 let args: OperationArgs = decode(request.args)?;
                 Ok(json(self.operation(args)?)?)
@@ -848,11 +855,13 @@ impl Workspace {
 
     /// Synthetic proof lane for the native copy adapter.
     ///
-    /// These operations are deliberately unreachable from [`Workspace::dispatch`]
-    /// until the C1 proof lane records its rows in
+    /// Preview, Apply and Restore are deliberately unreachable from
+    /// [`Workspace::dispatch`] until the C1 proof lane records its rows in
     /// `docs/research/m1-native-results.md`. Tests drive the same catalog,
     /// journal and adapter composition here; the adapter itself refuses an
-    /// unqualified volume with a typed error.
+    /// unqualified volume with a typed error. Reconciliation is the exception:
+    /// [`Op::Recover`] reaches the same route because recorded pending work
+    /// must be settled after a crash.
     #[doc(hidden)]
     pub fn proof_preview_deployment(
         &mut self,
@@ -873,9 +882,14 @@ impl Workspace {
         self.restore_generation()
     }
 
-    /// Synthetic restart reconciliation, see [`Self::proof_preview_deployment`].
-    #[doc(hidden)]
-    pub fn proof_recover_pending(&mut self) -> Result<Option<Operation>, WireError> {
+    /// Restart reconciliation behind the [`Op::Recover`] wire route.
+    ///
+    /// This is deliberately not gated by [`native_effects_gate`]: a crash
+    /// mid-apply leaves recorded pending work that must be reconciled even
+    /// while client-visible Apply/Restore stay closed. The adapter still
+    /// refuses an unqualified volume with a typed error, so the request can
+    /// never report a simulated success.
+    fn recover_pending(&mut self) -> Result<Option<Operation>, WireError> {
         let selected = self.selected_pair()?;
         // No pending operation means no native work. Answer before opening the
         // port so a clean but unqualified root reports `None`, not a volume
@@ -884,8 +898,15 @@ impl Workspace {
             .journal
             .root_state(&selected.data)
             .map_err(deploy_error)?;
-        if state.pending.is_none() {
+        let Some(op) = state.pending else {
             return Ok(None);
+        };
+        // A pending lease that already records a terminal phase is resolved
+        // work; report that recorded outcome without a second effect.
+        if let Some(status) = Journal::status(&mut self.journal, op).map_err(deploy_error)? {
+            if status.phase.is_terminal() {
+                return Ok(Some(operation(status)));
+            }
         }
         let mut port = self.native_effects(&selected)?;
         marduk_core::recovery::recover_pending(
@@ -896,6 +917,12 @@ impl Workspace {
         )
         .map(|status| status.map(operation))
         .map_err(deploy_error)
+    }
+
+    /// Synthetic restart reconciliation, see [`Self::proof_preview_deployment`].
+    #[doc(hidden)]
+    pub fn proof_recover_pending(&mut self) -> Result<Option<Operation>, WireError> {
+        self.recover_pending()
     }
 
     fn operation(&mut self, args: OperationArgs) -> Result<Operation, WireError> {

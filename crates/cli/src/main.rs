@@ -53,6 +53,8 @@ enum Command {
     },
     /// Restore the recorded deployed generation.
     Restore,
+    /// Reconcile pending work recorded before an interrupted apply or restore.
+    Recover,
     /// Read one operation's authoritative status.
     Operation { operation_id: String },
 }
@@ -168,6 +170,7 @@ fn request(command: Command) -> Result<Request, WireError> {
             DeployCommand::Apply { plan_id } => (Op::DeployApply, json!({ "planId": plan_id })),
         },
         Command::Restore => (Op::Restore, json!({})),
+        Command::Recover => (Op::Recover, json!({})),
         Command::Operation { operation_id } => {
             (Op::Operation, json!({ "operationId": operation_id }))
         }

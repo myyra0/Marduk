@@ -124,6 +124,17 @@ fn setup_status_and_empty_order_workflow() {
         json!("Configuration")
     );
 
+    // A clean root has no pending work; reconciliation answers null without a
+    // native effect.
+    let output = fixture.run(&["recover", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(envelope(&output)["result"], Value::Null);
+
     let output = fixture.run(&["order", "--at-revision", "0", "--json"]);
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(envelope(&output)["result"]["revision"], json!("1"));
@@ -196,6 +207,15 @@ fn relative_setup_persists_an_absolute_locator() {
 #[test]
 fn human_mode_keeps_the_stable_code_and_serialized_detail() {
     let fixture = Fixture::new();
+
+    // No bound installation is a typed refusal, never a simulated clean root.
+    let output = fixture.run(&["recover"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim(),
+        "TargetUnavailable"
+    );
+
     let output = fixture.run(&["setup", "--game-dir", fixture.game_dir()]);
     assert_eq!(
         output.status.code(),
@@ -203,6 +223,10 @@ fn human_mode_keeps_the_stable_code_and_serialized_detail() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+
+    let output = fixture.run(&["recover"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "null");
 
     let output = fixture.run(&["deploy", "preview", "--at-revision", "0"]);
     assert_eq!(output.status.code(), Some(1));
@@ -261,6 +285,12 @@ fn blocked_routes_are_typed_unavailable() {
     let fixture = Fixture::new();
     let zip = fixture.temp.path().join("import.zip");
     fs::write(&zip, b"not a zip").unwrap();
+
+    // Reconciliation without a bound installation refuses; it never answers
+    // `null` as though the root were clean.
+    let output = fixture.run(&["recover", "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(code(&envelope(&output)), "TargetUnavailable");
 
     let output = fixture.run(&[
         "import",

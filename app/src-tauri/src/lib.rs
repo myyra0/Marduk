@@ -37,6 +37,7 @@ pub fn run() {
             commands::deploy_preview,
             commands::deploy_apply,
             commands::restore,
+            commands::recover,
             commands::operation,
         ])
         .run(tauri::generate_context!())
@@ -52,7 +53,10 @@ mod tests {
     #[test]
     fn desktop_resolves_the_shared_app_data_root() {
         let root = app_data_root().expect("an OS data directory is available");
-        assert_eq!(root.file_name(), Some(OsStr::new(marduk_workspace::APP_IDENTIFIER)));
+        assert_eq!(
+            root.file_name(),
+            Some(OsStr::new(marduk_workspace::APP_IDENTIFIER))
+        );
         assert_eq!(root, marduk_workspace::app_data_root().unwrap());
     }
 }

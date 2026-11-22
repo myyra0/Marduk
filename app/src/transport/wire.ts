@@ -173,6 +173,9 @@ export type RestoreResult =
   | { outcome: 'operation'; operation: Operation }
   | { outcome: 'noActiveDeployment'; code: 'NoActiveDeployment' };
 
+/** Crash reconciliation result: the recorded operation, or nothing pending. */
+export type Recover = Operation | null;
+
 export type Selection = { selectionId: Id; label: string };
 
 /**
@@ -515,6 +518,13 @@ export function parseRestoreResult(value: unknown, field = 'restore'): RestoreRe
     return { outcome, code: 'NoActiveDeployment' };
   }
   throw new WireFormatError(`${field}.outcome: unknown value`);
+}
+
+export function parseRecover(value: unknown, field = 'recover'): Recover {
+  if (value === null) {
+    return null;
+  }
+  return parseOperation(value, field);
 }
 
 export function parseProgress(value: unknown, field = 'progress'): Progress {

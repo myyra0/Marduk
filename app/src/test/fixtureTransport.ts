@@ -115,6 +115,10 @@ export function createStubTransport(overrides: Partial<WorkspaceTransport> = {})
       record('restore');
       return { ok: true, result: fixtureRestore() };
     },
+    async recover() {
+      record('recover');
+      return { ok: true, result: null };
+    },
     async operation(operationId) {
       record('operation', { operationId });
       return { ok: true, result: fixtureOperation() };

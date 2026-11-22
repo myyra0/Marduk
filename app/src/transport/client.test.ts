@@ -139,6 +139,24 @@ describe('Tauri transport', () => {
     expect(Object.keys(restoreArgs)).toEqual(['onProgress']);
   });
 
+  it('passes no arguments to recover and accepts an operation or null', async () => {
+    const invoke = invokeReturning(operationFixture);
+    const transport = createTauriTransport(invoke);
+
+    const envelope = await transport.recover();
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith('recover');
+    expect(envelope.ok).toBe(true);
+    if (envelope.ok) {
+      expect(envelope.result?.id).toBe('9223372036854775801');
+      expect(envelope.result?.phase).toBe('completed');
+    }
+
+    const empty = createTauriTransport(invokeReturning({ ok: true, result: null }));
+    await expect(empty.recover()).resolves.toEqual({ ok: true, result: null });
+  });
+
   it('validates progress channel messages and reports undecodable ones', async () => {
     const channel = new FakeChannel<Progress>();
     const invoke: InvokeFn = async (command) => {

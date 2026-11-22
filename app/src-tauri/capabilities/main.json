@@ -15,6 +15,7 @@
     "allow-deploy-preview",
     "allow-deploy-apply",
     "allow-restore",
+    "allow-recover",
     "allow-operation"
   ]
 }
