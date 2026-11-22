@@ -302,6 +302,30 @@ pub const PROOFS: &[Proof] = &[
         date: "2026-11-22",
         revision: "af0fc6d",
     },
+    Proof {
+        capability: Capability::NativeEffects,
+        os: Os::Linux,
+        volume: VolumeClass::Btrfs,
+        layer: Layer::Deploy,
+        witnesses: &[
+            "dispatch_deploy_and_restore_through_the_whole_composition",
+            "unqualified_installation_root_keeps_client_deploy_and_restore_refused",
+        ],
+        date: "2026-11-22",
+        revision: "97c03d9",
+    },
+    Proof {
+        capability: Capability::NativeEffects,
+        os: Os::Linux,
+        volume: VolumeClass::Tmpfs,
+        layer: Layer::Deploy,
+        witnesses: &[
+            "dispatch_deploy_and_restore_through_the_whole_composition",
+            "unqualified_installation_root_keeps_client_deploy_and_restore_refused",
+        ],
+        date: "2026-11-22",
+        revision: "97c03d9",
+    },
 ];
 
 /// The evidence rung a route requires for a capability.

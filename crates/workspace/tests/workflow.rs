@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use marduk_workspace::{
     Code, Envelope, Member, Op, Purpose, Request, Snapshot, WireError, Workspace, WorkspaceStatus,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use zip_fixture::{ClassicZip, Record};
 
