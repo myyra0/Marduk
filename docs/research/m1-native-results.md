@@ -1,6 +1,6 @@
 # M1-R03 native results
 
-Runtime evidence from 2026-11-22 (IST), code commit `29e587d`, base `ebd9e07`. Task 6 native-adapter rows were re-tested at `101b4f7` (recovery fix `7feb64b`), and the composition round trip was re-run at `af0fc6d` with scoped metadata that differs between the original and the staged payload (`2b6b51d` recorded the earlier composition run). `not run` is never a pass. No power-cut or VM evidence exists.
+Runtime evidence from 2026-11-22 (IST), code commit `29e587d`, base `ebd9e07`. Task 6 native-adapter rows were re-tested at `101b4f7` (recovery fix `7feb64b`), and the composition round trip was re-run at `af0fc6d` with scoped metadata that differs between the original and the staged payload (`2b6b51d` recorded the earlier composition run). `not run` is never a pass. No qualifying power-cut result exists.
 
 Close-out 2026-11-22: the Task 5 gate blocked native wiring; a later Task 5 continuation connected private-library staging on the two Linux volume classes with runtime evidence (Btrfs and tmpfs), and the Windows staging adapter is implemented and witnessed on NTFS while its product gate stays closed; see [Qualified library staging](#qualified-library-staging-connected-2026-11-22). Native game-directory preview, Apply and Restore are connected in the workspace proof lane on the two Linux volume classes (Task 6), but client `dispatch` still refuses them behind the closed C1 gate. `not run` rows stay `not run`.
 
@@ -13,7 +13,7 @@ Environment: Linux 7.3.5-1-cachyos, x86-64, rustc 1.100.0, uid 1000 with `CapEff
 | `native_rejects_root_and_parent_substitution` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run | — |
 | `native_detach_preserves_unknown_file` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run | — |
 | `native_error_does_not_prove_no_change` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run | — |
-| `native_namespace_survives_claimed_barrier` | ran 2026-11-22, passed (process-only, new create only) | ran 2026-11-22, passed (process-only, new create only) | not run | not run | Task 8, not run |
+| `native_namespace_survives_claimed_barrier` | ran 2026-11-22, passed (process-only, new create only) | ran 2026-11-22, passed (process-only, new create only) | not run | theoretically approved for testing, empirical proof deferred | Task 8, not run |
 | `library_catalog_never_names_missing_payload` | not run (staging wired on this volume; catalog witness not run) | not run (staging wired on this volume; catalog witness not run) | not run (unqualified; `StageUnavailable`) | not run (unqualified; `StageUnavailable`) | Task 8, not run |
 | `btrfs_cross_subvolume_copy_does_not_use_cross_subvolume_rename` | not run (subvolume teardown EPERM; two-subvolume `EXDEV`/substitution not run) | N/A | N/A | N/A | — |
 
@@ -351,17 +351,182 @@ namespace barrier stays `Unavailable`, and `effects_volume_qualified` therefore
 returns `false` on Windows. Native Apply stays disconnected behind
 `native_effects_gate`.
 
-Windows `native_namespace_survives_claimed_barrier` remains blocked: the
-durability barrier still reports `UnsupportedTarget(Configuration)` because
-Windows documents no ordinary-token namespace persistence barrier. Client
-deploy/restore `dispatch` stays closed behind `native_effects_gate`.
-
 Commands run for this row set:
 
 - `cargo check -p marduk-platform --all-targets --target x86_64-pc-windows-msvc` — passed (compile only).
 - `cargo test -p marduk-platform` (host Linux) — passed, including 6/6 in `tests/effects_primitives.rs`.
 - `cargo fmt --all -- --check` and `cargo build --workspace --locked` — passed.
 
+### Windows NTFS namespace barrier review (2026-11-22, base `495678a`)
+
+**Not approved as a barrier.** For local NTFS and an ordinary Windows token,
+flushing file data and then calling `FlushFileBuffers` on the modified parent
+does not establish the namespace durability required by
+[M1 recovery](../contracts/m1-recovery.md). The API sequence is a candidate
+approved for a discriminating experiment at final qualification. `Theoretical`
+in `crates/core/src/qualification.rs` records that decision separately from
+`PROOFS`; the guard checks the candidate cell and rejects a runtime pass or
+route availability for that configuration while the candidate is listed.
+
+**What the code does.** `effects::sync_directory` already opens the directory
+for write with `FILE_FLAG_BACKUP_SEMANTICS` and calls `File::sync_all` (on
+Windows, `FlushFileBuffers`). Publish, replace and detach use same-volume,
+no-replace `MoveFileExW` with flags `0`. `NativeEffects::durability_barrier`
+returns `Unavailable(UnsupportedTarget(Configuration))` on Windows before
+calling `sync_effect`. Removing that return would not implement the proposed
+sequence: `sync_effect` opens regular files for read on Windows and clones the
+pinned, read-only target parent handle. Neither grants the documented flush
+access. Neither the platform effects nor the adapter path changed.
+Context7's `windows-sys` lookup was checked against the locked
+`windows-sys-0.61.2/src/Windows/Win32/Storage/FileSystem/mod.rs` bindings;
+[Rust's Windows file implementation](https://github.com/rust-lang/rust/blob/master/library/std/src/sys/fs/windows.rs)
+shows the actual sync call.
+
+**Windows contracts and limits.**
+
+- [`CreateFileW`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew)
+  documents `OPEN_EXISTING` and `FILE_FLAG_BACKUP_SEMANTICS` for directory
+  handles. The flag enables the open; it doesn't override access checks unless
+  the requisite backup/restore privileges are present.
+  [`FlushFileBuffers`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers)
+  documents `GENERIC_WRITE`. An ordinary user can get that access in a personal
+  directory whose DACL grants it; ownership or permission to add a file alone
+  doesn't grant the whole mask (it includes `FILE_ADD_SUBDIRECTORY` and
+  write-attribute rights). See [file access rules](https://learn.microsoft.com/en-us/windows/win32/fileio/file-security-and-access-rights).
+  A narrower `FILE_ADD_FILE` mask has reportedly worked on NTFS
+  ([RocksDB draft](https://github.com/meta/rocksdb/pull/15682)); that's not the
+  Win32 contract. A raw volume flush is documented but requires administrative
+  privileges. The upstream draft also reports that opening the volume-root
+  directory for generic write can fail on a normal non-elevated token.
+- [MS-FSA §2.1.5.7](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/0de7dc40-9627-437e-a4df-c4696cdc3d02)
+  says the object-store directory flush persists the directory structure;
+  [product note 80](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/4e3695bd-7574-4f24-a223-b4679c065b63)
+  identifies NTFS as implementing it. That is good reason to test the candidate,
+  but not a local Win32 mapping that specifies which preceding child-name
+  changes and journal records a writable directory handle commits. The
+  [Microsoft Q&A moderator's distinction](https://learn.microsoft.com/en-us/answers/a/13008957)
+  is consistent with this reading; it isn't an API specification.
+- [`MoveFileExW`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw)
+  says `MOVEFILE_WRITE_THROUGH` doesn't return until the file is moved on disk,
+  but the explicit flush guarantee is for a move implemented as copy/delete
+  (the flush is at the end of the copy). There is no comparably explicit
+  power-loss guarantee for both bindings of an in-volume rename. Copy/delete
+  is forbidden here. Adding only `MOVEFILE_WRITE_THROUGH` is a useful comparison
+  arm, not a substitute barrier. `MOVEFILE_REPLACE_EXISTING` would not retain
+  the displaced file. [`ReplaceFileW`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-replacefilew)
+  is a different API: `REPLACEFILE_WRITE_THROUGH` is unsupported, and even
+  with a backup name the attribute merge breaks the staged fingerprint.
+- [`NtFlushBuffersFileEx`](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntflushbuffersfileex)
+  with flags `0` is the full flush form (cached data and metadata plus
+  storage-cache synchronization) and requires write or append access. It
+  doesn't specify a stronger name-binding guarantee. `FILE_DATA_ONLY` omits
+  metadata and storage synchronization; `NO_SYNC` omits storage synchronization;
+  `FILE_DATA_SYNC_ONLY` is invalid for directory handles. No flag cited here
+  provides a better ordinary-token namespace barrier.
+- [`FILE_FLAG_WRITE_THROUGH`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew)
+  covers metadata that results from the write-through request, including an
+  NTFS rename in Microsoft's description. Setting it on an unrelated open
+  doesn't order a later pathname operation. Even a handle-based rename on a
+  write-through handle deserves direct measurement, not inference from the
+  flag. NTFS journal replay restores [filesystem consistency](https://learn.microsoft.com/en-us/windows-server/storage/file-server/ntfs-overview),
+  not necessarily the latest visible name. Home metadata pages need not be
+  durable if the complete redo is durable; submitting a device flush doesn't
+  show that either reached it. A flush/FUA is also only as good as the
+  [filter, controller and device cache path](https://learn.microsoft.com/en-us/windows-hardware/drivers/storage/querying-for-the-write-cache-property)
+  that honors it.
+
+**Upstream practice (not Marduk evidence).**
+
+- [SQLite `os_win.c`](https://github.com/sqlite/sqlite/blob/master/src/os_win.c#L2180-L2220):
+  `winSync` flushes the mapped view when present, then the file handle.
+  [`winDelete`](https://github.com/sqlite/sqlite/blob/master/src/os_win.c#L4552-L4567)
+  explicitly ignores `syncDir` on Win32; no reason or parent-flush guarantee
+  is given there.
+- [LMDB `mdb.c`](https://github.com/LMDB/lmdb/blob/mdb.master/libraries/liblmdb/mdb.c#L2897-L2935):
+  `mdb_env_sync0` says the Windows commit normally uses write-through writes.
+  Forced sync uses the data-file handle (`MDB_FDATASYNC` is `FlushFileBuffers`
+  on Windows); mapped sync also flushes the view. Transaction publication
+  updates database pages and metadata in the existing file, not a directory
+  entry per commit; there is no directory sync in this path.
+- [RocksDB `WinDirectory::Fsync`](https://github.com/facebook/rocksdb/blob/ff683b119cbf42aa616eaeb5fbcec22ee40defb3/port/win/io_win.cc#L1085-L1088)
+  is a no-op returning success. Its [directory open](https://github.com/facebook/rocksdb/blob/ff683b119cbf42aa616eaeb5fbcec22ee40defb3/port/win/env_win.cc#L574-L607)
+  requests zero access for metadata queries, not write access. File sync
+  uses `FlushFileBuffers`; `RenameFile` uses `MOVEFILE_REPLACE_EXISTING`
+  without write-through. The draft to add a directory flush is not merged.
+- [LevelDB `env_windows.cc`](https://github.com/google/leveldb/blob/main/util/env_windows.cc#L312-L326)
+  flushes the file and explicitly skips parent sync, saying creation updates
+  the metadata. That comment isn't a durability guarantee. The Windows
+  rename uses `MoveFileA`, with `ReplaceFileA` as fallback for an existing
+  destination; the [directory-flush proposal](https://github.com/google/leveldb/pull/1388)
+  is not merged.
+- [libuv `src/win/fs.c`](https://github.com/libuv/libuv/blob/v1.x/src/win/fs.c#L2340-L2356):
+  `uv_fs_fsync`/`fdatasync` use `FlushFileBuffers` on the supplied file
+  descriptor; `uv_fs_rename` uses `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`.
+  It doesn't sync the parent in rename or promise a family of durable renames.
+- [sled 0.34.7](https://github.com/spacejam/sled/blob/v0.34.7/src/pagecache/iobuf.rs#L748-L757)
+  syncs the log file; its [snapshot writer](https://github.com/spacejam/sled/blob/v0.34.7/src/pagecache/snapshot.rs#L556-L563)
+  syncs the temporary snapshot then uses `std::fs::rename`, with no parent
+  sync there on any OS. [redb's file backend](https://github.com/cberner/redb/blob/2fc790d14fb62f39137b13f7943df433bec082c2/src/tree_store/page_store/file_backend/optimized.rs#L331-L337)
+  syncs the database file with `sync_data`; commits aren't a filesystem
+  rename protocol and don't sync the parent.
+- [Rust `atomicwrites`](https://github.com/untitaker/rust-atomicwrites/blob/master/src/lib.rs#L314-L334)
+  syncs the temporary file, syncs parents on Unix, and substitutes
+  `MoveFileExW(MOVEFILE_WRITE_THROUGH)` on Windows (also
+  `MOVEFILE_REPLACE_EXISTING` for overwrite). [Rust `tempfile::persist`](https://docs.rs/tempfile/latest/tempfile/struct.NamedTempFile.html#method.persist)
+  explicitly says it doesn't synchronize the file contents or containing
+  directory. These are publication APIs, not precedents for the M1 recovery
+  guarantee.
+
+**What decided the refusal.** The published API scope leaves a gap, and
+third-party [E17 block traces](https://github.com/takomitkm/leveldb/blob/main/docs/powercut/E17-RESULTS.md)
+and [E21 ETW traces](https://github.com/takomitkm/leveldb/blob/main/docs/powercut/E21-RESULTS.md)
+report a disk flush without the expected directory/MFT writeback on the
+parent-directory path. Log records can be present without home pages;
+the reports don't establish what Windows replay reconstructs for Marduk.
+The same project's [E29–E32](https://github.com/takomitkm/leveldb/tree/main/docs/powercut)
+report no reproducible stronger barrier from same-volume
+`MOVEFILE_WRITE_THROUGH`, a write-through native rename handle, or
+`NtFlushBuffersFileEx` flag 8 on the tested stacks. These are warnings, not
+our qualification results. The earlier hard `virsh destroy` observation
+left the new name and correct bytes with and without the parent flush.
+Neither arm showed loss, and the cut did not control what host or device
+caches could write back. That comparison is inconclusive.
+
+**Deferred final experiment.** Use the [R03 cut oracle](../contracts/m1-native-proof.md)
+and a separate cut driver; the existing process witness writes its
+checkpoint in the test tree and measures visibility, not persistence.
+Use a disposable local NTFS volume under a recorded ordinary token, Windows
+build, DACL, and cache stack. Prepare a known stable baseline with unique names
+and distinguishable bytes, identities and metadata. Run matched trials of
+the same mutations with leaf/data sync only (negative control), with the
+candidate parent flush added (all changed parents for cross-directory
+moves), and with an elevated full-volume flush on the disposable volume
+(positive control only). Keep timing and leaf sync the same in the two
+ordinary-token arms. Test a new publish, multi-rename replacement with the
+operation-owned displaced slot, detach/restore, and any newly created
+directory bindings the operation relies on.
+
+Capture writes, completions, FLUSH and FUA at the backing device with a
+volatile-cache model, or use equivalent instrumentation and cut physical
+power to the test storage. Mark syscall returns and journal acknowledgments
+out of band, never by writing a marker to the tested volume. Reconstruct or
+cut immediately before the namespace barrier and immediately after its
+return, before unrelated writeback or acknowledgement. For reconstruction,
+discard uncommitted writes: a completed FLUSH commits the writes it covers;
+FUA commits that write, not all preceding writes. Inspect the durable
+`$LogFile`, `$MFT` and directory index (`$I30`) stream updates, then let
+Windows replay **copies** of those exact images. Verify the old and new
+bindings, file IDs, hashes, metadata, retained bytes and journal state
+against the frozen oracle. Include cuts between replacement moves and
+before and after durable journal acknowledgement to separate legally
+recoverable intermediate states from lost acknowledged changes.
+
+A run discriminates only if the no-namespace-flush control loses or reverts
+a name at a matched cut while the positive control retains it. Require the
+candidate's complete expected state after successful barrier return at
+those cuts; if it loses a name or retained object, reject it. If all arms
+merely survive or the positive control fails, fix the cut setup rather
+than recording a pass. Any result is scoped to the recorded configuration.
 
 ## Test-oracle correction
 

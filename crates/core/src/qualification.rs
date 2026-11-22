@@ -141,6 +141,23 @@ pub struct Proof {
     pub revision: &'static str,
 }
 
+/// A candidate approved for a future experiment, not a runtime proof.
+#[derive(Clone, Copy, Debug)]
+pub struct Theoretical {
+    pub capability: Capability,
+    pub os: Os,
+    pub volume: VolumeClass,
+    pub witness: &'static str,
+}
+
+/// Deferred experiments, separate from the proofs that routes consult.
+pub const THEORETICAL: &[Theoretical] = &[Theoretical {
+    capability: Capability::NativeEffects,
+    os: Os::Windows,
+    volume: VolumeClass::Ntfs,
+    witness: "native_namespace_survives_claimed_barrier",
+}];
+
 /// Code that exists on an operating system. Implementation is not evidence.
 const IMPLEMENTED: &[(Capability, Os)] = &[
     (Capability::LibraryStaging, Os::Linux),

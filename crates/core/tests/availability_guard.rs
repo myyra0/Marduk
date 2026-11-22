@@ -20,7 +20,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use marduk_core::qualification::{Capability, Os, PROOFS, Proof, VolumeClass, missing_witness};
+use marduk_core::qualification::{
+    Capability, Os, PROOFS, Proof, Route, THEORETICAL, VolumeClass, available, missing_witness,
+};
 
 const EVIDENCE: &str = "docs/research/m1-native-results.md";
 
@@ -29,6 +31,7 @@ enum Status {
     Ran,
     Unrun,
     NotApplicable,
+    Theoretical,
 }
 
 fn repo_root() -> PathBuf {
@@ -231,6 +234,9 @@ fn parse_status(line: usize, witness: &str, cell: &str) -> Status {
     }
     if lowered.starts_with("not run") {
         return Status::Unrun;
+    }
+    if lowered == "theoretically approved for testing, empirical proof deferred" {
+        return Status::Theoretical;
     }
     if matches!(cell, "N/A" | "—" | "-" | "") {
         return Status::NotApplicable;
@@ -481,11 +487,34 @@ fn the_record_and_the_evidence_document_agree() {
                  availability record has no proof for it; add the witness to the record or \
                  correct the row"
             ),
-            Status::Unrun | Status::NotApplicable => assert!(
+            Status::Unrun | Status::NotApplicable | Status::Theoretical => assert!(
                 !recorded,
                 "the availability record proves `{witness}` on {os} {volume}, but {EVIDENCE} \
                  does not record a pass for it; run the test or withdraw the proof"
             ),
+        }
+    }
+}
+
+#[test]
+fn theoretical_candidates_match_the_document_without_qualifying_a_route() {
+    let text = evidence_text();
+    let documented: BTreeSet<_> = observed_cells(&text)
+        .into_iter()
+        .chain(primitive_cells(&text))
+        .filter_map(|(key, status)| (status == Status::Theoretical).then_some(key))
+        .collect();
+    let recorded: BTreeSet<_> = THEORETICAL
+        .iter()
+        .map(|candidate| (candidate.witness.to_owned(), candidate.os, candidate.volume))
+        .collect();
+    assert_eq!(documented, recorded);
+    for candidate in THEORETICAL {
+        for route in [Route::Adapter, Route::Import, Route::Deploy, Route::Restore] {
+            assert!(
+                !available(candidate.capability, route, candidate.os, candidate.volume),
+                "{candidate:?} is theoretical, but {route:?} is available"
+            );
         }
     }
 }
