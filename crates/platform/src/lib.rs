@@ -53,6 +53,7 @@ use linux as native;
 #[cfg(windows)]
 use windows as native;
 
+pub mod effects;
 pub mod library_stage;
 #[doc(hidden)]
 pub mod native_proof;
@@ -142,6 +143,13 @@ impl InstallationBinding {
     pub fn identities(&self) -> (&RootIdentity, &RootIdentity) {
         self.inner.identities()
     }
+
+    /// Re-prove the live installation/data pair through its pinned handles. A
+    /// renamed, replaced or redirected root is refused; no replacement binding
+    /// is adopted.
+    pub fn verify(&self) -> Result<(), RootError> {
+        self.inner.check_roots()
+    }
 }
 
 impl fmt::Debug for InstallationBinding {
@@ -164,6 +172,13 @@ impl ResolvedTarget<'_> {
     /// planned spelling supplied by the caller.
     pub fn leaf(&self) -> &str {
         self.inner.leaf()
+    }
+
+    /// A clone of the verified parent directory handle for a handle-relative
+    /// effect. The caller re-observes before acting; the handle keeps the
+    /// parent pinned.
+    pub fn parent_dir(&self) -> Result<std::fs::File, RootError> {
+        self.inner.parent_dir()
     }
 }
 
