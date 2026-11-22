@@ -85,7 +85,8 @@ fn assert_refused(error: ImportError) {
 
 /// Create a directory redirection at `link`. Linux uses a symlink; Windows
 /// tries a directory symlink and falls back to a junction, which an ordinary
-/// user can create without the symlink privilege.
+/// user can create without the symlink privilege. `MARDUK_FORCE_JUNCTION=1`
+/// forces the junction path so it can be exercised even in an elevated session.
 fn link_directory(link: &Path, target: &Path) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -93,14 +94,15 @@ fn link_directory(link: &Path, target: &Path) -> bool {
     }
     #[cfg(windows)]
     {
-        if std::os::windows::fs::symlink_dir(target, link).is_ok() {
+        let force_junction = std::env::var("MARDUK_FORCE_JUNCTION")
+            .map(|value| value != "0" && !value.is_empty())
+            .unwrap_or(false);
+
+        if !force_junction && std::os::windows::fs::symlink_dir(target, link).is_ok() {
             eprintln!("link_directory: used symlink_dir for {}", link.display());
             return true;
         }
-        eprintln!(
-            "link_directory: symlink_dir refused, falling back to mklink /J for {}",
-            link.display()
-        );
+
         let created = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
             .arg(link)
@@ -108,7 +110,7 @@ fn link_directory(link: &Path, target: &Path) -> bool {
             .status()
             .is_ok_and(|status| status.success());
         if created {
-            eprintln!("link_directory: used mklink /J for {}", link.display());
+            eprintln!("link_directory: used junction for {}", link.display());
         }
         created
     }
@@ -194,7 +196,11 @@ fn redirected_revisions_is_refused_without_writes() {
     fs::create_dir(&root).unwrap();
     let outside = tmp.path().join("outside");
     fs::create_dir(&outside).unwrap();
+    #[cfg(windows)]
+    std::env::set_var("MARDUK_FORCE_JUNCTION", "1");
     assert!(link_directory(&root.join(REVISIONS), &outside));
+    #[cfg(windows)]
+    std::env::remove_var("MARDUK_FORCE_JUNCTION");
 
     assert!(matches!(
         NativeStage::open(&root),
