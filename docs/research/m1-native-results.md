@@ -1,8 +1,8 @@
 # M1-R03 native results
 
-Runtime evidence from 2026-11-22 (IST), code commit `29e587d`, base `ebd9e07`. `not run` is never a pass. No power-cut or VM evidence exists.
+Runtime evidence from 2026-11-22 (IST), code commit `29e587d`, base `ebd9e07`. Task 6 native-adapter rows were re-tested at `101b4f7` (recovery fix `7feb64b`). `not run` is never a pass. No power-cut or VM evidence exists.
 
-Close-out 2026-11-22: the Task 5 gate blocked native wiring. A later Task 5 continuation connected private-library staging on the two volume classes with runtime evidence (Linux Btrfs and Linux tmpfs); see [Qualified library staging](#qualified-library-staging-connected-2026-11-22). `not run` rows stay `not run`, and no game-directory publication, Apply or Restore is wired. No Task 6 native wiring is unlocked.
+Close-out 2026-11-22: the Task 5 gate blocked native wiring; a later Task 5 continuation connected private-library staging on the two volume classes with runtime evidence (Linux Btrfs and Linux tmpfs); see [Qualified library staging](#qualified-library-staging-connected-2026-11-22). Native game-directory preview, Apply and Restore are now connected in the workspace proof lane on qualified volumes (Task 6), but client `dispatch` still refuses them behind the closed C1 gate. `not run` rows stay `not run`.
 
 Environment: Linux 7.3.5-1-cachyos, x86-64, rustc 1.100.0, uid 1000 with `CapEff: 0` (ordinary user, no elevated token). tmpfs scratch: `/tmp` `rw,noatime,inode64,huge=advise`, fsid `b6b575e7…`, mount view 74, no Btrfs tree. Btrfs scratch: `/home` on `/dev/nvme0n1p2[/@home]` `rw,noatime,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/@home`, fsid `b68b24bc…`, view 61, tree 257. All fixtures are synthetic files under a disposable parent; no game, external root or elevated operation was touched.
 
@@ -58,7 +58,7 @@ Continuation of Task 5 after the 2026-11-22 ruling. `Catalog::open` now selects 
 - Windows/native NTFS: `library_volume_qualified` is `false` and `StagingTree::open` is `Unsupported(Configuration)`.
 - A qualified volume whose private boundary will not bind: a redirected root or `revisions/`, an owner or mount mismatch, or a two-subvolume/`EXDEV` layout with no evidence. `NativeStage::open` refusal is final; it is never retried through a weaker adapter.
 
-Wired: private staging (private archive snapshot, admitted member set, hashed payload under `revisions/<id>/`, `sync_revisions` before the receipt) and catalog publication of a prepared import into the library (SQLite membership only, after native re-observation). Not wired: any game-directory effect. `DeploymentInputs`, `Catalog::prepare` deploy/restore routes, game publication/Apply and Restore remain typed unavailable, and no power-cut claim exists.
+Wired: private staging (private archive snapshot, admitted member set, hashed payload under `revisions/<id>/`, `sync_revisions` before the receipt) and catalog publication of a prepared import into the library (SQLite membership only, after native re-observation). Separate from library staging, Task 6 connected the native copy adapter for game-directory preview, Apply and Restore in the workspace `proof_*` lane on qualified volumes; client `dispatch` refuses `deploy_preview`, `deploy_apply` and `restore` with `UnsupportedTarget`/`Configuration`. No client-visible native write is unlocked, and no power-cut claim exists.
 
 | Suite / test | Required volume | Exact run condition | Observed |
 |---|---|---|---|
@@ -96,13 +96,13 @@ Base `8110c38`. `NativeStage` now keeps every archive and payload effect on the 
 
 **Known limitation (accepted by the 2026-11-22 user ruling):** On Linux and Windows, a same-privilege process can substitute the parent or leaf between the final live-handle check and the syscall. The [R02 contract](../contracts/m1-recovery.md#native-seam-that-r03-must-qualify) requires post-effect reobservation to detect divergence, retention of actually displaced bytes, and refusal to retry automatically on divergence. It does not claim prevention. A syscall error is not evidence of no change.
 
-The ruling changes the qualification criterion; it supplies no runtime evidence. Native staging is now wired only on Linux Btrfs and Linux tmpfs, and remains unqualified and unwired on ext4 and native NTFS. Publication into a game directory, Apply, Restore and power-cut behaviour remain unqualified and unwired.
+The ruling changes the qualification criterion; it supplies no runtime evidence. Native staging is now wired only on Linux Btrfs and Linux tmpfs, and remains unqualified and unwired on ext4 and native NTFS. Game-directory publication through the native adapter is connected in the workspace proof lane on those two Linux volume classes; client Apply and Restore stay behind the closed C1 gate. Power-cut behaviour remains unqualified.
 
 ## Native copy adapter (Task 6, 2026-11-22)
 
 Base `5fe1a02`. Adapter commit `b522b48`; primitive promotion `3f03ac8`;
-Windows compile fix `8fd7f79`.
-The checked effect primitives moved out of the hidden proof
+Windows compile fix `8fd7f79`; restart-durability fix `7feb64b`; preview/manifest
+alignment `101b4f7`. The checked effect primitives moved out of the hidden proof
 harness into `marduk_platform::effects`; `native_proof` now calls the same code.
 A production `marduk_storage::native_effects::NativeEffects` adapter implements
 `DeploymentInputs` and `CopyEffects` against the journal's recorded locator and
@@ -116,21 +116,59 @@ The workspace reaches the adapter only through its `proof_*` methods. Client
 run; the single decision point names this document. No real game directory was
 written.
 
+All rows below re-ran on 2026-11-22 at `101b4f7` on both qualified Linux volume
+classes.
+
 | Witness | Linux Btrfs | Linux tmpfs | Linux ext4 | Hosted `windows-2025` NTFS |
 |---|---|---|---|---|
-| `qualified_native_round_trip_retains_backups_and_restores_the_original_tree` (workspace: setup → import → order → preview → apply → restart → restore) | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run |
-| `native_copy_adapter_restart_after_apply_before_ack` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run |
-| `native_copy_adapter_concurrent_edit_conflicts_and_preserves_bytes` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run |
-| `native_copy_adapter_recorded_locator_mismatch_is_refused` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run |
-| `native_copy_adapter_unqualified_root_is_refused_before_writes` | ran 2026-11-22, passed (procfs refusal) | ran 2026-11-22, passed (procfs refusal) | not run | not run |
+| `qualified_native_round_trip_retains_backups_and_restores_the_original_tree` (workspace: setup → import → order → preview → apply → restart → replay → restore) | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
+| `restart_after_apply_before_ack_rolls_back_and_never_reapplies` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
+| `restart_after_record_undo_uses_the_sealed_stage_fingerprint` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
+| `restart_mid_restore_continues_in_reverse_order` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
+| `concurrent_edit_during_apply_conflicts_and_preserves_external_bytes` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
+| `restore_time_external_edit_conflicts_and_preserves_external_bytes` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
+| `recorded_locator_mismatch_is_a_typed_refusal` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
+| `unqualified_installation_root_is_refused_before_any_write` | ran 2026-11-22 at `101b4f7`, passed (procfs installation) | ran 2026-11-22 at `101b4f7`, passed (procfs installation) | not run | not run |
+| `unqualified_app_root_is_refused_before_any_write` | ran 2026-11-22 at `101b4f7`, passed (sysfs app root) | ran 2026-11-22 at `101b4f7`, passed (sysfs app root) | not run | not run |
+| `unreadable_private_slot_is_unavailable_not_absent` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
+| `prepare_persists_private_artifacts_before_publication` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
+| `dispatch_stays_typed_unavailable_after_native_composition` (preview, apply and restore) | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
 
 The workspace round trip uses disposable synthetic roots only. It verifies the
 deployed bytes, the retained `original` backups for replaced files, the absent
 original slot for a created file, the committed generation after a restart, a
-no-op recovery, a reverse-order restore, and the exact original file tree after
-restore. The restart cut applies and barriers the winner, loses the step record,
-reopens the journal, rolls back under recovery, and proves a second recovery
-does not reapply.
+no-op recovery, a replay that reports the recorded operation, a reverse-order
+restore, and the exact original file tree after restore. The restart cut applies
+and barriers the winner, loses the step record, reopens the journal, rolls back
+under recovery, and proves a second recovery does not reapply.
+
+### Restart durability and evidence correction (`101b4f7`)
+
+- Recovery no longer depends on the map that `prepare` built. Every
+  `inspect_step` copies the sealed `staged` fingerprint from the journal-derived
+  `PreparedStep` before `execute`/`execute_undo`, so a reopened adapter can
+  classify and resume an exchange. Both restart witnesses above cut the port and
+  reopen before recovery and assert real target bytes and the terminal phase.
+- `artifact` maps only a `symlink_metadata` `NotFound` to `Absent`. A stat that
+  succeeds followed by an open/read failure is `Unavailable`, so an unreadable
+  slot cannot satisfy `matches_post` as if it were empty.
+- `prepare` fsyncs the operation directory and its ancestors up to the app data
+  root before returning. `prepare_persists_private_artifacts_before_publication`
+  reopens the port after prepare, verifies the private evidence and the unchanged
+  public tree, and resolves the prepared operation as `Cancelled`. This is a
+  process-restart witness, not power-loss evidence for directory fsync ordering.
+- The workspace consults `Journal::claimed` for Apply and `root_state`/`status`
+  for Restore before opening the native port, so a claimed replay reports its
+  recorded status and a clean root reports `NoActiveDeployment` instead of
+  `UnsupportedTarget`.
+- Windows `replace` now returns `UnsupportedTarget(Configuration)`; it never
+  passes the stage path as both replacement and backup. Windows remains
+  unqualified for every native effect and no NTFS runtime row exists.
+- `resolved_inputs` inserts a manifest only for a published revision: an unknown
+  revision is omitted (`MissingManifest` can fire) and a published revision with
+  no rows is an empty manifest.
+- Preview `winner`/`candidates` are member ids, matching the fixture and the TS
+  DTO; a fixture drift witness asserts they are never installed revision ids.
 
 ### Primitive correction
 
@@ -143,19 +181,21 @@ both qualified volumes afterwards: 7 passed on each.
 
 ### Commands
 
-- `TMPDIR=/tmp cargo test -p marduk-storage --test native_effects -- --ignored --test-threads=1` — 4 passed.
-- `TMPDIR=/var/tmp cargo test -p marduk-storage --test native_effects -- --ignored --test-threads=1` — 4 passed.
-- `TMPDIR=/tmp cargo test -p marduk-workspace --test native_deployment -- --ignored --test-threads=1` — 2 passed.
-- `TMPDIR=/var/tmp cargo test -p marduk-workspace --test native_deployment -- --ignored --test-threads=1` — 2 passed.
+- `TMPDIR=/tmp cargo test -p marduk-storage --test native_effects -- --ignored --test-threads=1` — 10 passed at `101b4f7`.
+- `TMPDIR=/var/tmp cargo test -p marduk-storage --test native_effects -- --ignored --test-threads=1` — 10 passed at `101b4f7`.
+- `TMPDIR=/tmp cargo test -p marduk-workspace --test native_deployment -- --ignored --test-threads=1` — 2 passed at `101b4f7`.
+- `TMPDIR=/var/tmp cargo test -p marduk-workspace --test native_deployment -- --ignored --test-threads=1` — 2 passed at `101b4f7`.
 - `TMPDIR=/tmp` and `TMPDIR=/var/tmp cargo test -p marduk-storage --test qualified_stage -- --ignored` — 1 passed on each.
 - `MARDUK_R03_SCRATCH=/tmp` and `/var/tmp cargo test -p marduk-platform --test native_proof_evidence -- --test-threads=1` — 7 passed on each.
 - `MARDUK_R03_SCRATCH=/tmp` and `/var/tmp cargo test -p marduk-platform --test native_publication -- --test-threads=1` — 8 passed, 1 ignored on each after the `futimens` correction.
-- `TMPDIR=/tmp cargo test -p marduk-platform -p marduk-storage -p marduk-workspace -p marduk-cli` — passed.
-- `cargo fmt --all -- --check`, `cargo build --workspace --locked`, `TMPDIR=/tmp cargo test --workspace --locked` — passed.
+- `TMPDIR=/tmp cargo test -p marduk-platform -p marduk-storage -p marduk-workspace -p marduk-cli` — passed at `101b4f7`.
+- `cargo fmt --all -- --check`, `cargo build --workspace --locked`, `TMPDIR=/tmp cargo test --workspace --locked` — passed at `101b4f7`.
+- `cargo check -p marduk-platform --tests --target x86_64-pc-windows-msvc` — passed at `101b4f7`; compile-only, not NTFS runtime evidence.
 
 Linux ext4 and native NTFS remain `not run`. Windows compilation is not NTFS
-runtime evidence, and `effects::volume_qualified` refuses every Windows volume.
-The final-window substitution limitation in
+runtime evidence, `effects::volume_qualified` refuses every Windows volume, and
+Windows `replace` now reports `UnsupportedTarget(Configuration)` instead of
+offering an unproven exchange. The final-window substitution limitation in
 [R02](../contracts/m1-recovery.md#native-seam-that-r03-must-qualify) is unchanged:
 the adapter detects divergence after an effect and retains displaced bytes; it
 does not claim prevention.
