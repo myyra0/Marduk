@@ -98,6 +98,66 @@ Base `8110c38`. `NativeStage` now keeps every archive and payload effect on the 
 
 The ruling changes the qualification criterion; it supplies no runtime evidence. Native staging is now wired only on Linux Btrfs and Linux tmpfs, and remains unqualified and unwired on ext4 and native NTFS. Publication into a game directory, Apply, Restore and power-cut behaviour remain unqualified and unwired.
 
+## Native copy adapter (Task 6, 2026-11-22)
+
+Base `5fe1a02`. Adapter commit `b522b48`; primitive promotion `3f03ac8`.
+The checked effect primitives moved out of the hidden proof
+harness into `marduk_platform::effects`; `native_proof` now calls the same code.
+A production `marduk_storage::native_effects::NativeEffects` adapter implements
+`DeploymentInputs` and `CopyEffects` against the journal's recorded locator and
+the app-owned library root. It refuses an unqualified volume, reopens the
+recorded locator, uses bound targets, retains actually displaced bytes, obtains
+the root and library gates in order, and records `Applied` only after the
+platform returns durability evidence.
+
+The workspace reaches the adapter only through its `proof_*` methods. Client
+`dispatch` and status remain typed unavailable because the C1 proof lane has not
+run; the single decision point names this document. No real game directory was
+written.
+
+| Witness | Linux Btrfs | Linux tmpfs | Linux ext4 | Hosted `windows-2025` NTFS |
+|---|---|---|---|---|
+| `qualified_native_round_trip_retains_backups_and_restores_the_original_tree` (workspace: setup → import → order → preview → apply → restart → restore) | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run |
+| `native_copy_adapter_restart_after_apply_before_ack` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run |
+| `native_copy_adapter_concurrent_edit_conflicts_and_preserves_bytes` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run |
+| `native_copy_adapter_recorded_locator_mismatch_is_refused` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run |
+| `native_copy_adapter_unqualified_root_is_refused_before_writes` | ran 2026-11-22, passed (procfs refusal) | ran 2026-11-22, passed (procfs refusal) | not run | not run |
+
+The workspace round trip uses disposable synthetic roots only. It verifies the
+deployed bytes, the retained `original` backups for replaced files, the absent
+original slot for a created file, the committed generation after a restart, a
+no-op recovery, a reverse-order restore, and the exact original file tree after
+restore. The restart cut applies and barriers the winner, loses the step record,
+reopens the journal, rolls back under recovery, and proves a second recovery
+does not reapply.
+
+### Primitive correction
+
+While exercising the moved copy primitive, the adapter's metadata witness
+failed on a freshly copied backup. `copy_file` passed the `futimens` array as
+`[mtime, atime]`; POSIX expects `[atime, mtime]`. The primitive now preserves
+the source modification time. This is a correctness fix in the promoted code,
+not a change to any contract or oracle. `native_proof_evidence` was re-run on
+both qualified volumes afterwards: 7 passed on each.
+
+### Commands
+
+- `TMPDIR=/tmp cargo test -p marduk-storage --test native_effects -- --ignored --test-threads=1` — 4 passed.
+- `TMPDIR=/var/tmp cargo test -p marduk-storage --test native_effects -- --ignored --test-threads=1` — 4 passed.
+- `TMPDIR=/tmp cargo test -p marduk-workspace --test native_deployment -- --ignored --test-threads=1` — 2 passed.
+- `TMPDIR=/var/tmp cargo test -p marduk-workspace --test native_deployment -- --ignored --test-threads=1` — 2 passed.
+- `TMPDIR=/tmp` and `TMPDIR=/var/tmp cargo test -p marduk-storage --test qualified_stage -- --ignored` — 1 passed on each.
+- `MARDUK_R03_SCRATCH=/tmp` and `/var/tmp cargo test -p marduk-platform --test native_proof_evidence -- --test-threads=1` — 7 passed on each.
+- `TMPDIR=/tmp cargo test -p marduk-platform -p marduk-storage -p marduk-workspace -p marduk-cli` — passed.
+- `cargo fmt --all -- --check`, `cargo build --workspace --locked`, `TMPDIR=/tmp cargo test --workspace --locked` — passed.
+
+Linux ext4 and native NTFS remain `not run`. Windows compilation is not NTFS
+runtime evidence, and `effects::volume_qualified` refuses every Windows volume.
+The final-window substitution limitation in
+[R02](../contracts/m1-recovery.md#native-seam-that-r03-must-qualify) is unchanged:
+the adapter detects divergence after an effect and retains displaced bytes; it
+does not claim prevention.
+
 ## Test-oracle correction
 
 `crates/storage/tests/library_contract.rs` was changed at `a2250e9` from an unconditional `StageUnavailable` assertion to a both-branch assertion because the 2026-11-22 user ruling connected native staging on qualified volumes; the refusal branch still asserts `StageUnavailable`, the initial profile and zero `revisions/` entries, and the qualified branch asserts a prepared receipt plus reopen/`reconcile`; approved by the orchestrator as scope-mandated; `qualified_stage` is the positive guard and must not become a silent skip.
