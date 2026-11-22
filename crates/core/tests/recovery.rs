@@ -141,6 +141,8 @@ struct Effects {
     unreadable_retains: BTreeSet<BackupRef>,
     target_reads: BTreeMap<String, usize>,
     unreadable_target_after: Option<(&'static str, usize)>,
+    stage_reads: BTreeMap<u32, usize>,
+    corrupt_stage_after: Option<(u32, usize)>,
 }
 
 impl Effects {
@@ -179,6 +181,8 @@ impl Effects {
             unreadable_retains: BTreeSet::new(),
             target_reads: BTreeMap::new(),
             unreadable_target_after: None,
+            stage_reads: BTreeMap::new(),
+            corrupt_stage_after: None,
         }
     }
 
@@ -538,6 +542,15 @@ impl CopyEffects for Effects {
                 stage: Artifact::Unavailable,
                 retained: Artifact::Unavailable,
             };
+        }
+        let stage_reads = self.stage_reads.entry(step.ordinal).or_insert(0);
+        *stage_reads += 1;
+        if self
+            .corrupt_stage_after
+            .is_some_and(|(ordinal, after)| ordinal == step.ordinal && *stage_reads >= after)
+            && let Some((at, _)) = step.staged
+        {
+            self.visible.staged.retain(|(slot, _)| *slot != at);
         }
         let reads = self.retain_reads.entry(step.ordinal).or_insert(0);
         *reads += 1;
@@ -1768,4 +1781,31 @@ fn missing_or_corrupt_step_preimage_is_not_a_safe_rollback() {
             f.mutations(&[(Mutation::Create, CREATED), (Mutation::Replace, WINNER)]);
         }
     }
+}
+
+#[test]
+fn a_stage_changed_after_preflight_blocks_before_any_effect() {
+    let mut f = Fixture::new(WINNER);
+    let plan = f.plan();
+    // First inspection is the operation-wide preflight; the second is the
+    // per-step apply boundary for ordinal 0 (the created file).
+    f.effects.corrupt_stage_after = Some((0, 2));
+
+    assert_eq!(f.commit(plan), Err(DeployError::RecoveryConflict));
+    assert!(
+        f.effects.mutations.is_empty(),
+        "no later effect may follow a changed stage"
+    );
+    let pending = f
+        .journal
+        .visible
+        .pending
+        .expect("the blocked operation stays pending");
+    let status = f.state(pending);
+    assert_eq!(
+        (status.phase, status.blocker),
+        (Phase::Applying, Some(DeployError::RecoveryConflict))
+    );
+    assert_eq!(f.effects.visible.public[WINNER].bytes, BASE);
+    assert!(!f.effects.visible.public.contains_key(CREATED));
 }

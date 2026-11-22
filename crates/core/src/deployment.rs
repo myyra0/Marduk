@@ -530,6 +530,10 @@ pub fn restore<J: Journal, P: DeploymentInputs>(
 /// Inspect a step at the per-step apply boundary. An unreadable target is a
 /// typed blocker: the checked exchange cannot prove its precondition from a
 /// failed read, so no effect may run and no displacement may be attributed.
+///
+/// The full precondition is repeated here, not only readability: a stage or
+/// backup changed after the operation-wide preflight must block this effect
+/// before any later step mutates the install.
 fn inspect_effect_ready<J: Journal, P: CopyEffects>(
     journal: &mut J,
     port: &mut P,
@@ -538,6 +542,10 @@ fn inspect_effect_ready<J: Journal, P: CopyEffects>(
 ) -> Result<(), DeployError> {
     let evidence = crate::recovery::inspect_checked(journal, port, step)?;
     if let Some(error) = crate::recovery::target_error(&evidence) {
+        journal.block(op, Some(error))?;
+        return Err(error);
+    }
+    if let Err(error) = crate::recovery::check_pre(port, step, &evidence) {
         journal.block(op, Some(error))?;
         return Err(error);
     }
