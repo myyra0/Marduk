@@ -37,7 +37,7 @@ pub struct OperationJournal {
 ///
 /// The locator is retained so callers can reopen and re-verify the native
 /// pair. It is never a wire value, and it grants no write authority.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectedInstallation {
     pub id: u64,
     pub locator: PathBuf,
@@ -73,7 +73,7 @@ impl OperationJournal {
         locator: &Path,
         installation: &RootIdentity,
         data: &RootIdentity,
-    ) -> Result<(), DeployError> {
+    ) -> Result<SelectedInstallation, DeployError> {
         let _guard = self.lock()?;
         let installation_blob = encode_root(installation);
         let data_blob = encode_root(data);
@@ -158,7 +158,9 @@ impl OperationJournal {
                 )
                 .map_err(|_| DeployError::Io)?;
         }
-        transaction.commit().map_err(|_| DeployError::Io)
+        let selected = read_selected(&transaction)?.ok_or(DeployError::Io)?;
+        transaction.commit().map_err(|_| DeployError::Io)?;
+        Ok(selected)
     }
 
     /// Read the selected installation, its locator and the lease state.
@@ -166,54 +168,59 @@ impl OperationJournal {
     /// This is the restart read for clients: it reports recorded work but never
     /// resumes or retries it.
     pub fn selected_installation(&mut self) -> Result<Option<SelectedInstallation>, DeployError> {
-        let read = self.connection.transaction().map_err(|_| DeployError::Io)?;
-        let row: Option<(i64, Vec<u8>, Vec<u8>, Vec<u8>, Option<i64>, Option<i64>)> = read
-            .query_row(
-                "SELECT i.id, i.location, i.installation, i.data, \
-                 l.pending_op, l.active_generation \
-                 FROM installations i \
-                 LEFT JOIN root_leases l \
-                   ON l.data = i.data AND l.installation = i.installation \
-                 WHERE i.selected = 1",
-                [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|_| DeployError::Io)?;
-        let Some((id, location, installation, data, pending, active)) = row else {
-            return Ok(None);
-        };
-
-        let locator = decode_locator(&location).ok_or(DeployError::Io)?;
-        let installation = decode_root(&installation)?;
-        let data = decode_root(&data)?;
-        let pending = pending
-            .map(|operation| {
-                let id = OperationId::try_from_u64(row_id(operation)?)?;
-                read_status(&read, id)?.ok_or(DeployError::Io)
-            })
-            .transpose()?;
-        let active_generation = active.map(row_id).transpose()?;
-
-        Ok(Some(SelectedInstallation {
-            id: positive(id)?,
-            locator,
-            installation,
-            data,
-            pending,
-            active_generation,
-        }))
+        read_selected(&self.connection)
     }
+}
 
+fn read_selected(connection: &Connection) -> Result<Option<SelectedInstallation>, DeployError> {
+    let row: Option<(i64, Vec<u8>, Vec<u8>, Vec<u8>, Option<i64>, Option<i64>)> = connection
+        .query_row(
+            "SELECT i.id, i.location, i.installation, i.data, \
+             l.pending_op, l.active_generation \
+             FROM installations i \
+             LEFT JOIN root_leases l \
+               ON l.data = i.data AND l.installation = i.installation \
+             WHERE i.selected = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| DeployError::Io)?;
+    let Some((id, location, installation, data, pending, active)) = row else {
+        return Ok(None);
+    };
+
+    let locator = decode_locator(&location).ok_or(DeployError::Io)?;
+    let installation = decode_root(&installation)?;
+    let data = decode_root(&data)?;
+    let pending = pending
+        .map(|operation| {
+            let id = OperationId::try_from_u64(row_id(operation)?)?;
+            read_status(connection, id)?.ok_or(DeployError::Io)
+        })
+        .transpose()?;
+    let active_generation = active.map(row_id).transpose()?;
+
+    Ok(Some(SelectedInstallation {
+        id: positive(id)?,
+        locator,
+        installation,
+        data,
+        pending,
+        active_generation,
+    }))
+}
+
+impl OperationJournal {
     fn lock(&self) -> Result<WriterGuard, DeployError> {
         self.gate.try_lock().map_err(gate_error)
     }
@@ -1105,15 +1112,19 @@ fn read_status(
     for row in &steps {
         retained.extend(row.prepared.spec.original.backup);
         retained.extend(row.prepared.step_pre.backup);
-        if let Some(undo) = &row.undo {
-            retained.extend(undo.step_pre.backup);
-            retained.insert(row.prepared.retain);
-        }
-        if row
+        let confirmed = row
             .evidence
             .as_ref()
-            .is_some_and(|evidence| matches!(evidence.retained, Artifact::Regular(_)))
-        {
+            .is_some_and(|evidence| observed_retention(&evidence.retained));
+        if let Some(undo) = &row.undo {
+            retained.extend(undo.step_pre.backup);
+            // The canonical retain is known only when evidence observed it;
+            // an unreadable slot is not reported as retained.
+            if confirmed {
+                retained.insert(row.prepared.retain);
+            }
+        }
+        if confirmed {
             let settled = if row.phase == StepPhase::Undone {
                 row.undo.as_ref().unwrap_or(&row.prepared)
             } else {
@@ -1126,6 +1137,7 @@ fn read_status(
     retained.extend(
         owned_displacements(connection, op, &steps)?
             .into_iter()
+            .filter(|(_, evidence)| observed_retention(&evidence.retained))
             .map(|(at, _)| at),
     );
     let generation = match (row.kind, row.phase) {
@@ -1506,6 +1518,11 @@ fn direction_tag(direction: StepDirection) -> i64 {
         StepDirection::Forward => 0,
         StepDirection::Undo => 1,
     }
+}
+
+/// An artifact the journal actually observed, as opposed to an unreadable slot.
+fn observed_retention(artifact: &Artifact) -> bool {
+    matches!(artifact, Artifact::Regular(_) | Artifact::Unsupported(_))
 }
 
 fn read_displacement(connection: &Connection, op: OperationId) -> Result<Option<()>, DeployError> {

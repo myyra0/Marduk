@@ -121,7 +121,9 @@ fn unreadable_canonical_retain_blocks_recovery_without_effect() {
         .unwrap()
         .unwrap();
     assert_eq!(status.blocker, Some(DeployError::RecoveryConflict));
-    assert!(status.retained.contains(&step.retain));
+    // An unreadable canonical slot is evidence, not a known retention; the
+    // positively observed alternate stays reported.
+    assert!(!status.retained.contains(&step.retain));
     assert!(status.retained.contains(&alternate));
     assert_eq!(journal.unexpected_displacements(op).unwrap().len(), 2);
     assert_eq!(effects.mutations, 0);
