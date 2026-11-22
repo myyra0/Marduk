@@ -19,7 +19,7 @@ use selection::{SelectionStore, Source};
 use marduk_core::deployment::{
     DeployError, OperationKind, OperationStatus, Phase, PlanId, PreState,
 };
-use marduk_core::ids::{MemberId, ProfileId, ProfileRevision};
+use marduk_core::ids::{InstalledRevisionId, MemberId, ProfileId, ProfileRevision};
 use marduk_core::import::NamedProfile;
 use marduk_core::import::{
     ArchiveError, BeginImport, ImportError, ImportId, ImportTarget, LimitKind, PreparedImport,
@@ -720,30 +720,48 @@ impl Workspace {
             &selected.data,
         )
         .map_err(deploy_error)?;
+        let members = &named.snapshot.members;
+        let member_for = |installed: InstalledRevisionId| {
+            members
+                .iter()
+                .find(|member| member.installed == installed)
+                .map(|member| member.id)
+                .ok_or_else(|| WireError::new(Code::StalePlan))
+        };
+        let files = plan
+            .intents
+            .iter()
+            .map(|intent| {
+                let winner = member_for(intent.source.installed)?;
+                Ok(PreviewFile {
+                    target: Target {
+                        role: Role::Data,
+                        path: intent.target.target.relative.as_str().to_owned(),
+                    },
+                    winner: decimal(winner.get()),
+                    candidates: vec![decimal(winner.get())],
+                    needs_backup: matches!(intent.original, PreState::Regular(_)),
+                })
+            })
+            .collect::<Result<Vec<_>, WireError>>()?;
         Ok(Preview {
             id: Some(decimal(plan.id.get())),
             profile_id: decimal(plan.profile.get()),
             revision: decimal(plan.revision.get()),
             installation_id: decimal(selected.id),
             label: label(&selected.locator),
-            files: plan
-                .intents
-                .iter()
-                .map(|intent| PreviewFile {
-                    target: Target {
-                        role: Role::Data,
-                        path: intent.target.target.relative.as_str().to_owned(),
-                    },
-                    winner: decimal(intent.source.installed.get()),
-                    candidates: vec![decimal(intent.source.installed.get())],
-                    needs_backup: matches!(intent.original, PreState::Regular(_)),
-                })
-                .collect(),
+            files,
             blockers: Vec::new(),
         })
     }
 
     fn deploy_apply(&mut self, plan: PlanId) -> Result<Operation, WireError> {
+        // A recorded claim is a durable answer. Serve it before opening a
+        // native port, so a replay on a clean or unsupported root still reports
+        // the recorded terminal status instead of `UnsupportedTarget`.
+        if let Some(status) = self.journal.claimed(plan).map_err(deploy_error)? {
+            return Ok(operation(status));
+        }
         let selected = self.selected_pair()?;
         let mut port = self.native_effects(&selected)?;
         let status =
@@ -756,6 +774,34 @@ impl Workspace {
 
     fn restore_generation(&mut self) -> Result<RestoreResult, WireError> {
         let selected = self.selected_pair()?;
+        // Answer the no-work and pending cases from the journal before opening
+        // the port. A clean root is `NoActiveDeployment`, not an unavailable
+        // volume, and a pending Restore reports its tracked status.
+        let state = self
+            .journal
+            .root_state(&selected.data)
+            .map_err(deploy_error)?;
+        if let Some(op) = state.pending {
+            self.journal
+                .verify_pending_pair(op, &selected.installation, &selected.data)
+                .map_err(deploy_error)?;
+            let status = self
+                .journal
+                .status(op)
+                .map_err(deploy_error)?
+                .ok_or_else(|| deploy_error(DeployError::UnknownOperation))?;
+            if status.kind == OperationKind::Restore {
+                return Ok(RestoreResult::Operation {
+                    operation: operation(status),
+                });
+            }
+            return Err(deploy_error(DeployError::Busy));
+        }
+        if state.active.is_none() {
+            return Ok(RestoreResult::NoActiveDeployment {
+                code: Code::NoActiveDeployment,
+            });
+        }
         let mut port = self.native_effects(&selected)?;
         match marduk_core::deployment::restore(
             &mut self.journal,
@@ -1566,6 +1612,44 @@ mod wire_fixture {
             });
             let committed: Value = serde_json::from_str(&text).unwrap();
             assert_eq!(committed, value, "{name} drifted from the Rust DTOs");
+        }
+    }
+
+    #[test]
+    fn preview_fixture_names_members_not_installed_revisions() {
+        let dir = fixture_dir();
+        let read = |name: &str| -> Value {
+            let text = std::fs::read_to_string(dir.join(name)).unwrap();
+            serde_json::from_str::<Value>(&text).unwrap()["result"].clone()
+        };
+        let preview: Preview = serde_json::from_value(read("preview.json")).unwrap();
+        let snapshot: Snapshot = serde_json::from_value(read("snapshot.json")).unwrap();
+        let members: std::collections::BTreeSet<&str> = snapshot
+            .members
+            .iter()
+            .map(|member| member.id.as_str())
+            .collect();
+        let installed: std::collections::BTreeSet<&str> = snapshot
+            .members
+            .iter()
+            .map(|member| member.installed_id.as_str())
+            .collect();
+        for file in &preview.files {
+            assert!(
+                members.contains(file.winner.as_str()),
+                "{} is not a member id",
+                file.winner
+            );
+            for candidate in &file.candidates {
+                assert!(
+                    members.contains(candidate.as_str()),
+                    "{candidate} is not a member id"
+                );
+                assert!(
+                    !installed.contains(candidate.as_str()),
+                    "{candidate} is an installed revision id"
+                );
+            }
         }
     }
 

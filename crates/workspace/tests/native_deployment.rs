@@ -199,6 +199,12 @@ fn qualified_native_round_trip_retains_backups_and_restores_the_original_tree() 
     assert!(fixture.workspace.proof_recover_pending().unwrap().is_none());
     assert_eq!(tree(&fixture.game)["Data/textures/winner.dds"], POST);
 
+    // A replay of the claimed plan reports the recorded terminal status and
+    // never reopens the plan as a new operation.
+    let replay = fixture.workspace.proof_apply_deployment(plan).unwrap();
+    assert_eq!(replay.id, operation.id);
+    assert_eq!(tree(&fixture.game)["Data/textures/winner.dds"], POST);
+
     let restore = fixture.workspace.proof_restore().unwrap();
     let RestoreResult::Operation { operation } = restore else {
         panic!("expected a tracked restore, got {restore:?}");
@@ -226,6 +232,13 @@ fn dispatch_stays_typed_unavailable_after_native_composition() {
     let error = expect_error(fixture.send(json!({
         "op": "deploy_preview",
         "args": { "atRevision": "0" },
+    })));
+    assert_eq!(error["code"], json!("UnsupportedTarget"));
+    assert_eq!(error["detail"]["reason"], json!("Configuration"));
+
+    let error = expect_error(fixture.send(json!({
+        "op": "deploy_apply",
+        "args": { "planId": "1" },
     })));
     assert_eq!(error["code"], json!("UnsupportedTarget"));
     assert_eq!(error["detail"]["reason"], json!("Configuration"));
