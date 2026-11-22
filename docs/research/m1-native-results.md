@@ -17,6 +17,8 @@ Environment: Linux 7.3.5-1-cachyos, x86-64, rustc 1.100.0, uid 1000 with `CapEff
 | `library_catalog_never_names_missing_payload` | not run (native library staging disconnected pending gate) | not run (native library staging disconnected pending gate) | not run | not run | Task 8, not run |
 | `btrfs_cross_subvolume_copy_does_not_use_cross_subvolume_rename` | not run (subvolume teardown EPERM; two-subvolume `EXDEV`/substitution not run) | N/A | N/A | N/A | — |
 
+**Evidence scope:** The root/parent substitution row covers refusal when substitution was visible at the last live check. It does not demonstrate prevention inside the final check-to-syscall window.
+
 ## Per-row evidence
 
 1. **No-replace create** — the child created `Data/textures/new.dds = edit\n` at the `BeforeNativeEffect` cut, before the port issued any rename. The port's recheck observed the parent identity/leaf and the now-present target and refused with `Conflict`; no native `renameat2` `EEXIST` was reached. Target retained `edit\n`; the private stage still held `mod\n`; sentinels unchanged.
@@ -78,4 +80,6 @@ Base `8110c38`. `NativeStage` now keeps every archive and payload effect on the 
 - `TMPDIR=/tmp cargo test -p marduk-platform`, `TMPDIR=/tmp cargo test -p marduk-storage`, `cargo fmt --all -- --check`, `cargo build --workspace --locked`, `TMPDIR=/tmp cargo test --workspace --locked` — passed.
 - Windows compile check passed; Windows/NTFS staging remains `Unsupported(Configuration)`. `Catalog::open` remains `StageUnavailable` and no native Apply is connected.
 
-Final-window rename containment remains the blocker: publication renames still lack an expected-parent primitive. No native wiring is unlocked.
+**Known limitation (accepted by the 2026-11-22 user ruling):** On Linux and Windows, a same-privilege process can substitute the parent or leaf between the final live-handle check and the syscall. The [R02 contract](../contracts/m1-recovery.md#native-seam-that-r03-must-qualify) requires post-effect reobservation to detect divergence, retention of actually displaced bytes, and refusal to retry automatically on divergence. It does not claim prevention. A syscall error is not evidence of no change.
+
+The ruling changes the qualification criterion; it supplies no runtime evidence. Native staging and publication remain unqualified on ext4 and native NTFS and are not wired into the product.

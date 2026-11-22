@@ -51,11 +51,15 @@ The operation owner validates a new plan under the root lease before the first w
 
 ### Native seam that R03 must qualify
 
-The platform effect must support **observe**, **publish new into an absent path without clobber**, **exchange/replace existing while retaining the displaced file**, and **detach an expected existing file without destroying unknown bytes**. This is a small set of operations with explicit old/new/unknown outcomes, not a guarantee that every OS can express the same primitive. R03 must produce the exact Rust port signature and mapping from native return plus directory state to these outcomes, including safe behavior when an arbitrary external writer races. Do not replace it with check-then-overwrite or check-then-delete.
+The platform effect must support **observe**, **publish new into an absent path without clobber**, **exchange/replace existing while retaining the actually displaced file**, and **detach an expected existing file without destroying unknown bytes**. R03 must specify the exact Rust port signature and map the native return and reobserved state to outcomes for each qualified configuration. Do not replace it with check-then-overwrite or check-then-delete.
 
-- Pre-image and replacement data must be made stable before a public change; then qualify a namespace persistence barrier before calling a step durable. Record failure at either barrier. Root identity and containment must be proved through reopened handles/operations—not an earlier path string or directory scan.
+- Immediately before each effect, verify the expected pre-state through live handles, including the recorded root identity, parent binding and leaf state. An earlier path string or directory scan is not evidence. Refuse the effect if the pre-state cannot be verified.
+- Reobserve after every attempted effect, including one that returns an error. A successful syscall alone does not establish success; an error does not establish that nothing changed. Divergence from the required state yields `Ambiguous`, `Conflict` or `Unavailable`, never `Observed`.
+- Pre-image and replacement data must be made stable before a public change; then qualify a namespace persistence barrier before calling a step durable. Record failure at either barrier.
 - If a checked change displaced different bytes, preserve the actually displaced file as well as the original backup. Only put it back if a guarded operation proves it will not clobber a newer edit; otherwise report where it was retained. Do not finalize a clean deployment with a discrepancy.
 - If a step expected absence but sees an unknown newly created file, do not delete or replace it. If the root is detached or replaced, report `TargetUnavailable`, not absence, and never reroute a retry to a different install.
+
+**Known limitation (accepted by the 2026-11-22 user ruling):** On Linux and Windows, a same-privilege process can substitute the parent or leaf between the final live-handle check and the native syscall. Marduk does not claim to prevent that substitution. It mitigates the race by checking for divergence after the effect, retaining actually displaced bytes, and refusing to retry automatically on divergence.
 
 ## Planner witnesses and gates
 
