@@ -2721,3 +2721,14 @@ pub(crate) fn effects_volume_qualified(root: &Path) -> bool {
         volume_class(root),
     )
 }
+
+/// Client deploy and restore stay closed on Windows: the record proves the
+/// effect primitives on NTFS, not the composition that the client route needs.
+pub(crate) fn deploy_volume_qualified(root: &Path) -> bool {
+    available(
+        Capability::NativeEffects,
+        Route::Deploy,
+        Os::Windows,
+        volume_class(root),
+    )
+}

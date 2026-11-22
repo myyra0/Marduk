@@ -2,7 +2,7 @@
 
 Runtime evidence from 2026-11-22 (IST), code commit `29e587d`, base `ebd9e07`. Task 6 native-adapter rows were re-tested at `101b4f7` (recovery fix `7feb64b`), and the composition round trip was re-run at `af0fc6d` with scoped metadata that differs between the original and the staged payload (`2b6b51d` recorded the earlier composition run). `not run` is never a pass. No qualifying power-cut result exists.
 
-Close-out 2026-11-22: the Task 5 gate blocked native wiring; a later Task 5 continuation connected private-library staging on the two Linux volume classes with runtime evidence (Btrfs and tmpfs), and the Windows staging adapter is implemented and witnessed on NTFS while its product gate stays closed; see [Qualified library staging](#qualified-library-staging-connected-2026-11-22). Native game-directory preview, Apply and Restore are connected in the workspace proof lane on the two Linux volume classes (Task 6), but client `dispatch` still refuses them behind the closed C1 gate. `not run` rows stay `not run`.
+Close-out 2026-11-22: the Task 5 gate blocked native wiring; a later Task 5 continuation connected private-library staging on the two Linux volume classes with runtime evidence (Btrfs and tmpfs), and the Windows staging adapter is implemented and witnessed on NTFS while its product gate stays closed; see [Qualified library staging](#qualified-library-staging-connected-2026-11-22). Native game-directory preview, Apply and Restore are connected in the workspace proof lane on the two Linux volume classes (Task 6), and client `dispatch` serves deploy and restore where the record proves the composition (Linux Btrfs and tmpfs). Crash/power-cut evidence is deferred; Windows stays refused. `not run` rows stay `not run`.
 
 Environment: Linux 7.3.5-1-cachyos, x86-64, rustc 1.100.0, uid 1000 with `CapEff: 0` (ordinary user, no elevated token). tmpfs scratch: `/tmp` `rw,noatime,inode64,huge=advise`, fsid `b6b575e7…`, mount view 74, no Btrfs tree. Btrfs scratch: `/home` on `/dev/nvme0n1p2[/@home]` `rw,noatime,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/@home`, fsid `b68b24bc…`, view 61, tree 257. All fixtures are synthetic files under a disposable parent; no game, external root or elevated operation was touched.
 
@@ -58,7 +58,7 @@ Continuation of Task 5 after the 2026-11-22 ruling. `Catalog::open` now selects 
 - Windows product availability: the staging adapter is implemented and witnessed on native NTFS (below), but the record proves only the staging and primitive layers there, so `library_volume_qualified` and `effects_volume_qualified` stay `false` and catalog imports and deploys remain disconnected.
 - A qualified volume whose private boundary will not bind: a redirected root or `revisions/`, an owner or mount mismatch, or a two-subvolume/`EXDEV` layout with no evidence. `NativeStage::open` refusal is final; it is never retried through a weaker adapter.
 
-Wired: private staging (private archive snapshot, admitted member set, hashed payload under `revisions/<id>/`, `sync_revisions` before the receipt) and catalog publication of a prepared import into the library (SQLite membership only, after native re-observation). Separate from library staging, Task 6 connected the native copy adapter for game-directory preview, Apply and Restore in the workspace `proof_*` lane on qualified volumes; client `dispatch` refuses `deploy_preview`, `deploy_apply` and `restore` with `UnsupportedTarget`/`Configuration`. No client-visible native write is unlocked, and no power-cut claim exists.
+Wired: private staging (private archive snapshot, admitted member set, hashed payload under `revisions/<id>/`, `sync_revisions` before the receipt) and catalog publication of a prepared import into the library (SQLite membership only, after native re-observation). Separate from library staging, Task 6 connected the native copy adapter for game-directory preview, Apply and Restore in the workspace `proof_*` lane on qualified volumes. Client `dispatch` serves deploy and restore where the record proves the composition on the installation root's volume class (Linux Btrfs and tmpfs). Crash and power-cut behaviour is deferred, and no power-cut claim exists.
 
 | Suite / test | Required volume | Exact run condition | Observed |
 |---|---|---|---|
@@ -104,10 +104,9 @@ Deploy-level NTFS rows remain `not run`; only the private staging adapter is evi
 drives the production `Workspace` — the real `Catalog`, `OperationJournal` and
 `NativeEffects` — through setup, ZIP import, member order, preview, apply,
 restart, plan replay and restore on a qualified volume. Preview, Apply and
-Restore run through the `proof_*` methods; no client `dispatch` route serves
-them and the C1 gate still reports both unavailable. This is the composition
-rung: the whole service composed and ran, but no client-visible deploy or
-restore route did.
+Restore run through the `proof_*` methods, so this witness stays independent of
+the client availability gate. This is the composition rung: the whole service
+composed and ran; the client-visible run is recorded in the evidence row below.
 
 The separate `deploy_evidence` test and its `evidence` feature entry points were
 deleted. That build could force the stage open and serve a wire import while the
@@ -209,7 +208,7 @@ Base `8110c38`. `NativeStage` now keeps every archive and payload effect on the 
 
 **Known limitation (accepted by the 2026-11-22 user ruling):** On Linux and Windows, a same-privilege process can substitute the parent or leaf between the final live-handle check and the syscall. The [R02 contract](../contracts/m1-recovery.md#native-seam-that-r03-must-qualify) requires post-effect reobservation to detect divergence, retention of actually displaced bytes, and refusal to retry automatically on divergence. It does not claim prevention. A syscall error is not evidence of no change.
 
-The ruling changes the qualification criterion; it supplies no runtime evidence. Native staging is now wired only on Linux Btrfs and Linux tmpfs, and remains unqualified and unwired on ext4 and native NTFS. Game-directory publication through the native adapter is connected in the workspace proof lane on those two Linux volume classes; client Apply and Restore stay behind the closed C1 gate. Power-cut behaviour remains unqualified.
+The ruling changes the qualification criterion; it supplies no runtime evidence. Native staging is now wired only on Linux Btrfs and Linux tmpfs, and remains unqualified and unwired on ext4 and native NTFS. Game-directory publication through the native adapter is connected on those two Linux volume classes, and client Apply and Restore are served there because the record proves the composition. Power-cut behaviour remains unqualified.
 
 ## Native copy adapter (Task 6, 2026-11-22)
 
@@ -224,10 +223,10 @@ recorded locator, uses bound targets, retains actually displaced bytes, obtains
 the root and library gates in order, and records `Applied` only after the
 platform returns durability evidence.
 
-The workspace reaches the adapter only through its `proof_*` methods. Client
-`dispatch` and status remain typed unavailable because the C1 proof lane has not
-run; the single decision point names this document. No real game directory was
-written.
+The workspace reaches the adapter through its `proof_*` methods and its client
+routes. `dispatch` and status ask the availability record through one decision
+point for the installation root's volume class; the routes are available where
+the record proves the composition, and no real game directory was written.
 
 All rows below re-ran on 2026-11-22 at `101b4f7` on both qualified Linux volume
 classes.
@@ -250,7 +249,8 @@ classes.
 | `sync_chain_stops_at_the_resolved_root_for_a_symlinked_library_spelling` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run |
 | `unqualified_root_answers_a_claimed_plan_and_pending_restore` (workspace) | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run |
 | `clean_unqualified_root_answers_before_opening_a_native_port` (workspace) | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run |
-| `dispatch_stays_typed_unavailable_after_native_composition` (preview, apply and restore) | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run |
+| `dispatch_deploy_and_restore_through_the_whole_composition` (client-visible preview, apply and restore) | not run | not run | not run | not run |
+| `unqualified_installation_root_keeps_client_deploy_and_restore_refused` (same three routes) | not run | not run | not run | not run |
 
 The workspace round trip uses disposable synthetic roots only. It verifies the
 deployed bytes, the retained `original` backups for replaced files, the absent
@@ -348,8 +348,8 @@ The six file-level primitives passed hosted `windows-2025` at `eb39be0` on real
 NTFS (the run that exposed and then verified the tunneling fix). That is
 primitive-level evidence only: deploy-level NTFS rows remain `not run`, the
 namespace barrier stays `Unavailable`, and `effects_volume_qualified` therefore
-returns `false` on Windows. Native Apply stays disconnected behind
-`native_effects_gate`.
+returns `false` on Windows. Native Apply stays refused on Windows by
+`native_effects_gate`, which reads the record.
 
 Commands run for this row set:
 

@@ -1604,6 +1604,13 @@ pub(crate) fn effects_volume_qualified(root: &Path) -> bool {
         .is_some_and(|class| available(Capability::NativeEffects, Route::Adapter, Os::Linux, class))
 }
 
+/// Client deploy and restore are connected only where the record proves the
+/// whole composition on this volume class.
+pub(crate) fn deploy_volume_qualified(root: &Path) -> bool {
+    observed_volume_class(root)
+        .is_some_and(|class| available(Capability::NativeEffects, Route::Deploy, Os::Linux, class))
+}
+
 /// The effective group and every supplementary group can be restored without
 /// changing ownership.
 fn group_is_current(gid: u32) -> bool {

@@ -253,10 +253,11 @@ fn qualified_native_round_trip_retains_backups_and_restores_the_original_tree() 
     let mut fixture = Fixture::new();
     let status = fixture.setup();
 
-    // The C1 gate keeps client-visible deploy/restore unavailable even on a
-    // qualified volume; the synthetic proof lane below is the adapter witness.
-    assert_eq!(status["availability"]["deploy"]["available"], json!(false));
-    assert_eq!(status["availability"]["restore"]["available"], json!(false));
+    // The record proves the composition on this volume, so the client routes
+    // are available; this witness still drives the proof lane directly.
+    assert_eq!(status["availability"]["deploy"]["available"], json!(true));
+    assert_eq!(status["availability"]["restore"]["available"], json!(true));
+    assert_eq!(status["availability"]["deploy"]["blocker"], Value::Null);
 
     let (revision, imported) = fixture.import_and_order();
     assert_eq!(imported["members"].as_array().unwrap().len(), 1);
@@ -612,24 +613,151 @@ fn clean_unqualified_root_answers_before_opening_a_native_port() {
 
 #[test]
 #[ignore = "requires TMPDIR on tmpfs or Btrfs"]
-fn dispatch_stays_typed_unavailable_after_native_composition() {
+fn dispatch_deploy_and_restore_through_the_whole_composition() {
+    let mut fixture = Fixture::new();
+    let status = fixture.setup();
+    assert_eq!(status["availability"]["deploy"]["available"], json!(true));
+    assert_eq!(status["availability"]["restore"]["available"], json!(true));
+    assert_eq!(status["availability"]["deploy"]["blocker"], Value::Null);
+
+    let (revision, _) = fixture.import_and_order();
+    let staged_winner = fixture.staged_winner();
+    set_mode(&staged_winner, STAGED_MODE);
+    set_mtime(&staged_winner, stamped(STAGED_MTIME));
+
+    let preview = expect_ok(fixture.send(json!({
+        "op": "deploy_preview",
+        "args": { "atRevision": revision.to_string() },
+    })));
+    assert_eq!(preview["blockers"], json!([]));
+    let plan_id = preview["id"].as_str().expect("preview plan id").to_owned();
+    let replaced = preview["files"]
+        .as_array()
+        .expect("preview files")
+        .iter()
+        .position(|file| file["needsBackup"] == json!(true))
+        .expect("a replaced file");
+
+    let operation = expect_ok(fixture.send(json!({
+        "op": "deploy_apply",
+        "args": { "planId": plan_id },
+    })));
+    assert_eq!(operation["kind"], json!("deploy"));
+    assert_eq!(operation["phase"], json!("completed"));
+    assert_eq!(operation["blocker"], Value::Null);
+    let generation = operation["generationId"]
+        .as_str()
+        .expect("committed generation")
+        .to_owned();
+    let operation_id = operation["id"].as_str().expect("operation id").to_owned();
+
+    // Bytes and scoped metadata: apply publishes the staged payload, not the
+    // displaced original.
+    let deployed_winner = fixture.game.join("Data/textures/winner.dds");
+    assert_eq!(fs::read(&deployed_winner).unwrap(), POST);
+    assert_eq!(
+        fs::read(fixture.game.join("Data/textures/a-only.dds")).unwrap(),
+        ONLY
+    );
+    assert_eq!(mode_of(&deployed_winner), STAGED_MODE);
+    assert_eq!(mtime_of(&deployed_winner), STAGED_MTIME);
+
+    // Retention: the status names the actually displaced original and the
+    // sealed slot still holds its bytes and metadata.
+    let displaced = operation["retained"]
+        .as_array()
+        .expect("retained refs")
+        .iter()
+        .find(|retained| {
+            retained["ordinal"] == json!(replaced as u32)
+                && retained["direction"] == json!("forward")
+                && retained["slot"] == json!("displaced")
+        })
+        .expect("status names the displaced object");
+    assert_eq!(displaced["operationId"], json!(operation_id));
+    let forward = fixture
+        .app
+        .join("effects/ops")
+        .join(&operation_id)
+        .join(replaced.to_string())
+        .join("forward");
+    let sealed = if forward.join("displaced").exists() {
+        forward.join("displaced")
+    } else {
+        forward.join("stage")
+    };
+    assert_eq!(fs::read(&sealed).unwrap(), BASE);
+    assert_eq!(mode_of(&sealed), ORIGINAL_MODE);
+    assert_eq!(mtime_of(&sealed), ORIGINAL_MTIME);
+
+    // The committed generation survives a restart and is what a client reads
+    // before enabling Restore.
+    drop(fixture.workspace);
+    fixture.workspace = Workspace::open(&fixture.app).unwrap();
+    let status: WorkspaceStatus = serde_json::from_value(expect_ok(fixture.send(json!({
+        "op": "status",
+        "args": {},
+    }))))
+    .unwrap();
+    assert!(status.pending.is_none());
+    assert_eq!(status.active_generation_id, Some(generation));
+
+    let restored = expect_ok(fixture.send(json!({ "op": "restore", "args": {} })));
+    assert_eq!(restored["outcome"], json!("operation"));
+    assert_eq!(restored["operation"]["kind"], json!("restore"));
+    assert_eq!(restored["operation"]["phase"], json!("completed"));
+    assert_eq!(restored["operation"]["blocker"], Value::Null);
+    assert_eq!(restored["operation"]["generationId"], Value::Null);
+    assert_eq!(tree(&fixture.game), fixture.initial);
+    assert_eq!(fs::read(&deployed_winner).unwrap(), BASE);
+    assert_eq!(mode_of(&deployed_winner), ORIGINAL_MODE);
+    assert_eq!(mtime_of(&deployed_winner), ORIGINAL_MTIME);
+
+    let second = expect_ok(fixture.send(json!({ "op": "restore", "args": {} })));
+    assert_eq!(second["outcome"], json!("noActiveDeployment"));
+    assert_eq!(second["code"], json!("NoActiveDeployment"));
+    assert_eq!(tree(&fixture.game), fixture.initial);
+}
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn unqualified_installation_root_keeps_client_deploy_and_restore_refused() {
     let mut fixture = Fixture::new();
     fixture.setup();
 
-    let error = expect_error(fixture.send(json!({
-        "op": "deploy_preview",
-        "args": { "atRevision": "0" },
-    })));
-    assert_eq!(error["code"], json!("UnsupportedTarget"));
-    assert_eq!(error["detail"]["reason"], json!("Configuration"));
+    // The gate asks the recorded installation root's volume class. Point that
+    // path at a link the probe cannot resolve: the record has no proof for the
+    // answer, so dispatch refuses before any effect. The fixture and its
+    // initial tree stay intact behind the link.
+    let real = fixture.temp.path().join("game-real");
+    fs::rename(&fixture.game, &real).unwrap();
+    std::os::unix::fs::symlink("/sys/kernel", &fixture.game).unwrap();
 
-    let error = expect_error(fixture.send(json!({
-        "op": "deploy_apply",
-        "args": { "planId": "1" },
-    })));
-    assert_eq!(error["code"], json!("UnsupportedTarget"));
-    assert_eq!(error["detail"]["reason"], json!("Configuration"));
+    let status = expect_ok(fixture.send(json!({"op": "status", "args": {}})));
+    assert_eq!(status["availability"]["deploy"]["available"], json!(false));
+    assert_eq!(
+        status["availability"]["deploy"]["blocker"]["code"],
+        json!("UnsupportedTarget")
+    );
+    assert_eq!(
+        status["availability"]["deploy"]["blocker"]["detail"]["reason"],
+        json!("Configuration")
+    );
 
-    let error = expect_error(fixture.send(json!({ "op": "restore", "args": {} })));
-    assert_eq!(error["code"], json!("UnsupportedTarget"));
+    for request in [
+        json!({"op": "deploy_preview", "args": {"atRevision": "0"}}),
+        json!({"op": "deploy_apply", "args": {"planId": "1"}}),
+        json!({"op": "restore", "args": {}}),
+    ] {
+        let error = expect_error(fixture.send(request));
+        assert_eq!(error["code"], json!("UnsupportedTarget"));
+        assert_eq!(error["detail"]["reason"], json!("Configuration"));
+    }
+
+    assert_eq!(tree(&real), fixture.initial);
+    let ops = fixture.app.join("effects/ops");
+    assert!(
+        !ops.exists() || fs::read_dir(&ops).unwrap().next().is_none(),
+        "a refused route creates no operation-owned directory"
+    );
 }

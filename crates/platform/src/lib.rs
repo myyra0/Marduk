@@ -76,6 +76,14 @@ pub fn library_volume_qualified(root: &Path) -> bool {
     native::library_volume_qualified(root)
 }
 
+/// Whether the availability record proves a client-visible deploy and restore on
+/// the volume holding `root`. The decision owner is
+/// `marduk_core::qualification`; this function only observes the volume and asks
+/// for the client deploy route.
+pub fn deploy_volume_qualified(root: &Path) -> bool {
+    native::deploy_volume_qualified(root)
+}
+
 /// Open an application-owned child directory beneath the verified parent path,
 /// re-proving each component, refusing a final link and every redirected
 /// ancestor, and creating only that one missing child when absent.

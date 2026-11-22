@@ -288,6 +288,7 @@ export function App({ transport }: Props) {
     status === null || status.availability.restore.available
       ? null
       : status.availability.restore.blocker;
+  const effectsBlocker = deployAvailable ? (restoreAvailable ? null : restoreBlocker) : deployBlocker;
   const pending = status?.pending ?? null;
 
   function applySnapshot(snapshot: Snapshot) {
@@ -589,10 +590,11 @@ export function App({ transport }: Props) {
             <AvailabilityRow label="Import staging" availability={status.availability.import} />
             <AvailabilityRow label="Deploy" availability={status.availability.deploy} />
             <AvailabilityRow label="Restore" availability={status.availability.restore} />
-            <p className="hint">
-              Blocked operations stay disabled. Apply and Restore need a native effect port that is
-              not connected yet.
-            </p>
+            {effectsBlocker !== null && (
+              <p className="hint">
+                Blocked operations stay disabled. <code>{describeBlocker(effectsBlocker)}</code>
+              </p>
+            )}
           </section>
 
           <section className="panel">

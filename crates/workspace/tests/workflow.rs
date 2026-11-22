@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use marduk_workspace::{
     Code, Envelope, Member, Op, Purpose, Request, Snapshot, WireError, Workspace, WorkspaceStatus,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tempfile::TempDir;
 use zip_fixture::{ClassicZip, Record};
 
@@ -75,6 +75,12 @@ impl Fixture {
         marduk_platform::library_volume_qualified(&self.app)
     }
 
+    /// Whether the availability record opens client deploy/restore for this
+    /// installation root; status and dispatch must agree with it.
+    fn deploy_qualified(&self) -> bool {
+        marduk_platform::deploy_volume_qualified(&self.game)
+    }
+
     fn zip(&self, name: &str) -> PathBuf {
         let path = self.temp.path().join(name);
         let bytes = ClassicZip::new(&[Record::file(b"synthetic.txt", b"fixture bytes")]).bytes;
@@ -133,15 +139,22 @@ fn setup_status_and_restart_share_the_authoritative_state() {
             json!("StageUnavailable")
         );
     }
-    assert_eq!(status["availability"]["deploy"]["available"], json!(false));
     assert_eq!(
-        status["availability"]["deploy"]["blocker"]["code"],
-        json!("UnsupportedTarget")
+        status["availability"]["deploy"]["available"],
+        json!(fixture.deploy_qualified())
     );
-    assert_eq!(
-        status["availability"]["deploy"]["blocker"]["detail"]["reason"],
-        json!("Configuration")
-    );
+    if fixture.deploy_qualified() {
+        assert!(status["availability"]["deploy"]["blocker"].is_null());
+    } else {
+        assert_eq!(
+            status["availability"]["deploy"]["blocker"]["code"],
+            json!("UnsupportedTarget")
+        );
+        assert_eq!(
+            status["availability"]["deploy"]["blocker"]["detail"]["reason"],
+            json!("Configuration")
+        );
+    }
     assert_eq!(status["pending"], Value::Null);
     assert_eq!(status["activeGenerationId"], Value::Null);
 
@@ -280,9 +293,16 @@ fn import_preview_and_apply_round_trip_on_a_qualified_volume() {
 }
 
 #[test]
-fn deploy_preview_apply_and_restore_are_typed_unavailable() {
+fn unqualified_volume_keeps_deploy_preview_apply_and_restore_typed_unavailable() {
     let mut fixture = Fixture::new();
     fixture.setup();
+
+    // The gate answers for the recorded installation root's volume class.
+    // Replace that root with an object the probe cannot classify, leaving the
+    // real tree intact behind it, so the same three routes stay refusals.
+    let real = fixture.temp.path().join("game-real");
+    fs::rename(&fixture.game, &real).unwrap();
+    fs::write(&fixture.game, b"not a directory").unwrap();
 
     for envelope in [
         fixture.send(json!({
@@ -302,6 +322,7 @@ fn deploy_preview_apply_and_restore_are_typed_unavailable() {
 
     // The same typed unavailability is visible before the user tries.
     let status = fixture.status();
+    assert_eq!(status["availability"]["deploy"]["available"], json!(false));
     assert_eq!(
         status["availability"]["restore"]["blocker"]["code"],
         json!("UnsupportedTarget")
@@ -309,6 +330,10 @@ fn deploy_preview_apply_and_restore_are_typed_unavailable() {
     assert_eq!(
         status["availability"]["restore"]["blocker"]["detail"]["reason"],
         json!("Configuration")
+    );
+    assert!(
+        !fixture.app.join("effects/ops").exists(),
+        "a refused route creates no operation-owned directory"
     );
 }
 

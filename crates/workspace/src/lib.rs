@@ -513,19 +513,19 @@ impl Workspace {
             Op::DeployPreview => {
                 let args: DeployPreviewArgs = decode(request.args)?;
                 let revision = parse_revision(&args.at_revision)?;
-                native_effects_gate()?;
+                self.require_native_effects()?;
                 Ok(json(self.deploy_preview(revision)?)?)
             }
             Op::DeployApply => {
                 let args: DeployApplyArgs = decode(request.args)?;
                 let plan = PlanId::try_from_u64(parse_id(&args.plan_id)?)
                     .map_err(|_| WireError::new(Code::InvalidRequest))?;
-                native_effects_gate()?;
+                self.require_native_effects()?;
                 Ok(json(self.deploy_apply(plan)?)?)
             }
             Op::Restore => {
                 let _: NoArgs = decode(request.args)?;
-                native_effects_gate()?;
+                self.require_native_effects()?;
                 Ok(json(self.restore_generation()?)?)
             }
             Op::Recover => {
@@ -590,6 +590,12 @@ impl Workspace {
         };
         let mut pending = None;
         let mut active_generation_id = None;
+        // Both routes share one decision point: the record must prove the
+        // composition on the installation root's volume class. No bound
+        // installation has no proven root.
+        let effects = effect_availability(native_effects_gate(
+            selected.as_ref().map(|selected| selected.locator.as_path()),
+        ));
 
         if let Some(selected) = selected {
             let SelectedInstallation {
@@ -642,8 +648,8 @@ impl Workspace {
             availability: AvailabilitySet {
                 target,
                 import,
-                deploy: effect_availability(),
-                restore: effect_availability(),
+                deploy: effects.clone(),
+                restore: effects,
             },
             pending,
             active_generation_id,
@@ -848,20 +854,29 @@ impl Workspace {
             .ok_or_else(|| WireError::new(Code::TargetUnavailable))
     }
 
+    /// One decision point for client-visible deploy/restore availability. The
+    /// record decides for the bound installation root's volume class.
+    fn require_native_effects(&mut self) -> Result<(), WireError> {
+        let root = self
+            .journal
+            .selected_installation()
+            .map_err(deploy_error)?
+            .map(|selected| selected.locator);
+        native_effects_gate(root.as_deref())
+    }
+
     fn native_effects(&self, selected: &SelectedInstallation) -> Result<NativeEffects, WireError> {
         NativeEffects::open(&self.app_data, &selected.locator, skyrim_se::LAYOUT)
             .map_err(deploy_error)
     }
 
-    /// Synthetic proof lane for the native copy adapter.
+    /// Proof-lane preview that bypasses the client availability gate.
     ///
-    /// Preview, Apply and Restore are deliberately unreachable from
-    /// [`Workspace::dispatch`]: client deploy and restore stay closed by the C1
-    /// write-authority decision. Tests drive the same catalog, journal and
-    /// adapter composition here; the adapter itself refuses an unqualified
-    /// volume with a typed error. Reconciliation is the exception: [`Op::Recover`]
-    /// reaches the same route because recorded pending work must be settled
-    /// after a crash.
+    /// Client deploy and restore are available where the record proves the
+    /// composition, but witnesses also need the same catalog, journal and
+    /// adapter composition on an unqualified root to check its typed refusals
+    /// and recorded answers. The adapter itself refuses an unqualified volume
+    /// with a typed error, so this lane cannot simulate a write.
     #[doc(hidden)]
     pub fn proof_preview_deployment(
         &mut self,
@@ -885,7 +900,7 @@ impl Workspace {
     /// Restart reconciliation behind the [`Op::Recover`] wire route.
     ///
     /// `Recover` settles an already-recorded pending operation and creates no
-    /// work; the write-authority rule is owned by `docs/contracts/m1-clients.md`.
+    /// work; the availability rule is owned by `docs/contracts/m1-clients.md`.
     fn recover_pending(&mut self) -> Result<Option<Operation>, WireError> {
         let selected = self.selected_pair()?;
         // No pending operation means no native work. Answer before opening the
@@ -1142,18 +1157,20 @@ fn phase(phase: Phase) -> &'static str {
 
 /// One decision point for client-visible deploy/restore availability.
 ///
-/// Deploy and Restore stay closed on every configuration by the C1
-/// write-authority decision (`docs/contracts/m1-clients.md`); the availability
-/// record's deploy rows describe proof-lane composition runs only. When a
-/// client-visible rung exists, this gate queries `marduk_core::qualification`
-/// for it instead of returning a constant refusal. Synthetic runs reach the
-/// adapter only through the `proof_*` methods.
-fn native_effects_gate() -> Result<(), WireError> {
-    Err(unsupported_effect())
+/// The availability record answers for the installation root's volume class: a
+/// `NativeEffects`/`Deploy` proof at the composition rung or above. The
+/// client-visible rung is recorded after the first real run, so it cannot be a
+/// precondition here; crash evidence is deferred work. Windows has no proof on
+/// NTFS and stays refused. There is no runtime override.
+fn native_effects_gate(installation_root: Option<&Path>) -> Result<(), WireError> {
+    match installation_root {
+        Some(root) if marduk_platform::deploy_volume_qualified(root) => Ok(()),
+        _ => Err(unsupported_effect()),
+    }
 }
 
-fn effect_availability() -> Availability {
-    match native_effects_gate() {
+fn effect_availability(gate: Result<(), WireError>) -> Availability {
+    match gate {
         Ok(()) => Availability {
             available: true,
             blocker: None,
@@ -1165,8 +1182,9 @@ fn effect_availability() -> Availability {
     }
 }
 
-/// No native effect port is exposed to clients, so no plan can be bound, no
-/// game file can be observed and no restore can run through `dispatch`.
+/// No proven client deploy route exists for this configuration, so no plan can
+/// be bound, no game file can be observed and no restore can run through
+/// `dispatch`.
 fn unsupported_effect() -> WireError {
     WireError::with_detail(
         Code::UnsupportedTarget,

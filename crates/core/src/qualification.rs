@@ -314,7 +314,11 @@ fn required_layer(capability: Capability, route: Route) -> Layer {
         // No client-visible import or deployment route consumes the effect or
         // adapter capabilities directly; they are answered at the deploy rung.
         (_, Route::Import) => Layer::Catalog,
-        (_, Route::Deploy | Route::Restore) => Layer::Deploy,
+        // A client-visible deploy cannot be a precondition of the gate that
+        // lets the first one run, so Deploy and Restore require the composition
+        // rung instead. `Layer::Deploy` is recorded after that first real run;
+        // crash/power-cut evidence is deferred work, not a gate.
+        (_, Route::Deploy | Route::Restore) => Layer::Composition,
     }
 }
 
@@ -441,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn composition_is_proven_on_the_two_linux_volumes_but_client_routes_stay_closed() {
+    fn composition_is_proven_on_the_two_linux_volumes() {
         for volume in [VolumeClass::Btrfs, VolumeClass::Tmpfs] {
             let proof = qualification(Capability::NativeEffects, Route::Adapter, Os::Linux, volume)
                 .proof
@@ -460,27 +464,38 @@ mod tests {
     }
 
     #[test]
-    fn deploy_and_restore_routes_stay_closed_on_every_configuration() {
-        for capability in [
-            Capability::LibraryStaging,
-            Capability::EffectPrimitives,
-            Capability::NativeEffects,
+    fn deploy_and_restore_require_the_proven_composition() {
+        for volume in [VolumeClass::Btrfs, VolumeClass::Tmpfs] {
+            for route in [Route::Deploy, Route::Restore] {
+                let qualification =
+                    qualification(Capability::NativeEffects, route, Os::Linux, volume);
+                assert!(qualification.available(), "Linux {volume} {route:?}");
+                assert_eq!(
+                    qualification.proof.map(|proof| proof.layer),
+                    Some(Layer::Composition),
+                    "the composition rung satisfies Linux {volume} {route:?}"
+                );
+            }
+        }
+        // A Windows-shaped answer is a record query, not a host check. Only the
+        // native effect composition opens these routes; every other capability
+        // and every unproven volume stays refused.
+        for (capability, os, volume) in [
+            (Capability::NativeEffects, Os::Windows, VolumeClass::Ntfs),
+            (Capability::NativeEffects, Os::Windows, VolumeClass::Other),
+            (Capability::NativeEffects, Os::Linux, VolumeClass::Ext4),
+            (Capability::NativeEffects, Os::Linux, VolumeClass::Other),
+            (Capability::EffectPrimitives, Os::Linux, VolumeClass::Btrfs),
+            (Capability::EffectPrimitives, Os::Linux, VolumeClass::Tmpfs),
+            (Capability::LibraryStaging, Os::Linux, VolumeClass::Btrfs),
+            (Capability::LibraryStaging, Os::Linux, VolumeClass::Tmpfs),
+            (Capability::LibraryStaging, Os::Windows, VolumeClass::Ntfs),
         ] {
-            for os in [Os::Linux, Os::Windows] {
-                for volume in [
-                    VolumeClass::Btrfs,
-                    VolumeClass::Tmpfs,
-                    VolumeClass::Ext4,
-                    VolumeClass::Ntfs,
-                    VolumeClass::Other,
-                ] {
-                    for route in [Route::Deploy, Route::Restore] {
-                        assert!(
-                            !is_available(capability, route, os, volume),
-                            "{capability} {route:?} on {os}/{volume} must stay closed"
-                        );
-                    }
-                }
+            for route in [Route::Deploy, Route::Restore] {
+                assert!(
+                    !is_available(capability, route, os, volume),
+                    "{capability} {route:?} on {os}/{volume} must stay closed"
+                );
             }
         }
     }

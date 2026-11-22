@@ -119,10 +119,17 @@ fn setup_status_and_empty_order_workflow() {
     assert_eq!(output.status.code(), Some(0));
     let value = envelope(&output);
     assert_eq!(value["result"]["profile"]["revision"], json!("0"));
-    assert_eq!(
-        value["result"]["availability"]["deploy"]["blocker"]["detail"]["reason"],
-        json!("Configuration")
-    );
+    // Availability follows the volume class the fixture landed on.
+    let deploy = &value["result"]["availability"]["deploy"];
+    if deploy["available"] == json!(true) {
+        assert!(deploy["blocker"].is_null());
+    } else {
+        assert_eq!(deploy["blocker"]["code"], json!("UnsupportedTarget"));
+        assert_eq!(
+            deploy["blocker"]["detail"]["reason"],
+            json!("Configuration")
+        );
+    }
 
     // A clean root has no pending work; reconciliation answers null without a
     // native effect.
@@ -229,10 +236,19 @@ fn human_mode_keeps_the_stable_code_and_serialized_detail() {
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "null");
 
     let output = fixture.run(&["deploy", "preview", "--at-revision", "0"]);
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("UnsupportedTarget"), "stderr: {stderr}");
-    assert!(stderr.contains("Configuration"), "stderr: {stderr}");
+    if output.status.code() == Some(1) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("UnsupportedTarget"), "stderr: {stderr}");
+        assert!(stderr.contains("Configuration"), "stderr: {stderr}");
+    } else {
+        // A qualified volume answers preview instead of a blocker.
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     let output = fixture.run(&["order", "--at-revision", "0", "1"]);
     assert_eq!(output.status.code(), Some(1));

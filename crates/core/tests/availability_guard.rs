@@ -21,7 +21,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use marduk_core::qualification::{
-    Capability, Os, PROOFS, Proof, Route, THEORETICAL, VolumeClass, available, missing_witness,
+    Capability, Layer, Os, PROOFS, Proof, Route, THEORETICAL, VolumeClass, available,
+    missing_witness,
 };
 
 const EVIDENCE: &str = "docs/research/m1-native-results.md";
@@ -494,6 +495,44 @@ fn the_record_and_the_evidence_document_agree() {
             ),
         }
     }
+}
+
+#[test]
+fn a_composition_proof_opens_deploy_without_opening_an_unproven_configuration() {
+    for proof in PROOFS
+        .iter()
+        .filter(|proof| proof.layer == Layer::Composition)
+    {
+        for route in [Route::Deploy, Route::Restore] {
+            assert!(
+                available(proof.capability, route, proof.os, proof.volume),
+                "{} {route:?} on {}/{}",
+                proof.capability,
+                proof.os,
+                proof.volume
+            );
+        }
+    }
+    // The gate asks the record, so a Windows-shaped question is refused by the
+    // record itself: no NTFS composition proof exists.
+    assert!(!available(
+        Capability::NativeEffects,
+        Route::Deploy,
+        Os::Windows,
+        VolumeClass::Ntfs
+    ));
+    assert!(!available(
+        Capability::NativeEffects,
+        Route::Restore,
+        Os::Windows,
+        VolumeClass::Ntfs
+    ));
+    assert!(!available(
+        Capability::NativeEffects,
+        Route::Deploy,
+        Os::Linux,
+        VolumeClass::Ext4
+    ));
 }
 
 #[test]

@@ -103,6 +103,25 @@ describe('workspace shell', () => {
     expect(screen.queryByRole('button', { name: /Preview ZIP/ })).not.toBeInTheDocument();
   });
 
+  it('shows the typed effects blocker in the operations hint when deploy is blocked', async () => {
+    await renderReady();
+
+    expect(screen.getByText(/Blocked operations stay disabled/)).toBeInTheDocument();
+    // Two availability badges plus the hint carry the same typed reason; the
+    // hint is not a hard-coded sentence about a disconnected port.
+    expect(screen.getAllByText('UnsupportedTarget (Configuration)').length).toBeGreaterThanOrEqual(
+      3,
+    );
+  });
+
+  it('drops the operations hint when the availability record opens deploy', async () => {
+    const status = statusWithEffects();
+    await renderReady({ status: async () => ({ ok: true, result: status }) });
+
+    expect(screen.queryByText(/Blocked operations stay disabled/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/native effect port/)).not.toBeInTheDocument();
+  });
+
   it('shows the recorded pending operation and retained recovery state', async () => {
     await renderReady();
 
