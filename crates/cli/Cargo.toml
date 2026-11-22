@@ -14,5 +14,4 @@ marduk-workspace = { path = "../workspace" }
 serde_json = "=1.0.154"
 
 [dev-dependencies]
-rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled"] }
 tempfile = "=3.27.0"

@@ -6,6 +6,19 @@
 
 Both clients call the same core commands. Desktop Tauri commands decode/encode approved DTOs and call core; CLI flags map into those requests. Neither client performs its own conflict selection, scans directories to decide the winner, or edits the database. CLI accepts paths deliberately entered by its user; desktop uses a native picker and a binding or selection handle scoped to the chosen object. Don't expose generic desktop filesystem, shell, or network commands. Validate selected roots and archives again in the owning modules.
 
+## Application data root (frozen)
+
+One catalog location is shared by the CLI and the desktop shell. `marduk-workspace::app_data_root()` is the only resolution function; clients must not derive their own path.
+
+- Bundle identifier: `com.marduk.desktop`.
+- Root: the OS user data directory joined with the identifier.
+  - Linux: `$XDG_DATA_HOME/com.marduk.desktop`, else `$HOME/.local/share/com.marduk.desktop`.
+  - Windows: `%APPDATA%\com.marduk.desktop` (Roaming), matching `dirs::data_dir()`.
+  - macOS: `$HOME/Library/Application Support/com.marduk.desktop`.
+- The catalog and journal are `<root>/catalog.sqlite3`; earlier paths such as `.../marduk` are not read or migrated.
+
+Phase B must set the Tauri bundle identifier to `com.marduk.desktop` and pass `app.path().app_data_dir()` to `Workspace::open`, so `app_data_dir()` resolves to this same root. Environment variables are read only as the base data directory; tests isolate them, product code never adds a second override.
+
 | Operation | CLI proposal | Request and authoritative result |
 |---|---|---|
 | Choose installation | `marduk setup --game-dir <dir>` | Bind the selected installation, return its stable `InstallationId` and availability; initialize or return the sole M1 profile. No game writes. |

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, Subcommand};
-use marduk_workspace::{Code, Envelope, Op, Request, WireError, Workspace};
+use marduk_workspace::{Code, Envelope, Op, Request, WireError, Workspace, app_data_root};
 use serde_json::{Value, json};
 
 #[derive(Parser)]
@@ -118,7 +118,7 @@ fn run(cli: Cli) -> i32 {
         Ok(request) => request,
         Err(error) => return report(Envelope::error(error), cli.json),
     };
-    let app_data = match app_data() {
+    let app_data = match app_data_root() {
         Ok(path) => path,
         Err(error) => return report(Envelope::error(error), cli.json),
     };
@@ -177,46 +177,31 @@ fn path(path: &PathBuf) -> Result<&str, WireError> {
         .ok_or_else(|| WireError::new(Code::InvalidRequest))
 }
 
-fn app_data() -> Result<PathBuf, WireError> {
-    #[cfg(windows)]
-    {
-        if let Some(base) = std::env::var_os("LOCALAPPDATA")
-            && !base.is_empty()
-        {
-            return Ok(PathBuf::from(base).join("Marduk"));
-        }
-    }
-
-    #[cfg(not(windows))]
-    {
-        if let Some(base) = std::env::var_os("XDG_DATA_HOME")
-            && !base.is_empty()
-        {
-            return Ok(PathBuf::from(base).join("marduk"));
-        }
-        if let Some(home) = std::env::var_os("HOME")
-            && !home.is_empty()
-        {
-            return Ok(PathBuf::from(home).join(".local/share/marduk"));
-        }
-    }
-
-    Err(WireError::new(Code::Storage))
-}
-
 fn report(envelope: Envelope<Value>, wants_json: bool) -> i32 {
     if wants_json {
         emit(&envelope);
     } else {
         match &envelope {
-            Envelope::Ok { result, .. } => match serde_json::to_string_pretty(result) {
+            Envelope::Ok { result } => match serde_json::to_string_pretty(result) {
                 Ok(text) => println!("{text}"),
                 Err(_) => eprintln!("Storage"),
             },
-            Envelope::Error { error, .. } => eprintln!("{}", error.code.as_str()),
+            Envelope::Error { error } => eprintln!("{}", human_error(error)),
         }
     }
     exit_code(&envelope)
+}
+
+/// Human mode keeps the stable code and the same serialized detail the wire
+/// envelope carries, so wording never replaces the typed reason.
+fn human_error(error: &WireError) -> String {
+    match &error.detail {
+        None => error.code.as_str().to_owned(),
+        Some(detail) => match serde_json::to_string(detail) {
+            Ok(text) => format!("{} {text}", error.code.as_str()),
+            Err(_) => error.code.as_str().to_owned(),
+        },
+    }
 }
 
 fn emit(envelope: &Envelope<Value>) {

@@ -91,3 +91,68 @@ deploy/restore, recovery reconciliation and any real game write.
   Current phase-A status reports pending work and deliberately does not resume it.
 - Reuse the same `Workspace`, `Request` and envelope DTOs from the thin Tauri command layer;
   desktop selection IDs must resolve to owned sources in Rust, never to a renderer-supplied path.
+
+## Phase A review fixes
+
+Base: `c1319e8`. Fix commit: this commit (see `git show HEAD`).
+
+- **Reorder identity:** added `Catalog::reorder_named`, which returns the snapshot
+  and display names read inside the same `IMMEDIATE` transaction. `Catalog::reorder`
+  delegates to it and keeps its `ProfileSnapshot` result; the workspace `order`
+  handler builds the wire snapshot from that value with no second read.
+- **Durable locator:** `setup` resolves the selection once with
+  `std::path::absolute` and uses the same absolute path for `bind_installation`
+  and `select_verified_installation`. A relative CLI argument therefore persists
+  absolutely; an unresolvable path returns `InvalidPath`.
+- **Retained slots:** `BackupSlot::AlternateDisplaced` is detection-only and is
+  filtered out of the wire `retained` list. It is never reported as `displaced`;
+  `RecoveryConflict` on the operation blocker carries the conflict instead.
+- **Human errors:** non-`--json` errors print the stable code plus the same
+  serialized `detail` the envelope carries, for example
+  `UnsupportedTarget {"reason":"Configuration"}`.
+- **One app data root:** `marduk_workspace::app_data_root()` and
+  `app_data_root_in()` resolve the OS data directory plus
+  `APP_IDENTIFIER = "com.marduk.desktop"`. The CLI uses it; the location is
+  frozen in `docs/contracts/m1-clients.md` for phase B's Tauri
+  `app.path().app_data_dir()`.
+- **Tests:** removed the CLI `rusqlite` dev-dependency and hand-written SQL
+  seeding. Added `InvalidOrder`/`StalePlan` mapping, code/envelope serialization,
+  alternate-slot, app-root, storage `reorder_named`, pending/active
+  `selected_installation`, duplicate-order, human-mode, relative-setup and
+  setup-no-writes witnesses. Exact `>2^53` DTO strings remain covered by the
+  workspace DTO test; true duplicate/omission validation stays in the storage
+  contract test with two members.
+- **Shapes:** `Preview` and `RestoreResult` remain unproduced phase-A shapes and
+  are documented as phase-B round-trip requirements.
+
+### Verification (Linux x86_64)
+
+```text
+cargo fmt --all -- --check                                      PASS
+cargo build --workspace --locked                                PASS
+cargo test --locked -p marduk-workspace                         PASS (5 unit + 9 workflow)
+cargo test --locked -p marduk-cli                               PASS (7 workflow)
+cargo test --locked -p marduk-storage                           PASS (incl. reorder_named and pending/active)
+cargo test --workspace --locked                                 PASS (no failures; pre-existing ignored tests unchanged)
+cargo tree -p marduk-cli --locked                               clap v4.6.9 resolved
+```
+
+Not run: Windows workflow execution, Tauri desktop build/smoke, native
+import/deploy/restore, and any real game write. Clippy is not clean on the
+pre-existing `marduk-archive` target (`this loop never actually loops`); the
+workspace and CLI changes add no clippy diagnostics of their own beyond the
+existing core warnings.
+
+### Remaining phase B (Tauri)
+
+- Create `app/src-tauri` with bundle identifier `com.marduk.desktop` and pass
+  `app.path().app_data_dir()` to `Workspace::open`; never derive a second path.
+- Implement thin typed commands over the same `Request`/`Envelope`, and TS
+  mirrors checked against Rust-serialized fixtures including IDs above `2^53`.
+- Produce and round-trip `Preview` and `RestoreResult` once the qualified effect
+  port exists; keep blocked routes typed rather than simulating success.
+- Render the serialized error detail in the UI and keep `retained` free of the
+  detection-only alternate slot.
+- Run the desktop witnesses (`desktop_and_cli_share_winner_and_final_state`,
+  stale preview, replay/no duplicate writes, recovery conflict, keyboard order,
+  no generic write command, wire fixtures) on Linux and Windows.

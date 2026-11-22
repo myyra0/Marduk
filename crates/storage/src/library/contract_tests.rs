@@ -433,6 +433,31 @@ mod library_contract {
     }
 
     #[test]
+    fn reorder_named_returns_names_from_the_same_transaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut catalog = Catalog::open_for_test(tmp.path()).unwrap();
+        let (a, member_a) = publish_a(&mut catalog);
+        let b = prepare(&mut catalog, 1, append("B"), B).id;
+        catalog.publish_import(b).unwrap();
+        let snapshot = catalog.snapshot(profile()).unwrap();
+        let member_b = snapshot.members[1].id;
+
+        let named = catalog
+            .reorder_named(profile(), ProfileRevision::new(2), &[member_b, member_a])
+            .unwrap();
+        assert_named(
+            named,
+            3,
+            &[(member_b, b, true, "B"), (member_a, a, true, "A")],
+        );
+
+        let stale = catalog
+            .reorder_named(profile(), ProfileRevision::new(2), &[member_b, member_a])
+            .unwrap_err();
+        assert_eq!(stale, ProfileEditError::StalePlan);
+    }
+
+    #[test]
     fn names_are_trimmed_bounded_utf8_labels_not_paths() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("root");

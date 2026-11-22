@@ -9,7 +9,7 @@
 
 use std::fmt::Write as _;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use marduk_core::deployment::{DeployError, OperationKind, OperationStatus, Phase};
 use marduk_core::ids::{MemberId, ProfileId, ProfileRevision};
@@ -23,8 +23,50 @@ use marduk_games::skyrim_se;
 use marduk_storage::Catalog;
 use marduk_storage::operation_journal::OperationJournal;
 use marduk_storage::operation_journal::SelectedInstallation;
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
+
+/// Bundle identifier that fixes the desktop and CLI data root.
+///
+/// Phase B must configure the Tauri identifier to this exact value so
+/// `app.path().app_data_dir()` resolves to the same catalog as the CLI.
+pub const APP_IDENTIFIER: &str = "com.marduk.desktop";
+
+/// Join the OS data directory with [`APP_IDENTIFIER`]. Pure so tests can
+/// check the frozen layout without touching the process environment.
+pub fn app_data_root_in(data_dir: &Path) -> PathBuf {
+    data_dir.join(APP_IDENTIFIER)
+}
+
+/// The one application data root used by every client.
+///
+/// This mirrors Tauri 2's `app_data_dir()` base directories: the user's data
+/// directory (`$XDG_DATA_HOME` or `$HOME/.local/share` on Linux, `%APPDATA%`
+/// on Windows, `~/Library/Application Support` on macOS) plus the bundle
+/// identifier. No client may derive a different catalog location.
+pub fn app_data_root() -> Result<PathBuf, WireError> {
+    #[cfg(windows)]
+    let base = std::env::var_os("APPDATA").filter(|value| !value.is_empty());
+
+    #[cfg(target_os = "macos")]
+    let base = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(|home| PathBuf::from(home).join("Library/Application Support"));
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(|home| PathBuf::from(home).join(".local/share"))
+        });
+
+    base.map(|base| app_data_root_in(&base))
+        .ok_or_else(|| WireError::new(Code::Storage))
+}
 
 /// The single M1 profile. Setup returns or initializes it.
 fn profile() -> ProfileId {
@@ -66,20 +108,36 @@ fn empty_args() -> Value {
 }
 
 /// Stable wire result. Exactly one envelope per invocation.
-#[derive(Clone, Debug, Serialize)]
-#[serde(untagged)]
+#[derive(Clone, Debug)]
 pub enum Envelope<T> {
-    Ok { ok: bool, result: T },
-    Error { ok: bool, error: WireError },
+    Ok { result: T },
+    Error { error: WireError },
+}
+
+impl<T: Serialize> Serialize for Envelope<T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(2))?;
+        match self {
+            Self::Ok { result } => {
+                map.serialize_entry("ok", &true)?;
+                map.serialize_entry("result", result)?;
+            }
+            Self::Error { error } => {
+                map.serialize_entry("ok", &false)?;
+                map.serialize_entry("error", error)?;
+            }
+        }
+        map.end()
+    }
 }
 
 impl<T> Envelope<T> {
     pub fn ok(result: T) -> Self {
-        Self::Ok { ok: true, result }
+        Self::Ok { result }
     }
 
     pub fn error(error: WireError) -> Self {
-        Self::Error { ok: false, error }
+        Self::Error { error }
     }
 
     pub fn is_ok(&self) -> bool {
@@ -88,7 +146,7 @@ impl<T> Envelope<T> {
 }
 
 /// Stable client error codes. The strings are part of the client contract.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 pub enum Code {
     InvalidRequest,
     InvalidName,
@@ -152,6 +210,12 @@ impl Code {
             Self::NoActiveDeployment => "NoActiveDeployment",
             Self::Io => "Io",
         }
+    }
+}
+
+impl Serialize for Code {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
     }
 }
 
@@ -331,6 +395,8 @@ pub struct PreviewFile {
     pub needs_backup: bool,
 }
 
+/// Deployment preview shape. Phase B must produce it from the qualified effect
+/// port and round-trip it through this DTO before the desktop shows Review.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Preview {
@@ -343,6 +409,8 @@ pub struct Preview {
     pub blockers: Vec<Blocker>,
 }
 
+/// Restore outcome shape. Phase B must produce both variants and cover their
+/// round trip; phase A only returns the typed unsupported blocker.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "outcome", rename_all = "camelCase")]
 pub enum RestoreResult {
@@ -421,11 +489,16 @@ impl Workspace {
             return Err(WireError::new(Code::InvalidRequest));
         }
         let selection = Path::new(&args.game_dir);
-        let binding = marduk_platform::bind_installation(selection, &skyrim_se::LAYOUT)
+        // The locator is durable, so resolve it once and use that exact path
+        // for both the bind and the journal record. A relative path must never
+        // become the stored location.
+        let selection =
+            std::path::absolute(selection).map_err(|_| WireError::new(Code::InvalidPath))?;
+        let binding = marduk_platform::bind_installation(&selection, &skyrim_se::LAYOUT)
             .map_err(root_error)?;
         let (installation, data) = binding.identities();
         self.journal
-            .select_verified_installation(selection, installation, data)
+            .select_verified_installation(&selection, installation, data)
             .map_err(deploy_error)
     }
 
@@ -529,13 +602,10 @@ impl Workspace {
             .iter()
             .map(|value| parse_id(value).map(MemberId::new))
             .collect::<Result<Vec<_>, _>>()?;
-        self.catalog
-            .reorder(profile(), revision, &members)
-            .map_err(edit_error)?;
         let named = self
             .catalog
-            .named_profile(profile())
-            .map_err(import_error)?;
+            .reorder_named(profile(), revision, &members)
+            .map_err(edit_error)?;
         Ok(snapshot_dto(named))
     }
 
@@ -701,26 +771,27 @@ fn operation(status: OperationStatus) -> Operation {
                 detail: error.detail,
             }
         }),
-        retained: status.retained.into_iter().map(retained).collect(),
+        retained: status.retained.into_iter().filter_map(retained).collect(),
     }
 }
 
-fn retained(retained: BackupRef) -> Retained {
-    Retained {
+fn retained(retained: BackupRef) -> Option<Retained> {
+    let slot = match retained.slot() {
+        BackupSlot::Original => Slot::Original,
+        BackupSlot::Step => Slot::Step,
+        BackupSlot::Displaced => Slot::Displaced,
+        // Detection-only: never a retained location and never a wire slot.
+        BackupSlot::AlternateDisplaced => return None,
+    };
+    Some(Retained {
         operation_id: decimal(retained.operation().get()),
         ordinal: retained.ordinal(),
         direction: match retained.direction() {
             StepDirection::Forward => Direction::Forward,
             StepDirection::Undo => Direction::Undo,
         },
-        // The contract exposes the three operator-visible slots; the alternate
-        // reserved slot is reported as the displaced slot it backs up.
-        slot: match retained.slot() {
-            BackupSlot::Original => Slot::Original,
-            BackupSlot::Step => Slot::Step,
-            BackupSlot::Displaced | BackupSlot::AlternateDisplaced => Slot::Displaced,
-        },
-    }
+        slot,
+    })
 }
 
 fn phase(phase: Phase) -> &'static str {
@@ -881,4 +952,110 @@ fn hex(bytes: &[u8]) -> String {
         write!(&mut output, "{byte:02x}").expect("writing to a string cannot fail");
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn backup(slot: BackupSlot) -> BackupRef {
+        BackupRef::from_record(
+            marduk_core::deployment::OperationId::try_from_u64(7).unwrap(),
+            2,
+            StepDirection::Undo,
+            slot,
+        )
+    }
+
+    #[test]
+    fn code_strings_serialize_through_one_table() {
+        let codes = [
+            Code::InvalidRequest,
+            Code::InvalidName,
+            Code::InvalidOrder,
+            Code::StalePlan,
+            Code::MemberNotFound,
+            Code::Busy,
+            Code::UnknownImport,
+            Code::ImportNotPrepared,
+            Code::StageChanged,
+            Code::StageUnavailable,
+            Code::Storage,
+            Code::InvalidContainer,
+            Code::UnsupportedContainer,
+            Code::DuplicateRawName,
+            Code::UnsupportedEntry,
+            Code::UnsafeName,
+            Code::ConflictingNames,
+            Code::LimitExceeded,
+            Code::CorruptEntry,
+            Code::MissingEntry,
+            Code::InvalidPath,
+            Code::TargetUnavailable,
+            Code::UnsupportedTarget,
+            Code::ActiveDeployment,
+            Code::RecoveryConflict,
+            Code::UnknownOperation,
+            Code::NoActiveDeployment,
+            Code::Io,
+        ];
+        for code in codes {
+            assert_eq!(
+                serde_json::to_value(code).unwrap(),
+                Value::String(code.as_str().to_owned())
+            );
+            assert_eq!(
+                serde_json::from_value::<Code>(serde_json::to_value(code).unwrap()).unwrap(),
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn envelope_ok_is_derived_from_the_variant() {
+        assert_eq!(
+            serde_json::to_value(Envelope::ok(7)).unwrap(),
+            serde_json::json!({ "ok": true, "result": 7 })
+        );
+        assert_eq!(
+            serde_json::to_value(Envelope::<()>::error(WireError::new(Code::StalePlan))).unwrap(),
+            serde_json::json!({ "ok": false, "error": { "code": "StalePlan" } })
+        );
+    }
+
+    #[test]
+    fn order_failures_keep_their_stable_codes() {
+        use marduk_core::import::ProfileEditError;
+        assert_eq!(
+            edit_error(ProfileEditError::InvalidOrder),
+            WireError::new(Code::InvalidOrder)
+        );
+        assert_eq!(
+            edit_error(ProfileEditError::StalePlan),
+            WireError::new(Code::StalePlan)
+        );
+    }
+
+    #[test]
+    fn alternate_displacement_is_detection_only_not_a_retained_slot() {
+        assert!(retained(backup(BackupSlot::AlternateDisplaced)).is_none());
+        for (slot, expected) in [
+            (BackupSlot::Original, Slot::Original),
+            (BackupSlot::Step, Slot::Step),
+            (BackupSlot::Displaced, Slot::Displaced),
+        ] {
+            let dto = retained(backup(slot)).unwrap();
+            assert_eq!(
+                serde_json::to_value(dto).unwrap()["slot"],
+                serde_json::to_value(expected).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn app_data_root_is_the_identifier_under_the_os_data_directory() {
+        let root = app_data_root_in(Path::new("/var/lib/user-data"));
+        assert_eq!(root, Path::new("/var/lib/user-data").join(APP_IDENTIFIER));
+        assert_eq!(root.file_name().unwrap(), APP_IDENTIFIER);
+    }
 }

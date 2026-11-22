@@ -340,6 +340,17 @@ impl Catalog {
         expected: ProfileRevision,
         order: &[MemberId],
     ) -> Result<ProfileSnapshot, ProfileEditError> {
+        Ok(self.reorder_named(profile, expected, order)?.snapshot)
+    }
+
+    /// Reorder and return the snapshot with its display names from the same
+    /// transaction, so callers never need a second read for the result.
+    pub fn reorder_named(
+        &mut self,
+        profile: ProfileId,
+        expected: ProfileRevision,
+        order: &[MemberId],
+    ) -> Result<NamedProfile, ProfileEditError> {
         let _guard = self.lock_edit()?;
         let profile_value = sql_profile_id(profile).map_err(|_| ProfileEditError::Storage)?;
         let expected_value =
@@ -413,6 +424,7 @@ impl Catalog {
         if changed != 1 {
             return Err(ProfileEditError::StalePlan);
         }
+        let names = read_names(&transaction, profile).map_err(|_| ProfileEditError::Storage)?;
         transaction.commit().map_err(edit_storage)?;
 
         let by_id: BTreeMap<u64, &MemberRow> = members
@@ -433,10 +445,13 @@ impl Catalog {
             })
             .collect();
 
-        Ok(ProfileSnapshot {
-            id: profile,
-            revision: ProfileRevision::new(next),
-            members: reordered,
+        Ok(NamedProfile {
+            snapshot: ProfileSnapshot {
+                id: profile,
+                revision: ProfileRevision::new(next),
+                members: reordered,
+            },
+            names,
         })
     }
 

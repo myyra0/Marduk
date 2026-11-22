@@ -1,7 +1,7 @@
 //! CLI workflow witnesses against the real shared workspace service.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use serde_json::{Value, json};
@@ -23,22 +23,27 @@ impl Fixture {
         Self { temp, data, game }
     }
 
-    fn run(&self, arguments: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_marduk"))
+    fn command(&self, cwd: &Path, arguments: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_marduk"));
+        command
             .args(arguments)
+            .current_dir(cwd)
             .env("XDG_DATA_HOME", &self.data)
-            .env("LOCALAPPDATA", &self.data)
-            .output()
-            .unwrap()
+            .env("APPDATA", &self.data)
+            .env_remove("LOCALAPPDATA");
+        command
+    }
+
+    fn run(&self, arguments: &[&str]) -> Output {
+        self.command(self.temp.path(), arguments).output().unwrap()
+    }
+
+    fn run_at(&self, cwd: &Path, arguments: &[&str]) -> Output {
+        self.command(cwd, arguments).output().unwrap()
     }
 
     fn app_root(&self) -> PathBuf {
-        self.data
-            .join(if cfg!(windows) { "Marduk" } else { "marduk" })
-    }
-
-    fn database(&self) -> PathBuf {
-        self.app_root().join("catalog.sqlite3")
+        self.data.join("com.marduk.desktop")
     }
 
     fn game_dir(&self) -> &str {
@@ -58,6 +63,19 @@ fn envelope(output: &Output) -> Value {
 
 fn code(value: &Value) -> &str {
     value["error"]["code"].as_str().unwrap()
+}
+
+fn tree(root: &Path) -> Vec<PathBuf> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        entries.push(path.clone());
+        if path.is_dir() {
+            entries.extend(tree(&path));
+        }
+    }
+    entries.sort();
+    entries
 }
 
 #[test]
@@ -98,6 +116,89 @@ fn setup_status_and_empty_order_workflow() {
     let output = fixture.run(&["order", "--at-revision", "0", "--json"]);
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(code(&envelope(&output)), "StalePlan");
+}
+
+#[test]
+fn setup_leaves_the_game_tree_unchanged_and_writes_no_revision() {
+    let fixture = Fixture::new();
+    let before = tree(&fixture.game);
+
+    let output = fixture.run(&["setup", "--game-dir", fixture.game_dir(), "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(tree(&fixture.game), before);
+    assert_eq!(
+        fs::read_dir(fixture.app_root().join("revisions"))
+            .unwrap()
+            .count(),
+        0
+    );
+
+    let output = fixture.run(&["status", "--json"]);
+    let value = envelope(&output);
+    assert_eq!(value["result"]["profile"]["revision"], json!("0"));
+    assert_eq!(value["result"]["pending"], Value::Null);
+    assert_eq!(value["result"]["activeGenerationId"], Value::Null);
+}
+
+#[test]
+fn relative_setup_persists_an_absolute_locator() {
+    let fixture = Fixture::new();
+    let relative = fixture.game.file_name().unwrap().to_str().unwrap();
+
+    // Bind through a relative argument from the parent directory.
+    let output = fixture.run_at(
+        fixture.temp.path(),
+        &["setup", "--game-dir", relative, "--json"],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // A different working directory proves the durable locator is absolute.
+    let elsewhere = fixture.temp.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let output = fixture.run_at(&elsewhere, &["status", "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let value = envelope(&output);
+    assert_eq!(
+        value["result"]["installation"]["label"],
+        json!("Skyrim Special Edition")
+    );
+    assert_eq!(
+        value["result"]["availability"]["target"]["available"],
+        json!(true)
+    );
+}
+
+#[test]
+fn human_mode_keeps_the_stable_code_and_serialized_detail() {
+    let fixture = Fixture::new();
+    let output = fixture.run(&["setup", "--game-dir", fixture.game_dir()]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = fixture.run(&["deploy", "preview", "--at-revision", "0"]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("UnsupportedTarget"), "stderr: {stderr}");
+    assert!(stderr.contains("Configuration"), "stderr: {stderr}");
+
+    let output = fixture.run(&["order", "--at-revision", "0", "1"]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.trim(), "InvalidOrder");
 }
 
 #[test]
@@ -171,47 +272,28 @@ fn usage_and_id_syntax_exit_two() {
 }
 
 #[test]
-fn large_revision_round_trips_as_a_string() {
+fn id_and_revision_syntax_stops_at_the_signed_boundary() {
     let fixture = Fixture::new();
-
-    // Create the catalog through the service, then arrange one large revision.
-    let output = fixture.run(&["status", "--json"]);
+    let output = fixture.run(&["setup", "--game-dir", fixture.game_dir(), "--json"]);
     assert_eq!(output.status.code(), Some(0));
 
-    let revision = "9007199254740993"; // 2^53 + 1
-    let member = "9223372036854775806"; // i64::MAX - 1
-    let connection = rusqlite::Connection::open(fixture.database()).unwrap();
-    connection
-        .execute_batch(&format!(
-            "INSERT INTO imports
-                 (id, profile_id, expected_revision, target, display_name, state,
-                  owner, archive_sha, result_revision)
-             VALUES (1, 1, 0, 'append', 'Big', 'committed', x'00', zeroblob(32), 0);
-             INSERT INTO installed_revisions (id) VALUES (1);
-             INSERT INTO members
-                 (id, profile_id, ordinal, installed_id, enabled, display_name)
-             VALUES ({member}, 1, 0, 1, 1, 'Big');
-             UPDATE profiles SET revision = {revision} WHERE id = 1;"
-        ))
-        .unwrap();
-    drop(connection);
+    // i64::MAX is a valid revision string but stale, so it is parsed exactly.
+    let output = fixture.run(&["order", "--at-revision", "9223372036854775807", "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(code(&envelope(&output)), "StalePlan");
 
-    let output = fixture.run(&["order", "--at-revision", revision, member, "--json"]);
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "stdout: {}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    let text = String::from_utf8(output.stdout).unwrap();
-    assert_eq!(text.matches('\n').count(), 1);
-    assert!(
-        text.contains("\"revision\":\"9007199254740994\""),
-        "revision must survive as an exact string: {text}"
-    );
-    let value: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(value["result"]["revision"], json!("9007199254740994"));
-    assert_eq!(value["result"]["members"][0]["id"], json!(member));
-    assert!(value["result"]["revision"].is_string());
-    assert!(value["result"]["members"][0]["id"].is_string());
+    for arguments in [
+        vec!["order", "--at-revision", "9223372036854775808", "--json"],
+        vec![
+            "order",
+            "--at-revision",
+            "0",
+            "9223372036854775808",
+            "--json",
+        ],
+    ] {
+        let output = fixture.run(&arguments);
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(code(&envelope(&output)), "InvalidRequest");
+    }
 }

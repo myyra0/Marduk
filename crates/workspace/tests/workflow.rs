@@ -263,6 +263,12 @@ fn invalid_requests_are_refused_without_writes() {
     let error = expect_error(fixture.order("0", &["0"]));
     assert_eq!(code(&error), "InvalidRequest");
 
+    // The M1 profile has no members, so any supplied membership list cannot be
+    // the exact permutation; duplicates must not advance the revision.
+    let error = expect_error(fixture.order("0", &["1", "1"]));
+    assert_eq!(code(&error), "InvalidOrder");
+    assert_eq!(fixture.status()["profile"]["revision"], json!("0"));
+
     let error = expect_error(fixture.send(json!({ "op": "status", "args": { "path": "/" } })));
     assert_eq!(code(&error), "InvalidRequest");
 
