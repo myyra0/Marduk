@@ -1,5 +1,6 @@
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { StrictMode } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 
 import { App } from './App';
@@ -688,7 +689,7 @@ describe('workspace shell', () => {
     expect(deployApply).toHaveBeenCalledTimes(1);
   });
 
-  it('reconnect loads pending, conflict and retained state from status', async () => {
+  it('reconnect reloads a stale status without claiming reconciliation', async () => {
     const user = userEvent.setup();
     const status = vi.fn<WorkspaceTransport['status']>();
     status
@@ -697,11 +698,8 @@ describe('workspace shell', () => {
         result: { ...fixtureStatus(), pending: null },
       })
       .mockResolvedValue({ ok: true as const, result: fixtureStatus() });
-    const operation = vi.fn(async () => ({
-      ok: true as const,
-      result: fixtureOperation(),
-    }));
-    await renderReady({ status, operation });
+    const recover = vi.fn(async () => ({ ok: true as const, result: null }));
+    await renderReady({ status, recover });
 
     expect(screen.queryByText(/Pending operation/)).not.toBeInTheDocument();
 
@@ -710,10 +708,68 @@ describe('workspace shell', () => {
     expect(await screen.findByText(/Pending operation/)).toBeInTheDocument();
     expect(screen.getByText('RecoveryConflict')).toBeInTheDocument();
     expect(screen.getByText(/ordinal 2/)).toBeInTheDocument();
-    await waitFor(() => {
-      expect(operation).toHaveBeenCalledWith('9223372036854775803');
-    });
-    expect(screen.getByText(/Authoritative state reloaded/)).toBeInTheDocument();
+    await waitFor(() => expect(status).toHaveBeenCalledTimes(3));
+    expect(recover).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(/Interrupted work was reconciled/)).not.toBeInTheDocument();
+  });
+
+  it('reports an Ok recovery result with a blocker as refused, not reconciled', async () => {
+    const user = userEvent.setup();
+    const pendingStatus = statusWithEffects();
+    const withPending = {
+      ...pendingStatus,
+      pending: { ...fixtureOperation(), phase: 'applying' as const },
+    };
+    const status = vi.fn<WorkspaceTransport['status']>();
+    status
+      .mockResolvedValueOnce({ ok: true as const, result: pendingStatus })
+      .mockResolvedValue({ ok: true as const, result: withPending });
+    const recover = vi.fn(async () => ({
+      ok: true as const,
+      result: {
+        ...fixtureOperation(),
+        phase: 'rolling_back' as const,
+        blocker: { code: 'RecoveryConflict' as const },
+      },
+    }));
+
+    await renderReady({ status, recover });
+    await user.click(screen.getByRole('button', { name: /Reconnect/ }));
+
+    expect(await screen.findByText('Recovery refused')).toBeInTheDocument();
+    expect(screen.getByText('RecoveryConflict')).toBeInTheDocument();
+    expect(screen.getByText(/Recovery stopped: RecoveryConflict/)).toBeInTheDocument();
+    expect(screen.queryByText(/Interrupted work was reconciled/)).not.toBeInTheDocument();
+    expect(recover).toHaveBeenCalledTimes(1);
+    // A refused reconciliation keeps the authoritative status; it never
+    // pretends the work settled.
+    await waitFor(() => expect(status).toHaveBeenCalledTimes(2));
+    expect(screen.getByText(/Pending operation/)).toBeInTheDocument();
+  });
+
+  it('runs one recovery when the mount effect is double-invoked', async () => {
+    const pendingStatus = fixtureStatus();
+    const reconciled = { ...fixtureStatus(), pending: null };
+    const status = vi
+      .fn<WorkspaceTransport['status']>()
+      .mockResolvedValueOnce({ ok: true as const, result: pendingStatus })
+      .mockResolvedValue({ ok: true as const, result: reconciled });
+    const recover = vi.fn(async () => ({
+      ok: true as const,
+      result: { ...fixtureOperation(), phase: 'completed' as const, blocker: null },
+    }));
+    const { transport } = createStubTransport({ status, recover });
+
+    render(
+      <StrictMode>
+        <App transport={transport} />
+      </StrictMode>,
+    );
+
+    await waitFor(() => expect(recover).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByText(/Interrupted work was reconciled/)).toBeInTheDocument());
+    expect(recover).toHaveBeenCalledTimes(1);
+    expect(status).toHaveBeenCalledTimes(2);
   });
 
   it('reconciles pending work once on the first status load and reloads status', async () => {

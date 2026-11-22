@@ -23,6 +23,11 @@ type StatusState =
   | { kind: 'ready'; status: WorkspaceStatus; stale: boolean }
   | { kind: 'failed'; message: string };
 
+type RecoveryOutcome =
+  | { kind: 'reconciled'; operation: Operation }
+  | { kind: 'none' }
+  | { kind: 'blocked' };
+
 type Props = {
   transport: WorkspaceTransport;
 };
@@ -46,6 +51,7 @@ export function App({ transport }: Props) {
   const mounted = useRef(true);
   const stream = useRef(new ProgressStream());
   const operationRef = useRef<Operation | null>(null);
+  const recoveryInFlight = useRef(false);
 
   useEffect(() => {
     mounted.current = true;
@@ -55,7 +61,10 @@ export function App({ transport }: Props) {
   }, []);
 
   const refresh = useCallback(
-    async (announce: string | null = null): Promise<WorkspaceStatus | null> => {
+    async (
+      announce: string | null = null,
+      holdBusy = false,
+    ): Promise<WorkspaceStatus | null> => {
       setBusy(true);
       try {
         const envelope = await transport.status();
@@ -87,7 +96,7 @@ export function App({ transport }: Props) {
         setNotice(message);
         return null;
       } finally {
-        if (mounted.current) setBusy(false);
+        if (!holdBusy && mounted.current) setBusy(false);
       }
     },
     [transport],
@@ -115,31 +124,37 @@ export function App({ transport }: Props) {
   /**
    * Reconcile recorded pending work after a crash or reconnect.
    *
-   * Called once per status load. A typed refusal is shown and never retried
-   * automatically. `ok: true` with `operation: null` means the journal found
-   * nothing left to settle, so no reconciliation is claimed.
+   * `none` means the journal held no pending row, so the status that triggered
+   * the call was stale. A non-null blocker is a refusal: the envelope is `Ok`,
+   * but the recorded work did not settle.
    */
-  const recoverPending = useCallback(
-    async (): Promise<{ ok: true; operation: Operation | null } | { ok: false }> => {
-      try {
-        const envelope = await transport.recover();
-        if (!mounted.current) return { ok: false };
-        if (envelope.ok) {
+  const recoverPending = useCallback(async (): Promise<RecoveryOutcome> => {
+    try {
+      const envelope = await transport.recover();
+      if (!mounted.current) return { kind: 'blocked' };
+      if (envelope.ok) {
+        const operation = envelope.result;
+        if (operation === null) {
           setRecoveryError(null);
-          if (envelope.result === null) return { ok: true, operation: null };
-          operationRef.current = envelope.result;
-          setOperationState(envelope.result);
-          return { ok: true, operation: envelope.result };
+          return { kind: 'none' };
         }
-        setRecoveryError(envelope.error);
-        setNotice(`Recovery stopped: ${describeBlocker(envelope.error)}`);
-      } catch (error) {
-        if (mounted.current) setNotice(describeFailure(error));
+        operationRef.current = operation;
+        setOperationState(operation);
+        if (operation.blocker !== null) {
+          setRecoveryError(operation.blocker);
+          setNotice(`Recovery stopped: ${describeBlocker(operation.blocker)}`);
+          return { kind: 'blocked' };
+        }
+        setRecoveryError(null);
+        return { kind: 'reconciled', operation };
       }
-      return { ok: false };
-    },
-    [transport],
-  );
+      setRecoveryError(envelope.error);
+      setNotice(`Recovery stopped: ${describeBlocker(envelope.error)}`);
+    } catch (error) {
+      if (mounted.current) setNotice(describeFailure(error));
+    }
+    return { kind: 'blocked' };
+  }, [transport]);
 
   /** A gap or duplicate reloads authoritative state; it never retries the write. */
   const onProgress = useCallback(
@@ -169,20 +184,59 @@ export function App({ transport }: Props) {
     }
   }, [refresh, loadOperation]);
 
-  /** Load authoritative status, then settle recorded pending work once. */
-  const connect = useCallback(async () => {
-    const authoritative = await refresh();
-    if (!mounted.current || authoritative === null || authoritative.pending === null) {
-      return;
-    }
-    const outcome = await recoverPending();
-    if (!mounted.current || !outcome.ok || outcome.operation === null) return;
-    await refresh('Interrupted work was reconciled; authoritative state reloaded.');
-  }, [refresh, recoverPending]);
+  /**
+   * Load authoritative status, then settle recorded pending work once.
+   *
+   * The in-flight ref survives the mount effect's StrictMode cleanup and re-run,
+   * so a double-invoked effect cannot start a second recovery. Status is
+   * refreshed after both a null result and a reconciliation, but reconciliation
+   * is announced only when the refreshed status has nothing pending.
+   */
+  const settleRecovery = useCallback(
+    async (announce: string | null): Promise<void> => {
+      if (recoveryInFlight.current) return;
+      recoveryInFlight.current = true;
+      setBusy(true);
+      try {
+        const authoritative = await refresh(announce, true);
+        if (!mounted.current || authoritative === null) return;
+        if (authoritative.pending === null) {
+          const target = operationRef.current?.id;
+          if (target !== undefined) await loadOperation(target);
+          return;
+        }
+        const outcome = await recoverPending();
+        if (!mounted.current) return;
+        if (outcome.kind === 'blocked') {
+          // A refusal is reported once and nothing is retried; the recorded
+          // operation detail is still an authoritative read.
+          await loadOperation(authoritative.pending.id);
+          return;
+        }
+        // `none` means the journal had no pending row, so the status this call
+        // started from was stale. Reload it without claiming reconciliation.
+        const refreshed = await refresh(null, true);
+        if (
+          !mounted.current ||
+          outcome.kind !== 'reconciled' ||
+          refreshed === null ||
+          refreshed.pending !== null ||
+          outcome.operation.blocker !== null
+        ) {
+          return;
+        }
+        setNotice('Interrupted work was reconciled; authoritative state reloaded.');
+      } finally {
+        recoveryInFlight.current = false;
+        if (mounted.current) setBusy(false);
+      }
+    },
+    [refresh, recoverPending, loadOperation],
+  );
 
   useEffect(() => {
-    void connect();
-  }, [connect]);
+    void settleRecovery(null);
+  }, [settleRecovery]);
 
   type PerformOptions<T> = {
     apply?: (result: T) => void | Promise<void>;
@@ -461,30 +515,7 @@ export function App({ transport }: Props) {
   }
 
   async function reconnect() {
-    setBusy(true);
-    setNotice(null);
-    try {
-      const authoritative = await refresh('Authoritative state reloaded.');
-      if (!mounted.current || authoritative === null) return;
-      if (authoritative.pending !== null) {
-        const outcome = await recoverPending();
-        if (!mounted.current) return;
-        if (!outcome.ok || outcome.operation === null) {
-          // A refusal is reported once and nothing is retried; the recorded
-          // operation detail is still an authoritative read.
-          await loadOperation(authoritative.pending.id);
-          return;
-        }
-        await refresh('Interrupted work was reconciled; authoritative state reloaded.');
-        return;
-      }
-      const target = operationRef.current?.id;
-      if (target !== undefined) {
-        await loadOperation(target);
-      }
-    } finally {
-      if (mounted.current) setBusy(false);
-    }
+    await settleRecovery('Authoritative state reloaded.');
   }
 
   return (

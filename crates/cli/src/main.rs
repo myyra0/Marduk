@@ -218,9 +218,21 @@ fn emit(envelope: &Envelope<Value>) {
     }
 }
 
+/// A blocked reconciliation is an `Ok` envelope whose recorded operation
+/// carries a non-null `blocker`; it exits 1 like a typed refusal because the
+/// work did not settle. `null` and a blocker-free operation exit 0.
 fn exit_code(envelope: &Envelope<Value>) -> i32 {
     match envelope {
-        Envelope::Ok { .. } => 0,
+        Envelope::Ok { result, .. } => {
+            if result
+                .get("blocker")
+                .is_some_and(|blocker| !blocker.is_null())
+            {
+                1
+            } else {
+                0
+            }
+        }
         Envelope::Error { error, .. } => {
             if error.code == Code::InvalidRequest {
                 2
@@ -243,5 +255,33 @@ mod tests {
             Some(std::ffi::OsStr::new(marduk_workspace::APP_IDENTIFIER))
         );
         assert_eq!(root, app_data_root().unwrap());
+    }
+
+    #[test]
+    fn blocked_recovery_exits_nonzero() {
+        let blocked: Envelope<Value> = Envelope::Ok {
+            result: json!({
+                "id": "9223372036854775803",
+                "kind": "deploy",
+                "phase": "rolling_back",
+                "blocker": { "code": "RecoveryConflict" },
+            }),
+        };
+        assert_eq!(exit_code(&blocked), 1);
+
+        let resolved: Envelope<Value> = Envelope::Ok {
+            result: json!({
+                "id": "9223372036854775803",
+                "kind": "deploy",
+                "phase": "rolled_back",
+                "blocker": null,
+            }),
+        };
+        assert_eq!(exit_code(&resolved), 0);
+
+        let nothing: Envelope<Value> = Envelope::Ok {
+            result: Value::Null,
+        };
+        assert_eq!(exit_code(&nothing), 0);
     }
 }

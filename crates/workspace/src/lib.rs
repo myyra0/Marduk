@@ -886,9 +886,10 @@ impl Workspace {
     ///
     /// This is deliberately not gated by [`native_effects_gate`]: a crash
     /// mid-apply leaves recorded pending work that must be reconciled even
-    /// while client-visible Apply/Restore stay closed. The adapter still
-    /// refuses an unqualified volume with a typed error, so the request can
-    /// never report a simulated success.
+    /// while client-visible Apply/Restore stay closed. Core verifies the
+    /// recorded installation/data pair and the adapter still refuses an
+    /// unqualified volume with a typed error, so the request can never report a
+    /// simulated success and never creates work.
     fn recover_pending(&mut self) -> Result<Option<Operation>, WireError> {
         let selected = self.selected_pair()?;
         // No pending operation means no native work. Answer before opening the
@@ -898,15 +899,8 @@ impl Workspace {
             .journal
             .root_state(&selected.data)
             .map_err(deploy_error)?;
-        let Some(op) = state.pending else {
+        if state.pending.is_none() {
             return Ok(None);
-        };
-        // A pending lease that already records a terminal phase is resolved
-        // work; report that recorded outcome without a second effect.
-        if let Some(status) = Journal::status(&mut self.journal, op).map_err(deploy_error)? {
-            if status.phase.is_terminal() {
-                return Ok(Some(operation(status)));
-            }
         }
         let mut port = self.native_effects(&selected)?;
         marduk_core::recovery::recover_pending(
@@ -1155,7 +1149,12 @@ fn phase(phase: Phase) -> &'static str {
 /// The native copy adapter is wired, but real Apply and Restore stay closed
 /// until the C1 proof lane records its rows in
 /// `docs/research/m1-native-results.md`. Synthetic runs reach the adapter only
-/// through the `proof_*` methods; normal requests never bypass this gate.
+/// through the `proof_*` methods.
+///
+/// `Op::Recover` is the one normal route that reaches the adapter. It only
+/// settles an already-recorded pending operation and must never create work.
+/// The exemption depends on no other client route being able to create a
+/// pending row while this gate is closed.
 fn native_effects_gate() -> Result<(), WireError> {
     Err(unsupported_effect())
 }
