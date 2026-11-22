@@ -87,16 +87,18 @@ fn assert_refused(error: ImportError) {
 /// tries a directory symlink and falls back to a junction, which an ordinary
 /// user can create without the symlink privilege. `MARDUK_FORCE_JUNCTION=1`
 /// forces the junction path so it can be exercised even in an elevated session.
-fn link_directory(link: &Path, target: &Path) -> bool {
+fn link_directory(link: &Path, target: &Path, force_junction: bool) -> bool {
     #[cfg(target_os = "linux")]
     {
+        let _ = force_junction;
         std::os::unix::fs::symlink(target, link).is_ok()
     }
     #[cfg(windows)]
     {
-        let force_junction = std::env::var("MARDUK_FORCE_JUNCTION")
-            .map(|value| value != "0" && !value.is_empty())
-            .unwrap_or(false);
+        let force_junction = force_junction
+            || std::env::var_os("MARDUK_FORCE_JUNCTION")
+                .map(|value| value != "0" && !value.is_empty())
+                .unwrap_or(false);
 
         if !force_junction && std::os::windows::fs::symlink_dir(target, link).is_ok() {
             eprintln!("link_directory: used symlink_dir for {}", link.display());
@@ -196,11 +198,7 @@ fn redirected_revisions_is_refused_without_writes() {
     fs::create_dir(&root).unwrap();
     let outside = tmp.path().join("outside");
     fs::create_dir(&outside).unwrap();
-    #[cfg(windows)]
-    std::env::set_var("MARDUK_FORCE_JUNCTION", "1");
-    assert!(link_directory(&root.join(REVISIONS), &outside));
-    #[cfg(windows)]
-    std::env::remove_var("MARDUK_FORCE_JUNCTION");
+    assert!(link_directory(&root.join(REVISIONS), &outside, true));
 
     assert!(matches!(
         NativeStage::open(&root),
@@ -218,7 +216,11 @@ fn redirected_revision_path_is_refused_without_writes() {
     let mut stage = NativeStage::open(&root).unwrap();
     let outside = tmp.path().join("outside");
     fs::create_dir(&outside).unwrap();
-    assert!(link_directory(&root.join(REVISIONS).join("7"), &outside));
+    assert!(link_directory(
+        &root.join(REVISIONS).join("7"),
+        &outside,
+        false
+    ));
     let gate = WriterGate::open(root.join("lock")).unwrap();
     let guard = gate.try_lock().unwrap();
 
@@ -244,7 +246,8 @@ fn redirected_payload_during_owner_record_is_refused_without_writes() {
     let error = match stage.stage(&guard, allocation(1), &mut input, &mut |_owner| {
         assert!(link_directory(
             &root.join(REVISIONS).join("1").join("payload"),
-            &outside
+            &outside,
+            false
         ));
         Ok(())
     }) {
@@ -367,7 +370,11 @@ fn reobserve_refuses_a_revision_redirected_while_unbound() {
     fs::create_dir(&outside).unwrap();
     let real = tmp.path().join("real-revision");
     fs::rename(root.join(REVISIONS).join("1"), &real).unwrap();
-    assert!(link_directory(&root.join(REVISIONS).join("1"), &outside));
+    assert!(link_directory(
+        &root.join(REVISIONS).join("1"),
+        &outside,
+        false
+    ));
 
     let mut stage = NativeStage::open(&root).unwrap();
     assert_refused(stage.reobserve(&guard, receipt.evidence()).unwrap_err());
