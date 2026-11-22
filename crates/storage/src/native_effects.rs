@@ -1327,6 +1327,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn source_component_resolves_the_stored_spelling() {
         let temp = tempfile::tempdir().unwrap();
@@ -1340,6 +1341,7 @@ mod tests {
         assert_eq!(fs::read(&source).unwrap(), b"staged\n");
     }
 
+    #[cfg(unix)]
     #[test]
     fn source_component_prefers_the_exact_spelling() {
         let temp = tempfile::tempdir().unwrap();
@@ -1350,6 +1352,7 @@ mod tests {
         assert_eq!(exact, temp.path().join("Textures"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn source_component_refuses_ambiguous_case_aliases() {
         let temp = tempfile::tempdir().unwrap();
