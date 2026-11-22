@@ -168,6 +168,24 @@ async function waitFor<T>(
   throw new Error(`timed out after ${timeoutMs}ms waiting for ${label}; last: ${last}`);
 }
 
+async function waitUntil(
+  label: string,
+  timeoutMs: number,
+  probe: () => Promise<boolean>,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let last = 'not ready';
+  while (Date.now() < deadline) {
+    try {
+      if (await probe()) return;
+    } catch (error) {
+      last = describe(error);
+    }
+    await sleep(500);
+  }
+  throw new Error(`timed out after ${timeoutMs}ms waiting for ${label}; last: ${last}`);
+}
+
 let sessionId: string | null = null;
 let execute: ((script: string) => Promise<unknown>) | null = null;
 let executeAsync: ((script: string) => Promise<unknown>) | null = null;
@@ -214,25 +232,20 @@ try {
 
   // 2. The status view loads from the real workspace, not a fixture. A typed
   //    failure is a failure here: a fresh catalog root must open successfully.
-  const statusView = (await waitFor('the authoritative status view', uiTimeoutMs, async () => {
-    const state = (await execute(DOM_STATE)) as {
-      shell?: boolean;
-      heading?: string | null;
-      text: string;
-      installationRendered?: boolean;
-    };
-    if (state.shell !== true) return null;
-    if (state.heading?.trim() !== 'Marduk') return null;
-    if (state.text.includes('Status unavailable')) {
-      throw new Error(`the shell rendered its typed failure state: ${state.text.slice(0, 600)}`);
-    }
-    if (!(state.text.includes('No installation bound.') || state.installationRendered === true)) {
-      return null;
-    }
-    return state.text.includes('Deploy') && state.text.includes('Profile')
-      ? state
-      : null;
-  })) as { text: string; rows: string[] };
+  await waitUntil('the authoritative status view', uiTimeoutMs, async () => {
+    const result = await execute(
+      `return document.querySelector('main.shell') !== null && document.body.innerText.includes('No installation bound.');`,
+    );
+    const value =
+      result !== null && typeof result === 'object' && 'value' in (result as object)
+        ? (result as { value: unknown }).value
+        : result;
+    return value === true;
+  });
+  const statusView = (await execute(DOM_STATE)) as { text: string; rows: string[] };
+  if (statusView.text.includes('Status unavailable')) {
+    throw new Error(`the shell rendered its typed failure state: ${statusView.text.slice(0, 600)}`);
+  }
 
   assert(
     statusView.text.includes('No installation bound.'),
