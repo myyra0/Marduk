@@ -1224,11 +1224,14 @@ mod root {
         }
     }
 
-    /// Digest what a descriptor grants: owner SID, group SID and the DACL as a
-    /// sorted list of (ACE type, inheritance flags, mask, object GUIDs, SID).
-    /// Self-relative layout, ACE order, padding and control/provenance bits are
-    /// ignored, so two descriptors that grant the same access hash equal; that
-    /// is intended. Observation uses `READ_CONTROL`, not privileged SACL access.
+    /// Digest what a descriptor grants: owner SID, group SID and the DACL as an
+    /// ordered list of (ACE type, inheritance flags, mask, object GUIDs, SID).
+    /// Self-relative layout, padding and control/provenance bits are ignored.
+    /// ACE order is preserved because Windows evaluates entries in order, so
+    /// reordering overlapping allow/deny entries can change effective access;
+    /// two descriptors with the same entries in a different order therefore
+    /// hash differently. Observation uses `READ_CONTROL`, not privileged SACL
+    /// access.
     fn security_sha256(file: &File) -> Result<[u8; 32], RootError> {
         let requested =
             OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
@@ -1276,7 +1279,6 @@ mod root {
             }
             entries.push(canonical_ace(ace)?);
         }
-        entries.sort();
 
         let mut hasher = Sha256::new();
         hasher.update(b"windows-security-v1\0");
@@ -2594,9 +2596,13 @@ mod root {
     #[cfg(test)]
     mod security_digest_tests {
         use super::*;
+        use windows_sys::Win32::Security::Authorization::{
+            GetEffectiveRightsFromAclW, NO_MULTIPLE_TRUSTEE, TRUSTEE_IS_SID, TRUSTEE_IS_USER,
+            TRUSTEE_W,
+        };
         use windows_sys::Win32::Security::{
-            AddAccessAllowedAceEx, SetSecurityDescriptorDacl, SetSecurityDescriptorGroup,
-            SetSecurityDescriptorOwner,
+            AddAccessAllowedAceEx, AddAccessDeniedAceEx, SetSecurityDescriptorDacl,
+            SetSecurityDescriptorGroup, SetSecurityDescriptorOwner,
         };
         use windows_sys::Win32::Storage::FileSystem::{FILE_ALL_ACCESS, FILE_GENERIC_READ};
 
@@ -2622,14 +2628,25 @@ mod root {
         }
 
         /// `slack` extra words are allocated inside `AclSize`, so the stored
-        /// descriptor differs by padding without changing any ACE.
-        fn acl(entries: &[(u8, u32, &[u32])], slack: usize) -> Vec<u32> {
+        /// descriptor differs by padding without changing any ACE. `deny`
+        /// chooses the ACE class; order is preserved as supplied.
+        fn acl_with(entries: &[(bool, u8, u32, &[u32])], slack: usize) -> Vec<u32> {
             let bytes = size_of::<ACL>() + entries.len() * (8 + 12) + slack * size_of::<u32>();
             let mut words = vec![0u32; bytes.div_ceil(size_of::<u32>())];
             let acl: *mut ACL = words.as_mut_ptr().cast();
             assert_ne!(unsafe { InitializeAcl(acl, bytes as u32, ACL_REVISION) }, 0);
-            for (flags, mask, sid) in entries {
-                assert_ne!(
+            for (deny, flags, mask, sid) in entries {
+                let added = if *deny {
+                    unsafe {
+                        AddAccessDeniedAceEx(
+                            acl,
+                            ACL_REVISION,
+                            u32::from(*flags),
+                            *mask,
+                            sid.as_ptr().cast_mut().cast(),
+                        )
+                    }
+                } else {
                     unsafe {
                         AddAccessAllowedAceEx(
                             acl,
@@ -2638,11 +2655,36 @@ mod root {
                             *mask,
                             sid.as_ptr().cast_mut().cast(),
                         )
-                    },
-                    0
-                );
+                    }
+                };
+                assert_ne!(added, 0);
             }
             words
+        }
+
+        fn acl(entries: &[(u8, u32, &[u32])], slack: usize) -> Vec<u32> {
+            let entries: Vec<(bool, u8, u32, &[u32])> = entries
+                .iter()
+                .map(|(flags, mask, sid)| (false, *flags, *mask, *sid))
+                .collect();
+            acl_with(&entries, slack)
+        }
+
+        /// The access a trustee actually receives for `mask`, as the OS
+        /// evaluates the ordered DACL: the first matching ACE decides.
+        fn effective(acl: &[u32], sid: &[u32], mask: u32) -> u32 {
+            let trustee = TRUSTEE_W {
+                pMultipleTrustee: std::ptr::null_mut(),
+                MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_USER,
+                ptstrName: sid.as_ptr().cast_mut().cast(),
+            };
+            let mut rights = 0u32;
+            let error =
+                unsafe { GetEffectiveRightsFromAclW(acl.as_ptr().cast(), &trustee, &mut rights) };
+            assert_eq!(error, 0, "the DACL must be readable for an access check");
+            rights & mask
         }
 
         fn descriptor(owner: &[u32], group: &[u32], acl: &[u32]) -> SECURITY_DESCRIPTOR {
@@ -2672,7 +2714,30 @@ mod root {
         }
 
         #[test]
-        fn equivalent_storage_hashes_equal() {
+        fn layout_and_provenance_are_ignored() {
+            let owner = sid(18);
+            let group = sid(18);
+            let system = sid(18);
+            let user = sid(544);
+            let entries = [
+                (0, FILE_ALL_ACCESS, user.as_slice()),
+                (0, FILE_ALL_ACCESS, system.as_slice()),
+            ];
+            let first_acl = acl(&entries, 0);
+            // Same ACE order, different padding and the provenance-only
+            // inherited flag set on one ACE.
+            let mut second_acl = acl(&entries, 8);
+            let second_bytes =
+                unsafe { std::slice::from_raw_parts_mut(second_acl.as_mut_ptr().cast::<u8>(), 10) };
+            second_bytes[9] |= INHERITED_ACE as u8;
+
+            let mut first = descriptor(&owner, &group, &first_acl);
+            let mut second = descriptor(&owner, &group, &second_acl);
+            assert_eq!(digest(&mut first), digest(&mut second));
+        }
+
+        #[test]
+        fn ace_order_changes_the_digest() {
             let owner = sid(18);
             let group = sid(18);
             let system = sid(18);
@@ -2681,19 +2746,52 @@ mod root {
                 &[(0, FILE_ALL_ACCESS, &user), (0, FILE_ALL_ACCESS, &system)],
                 0,
             );
-            // Same grants, different ACE order, different padding and the
-            // provenance-only inherited flag set on one ACE.
-            let mut second_acl = acl(
+            let second_acl = acl(
                 &[(0, FILE_ALL_ACCESS, &system), (0, FILE_ALL_ACCESS, &user)],
-                8,
+                0,
             );
-            let second_bytes =
-                unsafe { std::slice::from_raw_parts_mut(second_acl.as_mut_ptr().cast::<u8>(), 10) };
-            second_bytes[9] |= INHERITED_ACE as u8;
 
             let mut first = descriptor(&owner, &group, &first_acl);
             let mut second = descriptor(&owner, &group, &second_acl);
-            assert_eq!(digest(&mut first), digest(&mut second));
+            assert_ne!(
+                digest(&mut first),
+                digest(&mut second),
+                "the digest must preserve evaluation order"
+            );
+        }
+
+        #[test]
+        fn digest_distinguishes_the_effective_access_of_overlapping_aces() {
+            let owner = sid(18);
+            let group = sid(18);
+            let user = sid(544);
+            // The same two ACEs in both orders. Windows evaluates the first
+            // matching ACE, so one DACL allows the read and the other denies
+            // it; the digest must separate those grants.
+            let deny_acl = acl_with(
+                &[
+                    (true, 0, FILE_GENERIC_READ, &user),
+                    (false, 0, FILE_GENERIC_READ, &user),
+                ],
+                0,
+            );
+            let allow_acl = acl_with(
+                &[
+                    (false, 0, FILE_GENERIC_READ, &user),
+                    (true, 0, FILE_GENERIC_READ, &user),
+                ],
+                0,
+            );
+
+            assert_eq!(effective(&deny_acl, &user, FILE_GENERIC_READ), 0);
+            assert_eq!(
+                effective(&allow_acl, &user, FILE_GENERIC_READ),
+                FILE_GENERIC_READ
+            );
+
+            let mut deny = descriptor(&owner, &group, &deny_acl);
+            let mut allow = descriptor(&owner, &group, &allow_acl);
+            assert_ne!(digest(&mut deny), digest(&mut allow));
         }
 
         #[test]
