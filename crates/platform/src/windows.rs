@@ -788,6 +788,11 @@ mod root {
     }
 
     fn verify_volume_filesystem(file: &File) -> Result<(), RootError> {
+        filesystem_name(file).map(|_| ())
+    }
+
+    /// File-system name reported for the volume that owns this handle.
+    fn filesystem_name(file: &File) -> Result<String, RootError> {
         let mut name = [0u16; 64];
         let result = unsafe {
             GetVolumeInformationByHandleW(
@@ -811,8 +816,19 @@ mod root {
             .ok_or(RootError::UnsupportedTarget(
                 UnsupportedReason::Configuration,
             ))?;
-        char::decode_utf16(name[..end].iter().copied())
-            .try_for_each(|unit| unit.map(|_| ()).map_err(|_| RootError::Io))
+        String::from_utf16(&name[..end]).map_err(|_| RootError::Io)
+    }
+
+    /// Whether the opened root lives on an NTFS volume. The decision reads the
+    /// volume that owns the handle, never the path spelling.
+    pub(crate) fn volume_is_ntfs(path: &Path) -> bool {
+        let Some(text) = path.to_str() else {
+            return false;
+        };
+        let Ok(file) = open_path(text, DIRECTORY_ACCESS) else {
+            return false;
+        };
+        filesystem_name(&file).is_ok_and(|name| name.eq_ignore_ascii_case("NTFS"))
     }
 
     fn final_path(file: &File) -> Result<String, RootError> {
@@ -1483,7 +1499,17 @@ pub(crate) use root::{
     verify_private_directory,
 };
 
-/// No Windows volume class has private-library staging evidence.
+/// Private-library staging has no Windows runtime evidence yet; it stays
+/// disconnected even on NTFS.
 pub(crate) fn library_volume_qualified(_root: &Path) -> bool {
     false
+}
+
+/// Native effect writes are qualified on NTFS only. The filesystem name is read
+/// from the opened root's volume, so an exFAT, FAT32, ReFS or unknown volume is
+/// refused without trusting the path spelling. The runtime gate for these
+/// primitives is the hosted Windows CI job; see
+/// `docs/research/m1-native-results.md`.
+pub(crate) fn effects_volume_qualified(root: &Path) -> bool {
+    root::volume_is_ntfs(root)
 }

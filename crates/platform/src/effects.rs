@@ -12,6 +12,38 @@
 //! `publish`, `replace` and `detach` move files between a caller-named target
 //! and operation-owned stage or retain slots; they never read or delete an
 //! arbitrary caller path.
+//!
+//! ## Windows guarantees
+//!
+//! - `copy_file` creates the destination with `CREATE_NEW`, copies the data
+//!   stream, applies the source's attributes, last-write time, owner, group and
+//!   DACL, and calls `FlushFileBuffers` before returning. Birth time, extended
+//!   attributes and alternate data streams are not copied; the caller already
+//!   refused such a source, and a copy is a new object. A destination that
+//!   appears first is refused, never overwritten.
+//! - `publish` is one `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`, so an
+//!   existing target makes the call fail; the target bytes are untouched. The
+//!   move is refused across volumes (`MOVEFILE_COPY_ALLOWED` is not set).
+//! - `replace` is an exchange of three no-replace renames: the target object
+//!   moves to the retain slot, then the staged object moves onto the target
+//!   name. The target briefly has no name between those two moves, so this is
+//!   not an atomic exchange. `ReplaceFileW` is deliberately not used: it merges
+//!   the replaced file's creation time and DACL into the replacement, so the
+//!   public target would no longer carry the sealed staged fingerprint. Every
+//!   failed step returns an error and the caller must re-observe; a failed
+//!   exchange is never reported as a no-op.
+//! - `detach` is one no-replace rename into the retain slot. Unknown bytes in
+//!   the slot make the call fail rather than be replaced.
+//! - `sync_directory` flushes a directory handle opened with
+//!   `FILE_FLAG_BACKUP_SEMANTICS` via `FlushFileBuffers`. Windows documents no
+//!   namespace persistence barrier for an ordinary token, so this is not
+//!   claimed as power-cut durable evidence and the deployment barrier stays
+//!   closed on Windows.
+//!
+//! None of these primitives prevents a same-privilege process from substituting
+//! a parent or leaf between the caller's live-handle check and the native call;
+//! see the accepted limitation in `docs/contracts/m1-recovery.md`. Divergence is
+//! detected by post-effect reobservation and the displaced bytes are retained.
 
 use std::fs::File;
 use std::io;
@@ -62,19 +94,29 @@ pub fn open_file(path: &std::path::Path) -> Result<File, RootError> {
         .map_err(|_| RootError::TargetUnavailable)
 }
 
-/// Flush a directory namespace change to stable storage. Windows has no
-/// documented ordinary-token directory barrier and reports the configuration
-/// unsupported.
+/// Flush a directory namespace change to stable storage.
 #[cfg(target_os = "linux")]
 pub fn sync_directory(path: &std::path::Path) -> Result<(), RootError> {
     crate::native::sync_directory(path)
 }
 
+/// Flush a directory handle so its entries reach stable storage.
+///
+/// Win32 has no documented ordinary-token namespace barrier: this reports the
+/// result of `FlushFileBuffers` on a directory handle and nothing more. Callers
+/// must not treat it as proof that an entry survives an unexpected power loss.
 #[cfg(windows)]
-pub fn sync_directory(_path: &std::path::Path) -> Result<(), RootError> {
-    Err(RootError::UnsupportedTarget(
-        marduk_core::root_identity::UnsupportedReason::Configuration,
-    ))
+pub fn sync_directory(path: &std::path::Path) -> Result<(), RootError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+    // `FlushFileBuffers` requires write access to the handle.
+    let directory = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .map_err(|_| RootError::TargetUnavailable)?;
+    directory.sync_all().map_err(|_| RootError::Io)
 }
 
 /// Move `stage_dir/stage_name` onto `target_dir/leaf` only when the target name
@@ -100,7 +142,10 @@ pub fn publish(
     }
     #[cfg(windows)]
     {
-        move_path(stage_path, target_path)
+        // No REPLACE_EXISTING and no COPY_ALLOWED: an existing target or another
+        // volume fails the move and leaves both names as they were. The caller's
+        // fresh observation classifies a reported failure as a conflict.
+        move_path_noreplace(stage_path, target_path)
     }
 }
 
@@ -130,12 +175,28 @@ pub fn replace(
     }
     #[cfg(windows)]
     {
-        // No distinct displaced slot is proven on Windows, so an exchange
-        // cannot retain the bytes it displaces. Refuse the configuration
-        // instead of passing the stage path as both replacement and backup.
-        Err(RootError::UnsupportedTarget(
-            marduk_core::root_identity::UnsupportedReason::Configuration,
-        ))
+        // The callers name the stage slot as the retain alias, so the exchange
+        // needs one distinct intermediate name. `ReplaceFileW` cannot be used:
+        // it merges the replaced file's creation time and DACL into the
+        // replacement, which would break the sealed staged fingerprint. A
+        // deterministic operation-owned name keeps the displaced bytes visible
+        // when the exchange is cut between its moves.
+        let displaced = if retain_path == stage_path {
+            let mut name = std::ffi::OsString::from(stage_name);
+            name.push(".displaced");
+            stage_path.with_file_name(name)
+        } else {
+            retain_path.to_path_buf()
+        };
+        // 1. Retain the expected target under a name that must be absent.
+        move_path_noreplace(target_path, &displaced).map_err(|_| RootError::Io)?;
+        // 2. Publish the staged object with its identity and metadata intact.
+        move_path_noreplace(stage_path, target_path).map_err(|_| RootError::Io)?;
+        // 3. Put the displaced object in the caller's canonical retain slot.
+        if displaced.as_path() != retain_path {
+            move_path_noreplace(&displaced, retain_path).map_err(|_| RootError::Io)?;
+        }
+        Ok(())
     }
 }
 
@@ -162,7 +223,7 @@ pub fn detach(
     }
     #[cfg(windows)]
     {
-        move_path(target_path, displaced_path)
+        move_path_noreplace(target_path, displaced_path)
     }
 }
 
@@ -183,7 +244,7 @@ pub fn fingerprint_path(path: &std::path::Path) -> Result<Fingerprint, RootError
 /// the volume holding `root`. Deployment composition refuses an unqualified
 /// installation or library root.
 pub fn volume_qualified(root: &std::path::Path) -> bool {
-    crate::native::library_volume_qualified(root)
+    crate::native::effects_volume_qualified(root)
 }
 
 /// Copy `source` to a new file at `destination`, preserving the supported
@@ -255,33 +316,165 @@ pub fn copy_file(
     Ok((len, sha256))
 }
 
-/// A scoped copy that restores attributes, timestamps and security is not
-/// runtime-qualified on NTFS, and a data-only copy silently drops them. Fail
-/// preparation closed instead of faking a complete backup.
+/// A complete copy: data, attributes, last-write time and the owner, group and
+/// DACL witness the caller holds for the source. Birth time, extended
+/// attributes and alternate data streams are not copied. The destination is
+/// created with `CREATE_NEW`; an existing object is refused. If the supported
+/// metadata cannot be reproduced the preparation fails closed with
+/// `UnsupportedTarget(Metadata)` instead of yielding a partial backup.
+/// `FlushFileBuffers` covers this file handle, not the directory entry.
 #[cfg(windows)]
 pub fn copy_file(
-    _source: &std::path::Path,
-    _destination: &std::path::Path,
+    source: &std::path::Path,
+    destination: &std::path::Path,
 ) -> Result<(u64, [u8; 32]), RootError> {
-    Err(RootError::UnsupportedTarget(
-        marduk_core::root_identity::UnsupportedReason::Configuration,
-    ))
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Write};
+    use std::mem::size_of;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, GENERIC_WRITE, GetLastError};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetKernelObjectSecurity,
+        OWNER_SECURITY_INFORMATION, SetKernelObjectSecurity,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
+        SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER,
+    };
+
+    let unsupported =
+        || RootError::UnsupportedTarget(marduk_core::root_identity::UnsupportedReason::Metadata);
+
+    let mut input = open_file(source)?;
+    let mut basic = FILE_BASIC_INFO::default();
+    if unsafe {
+        GetFileInformationByHandleEx(
+            input.as_raw_handle(),
+            FileBasicInfo,
+            (&mut basic as *mut FILE_BASIC_INFO).cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(RootError::Io);
+    }
+    if basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(RootError::UnsupportedTarget(
+            marduk_core::root_identity::UnsupportedReason::ObjectKind,
+        ));
+    }
+
+    // `SetKernelObjectSecurity` needs WRITE_DAC and WRITE_OWNER, which
+    // `GENERIC_WRITE` does not include.
+    let mut output = std::fs::OpenOptions::new()
+        .access_mode(GENERIC_WRITE | WRITE_DAC | WRITE_OWNER)
+        .create_new(true)
+        .open(destination)
+        .map_err(|_| unsupported())?;
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut len = 0u64;
+    loop {
+        let read = input.read(&mut buffer).map_err(|_| RootError::Io)?;
+        if read == 0 {
+            break;
+        }
+        output
+            .write_all(&buffer[..read])
+            .map_err(|_| RootError::Io)?;
+        hasher.update(&buffer[..read]);
+        len += read as u64;
+    }
+
+    // The observed security witness is owner, group and DACL.
+    let requested =
+        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    let mut needed = 0u32;
+    if unsafe {
+        GetKernelObjectSecurity(
+            input.as_raw_handle(),
+            requested,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        )
+    } == 0
+        && unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER
+    {
+        return Err(unsupported());
+    }
+    if needed == 0 {
+        return Err(unsupported());
+    }
+    // A security descriptor must be four-byte aligned; `Vec<u32>` supplies that.
+    let mut descriptor = vec![0u32; (needed as usize).div_ceil(size_of::<u32>())];
+    let capacity = needed;
+    if unsafe {
+        GetKernelObjectSecurity(
+            input.as_raw_handle(),
+            requested,
+            descriptor.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+        || needed > capacity
+        || unsafe {
+            SetKernelObjectSecurity(
+                output.as_raw_handle(),
+                requested,
+                descriptor.as_mut_ptr().cast(),
+            )
+        } == 0
+    {
+        return Err(unsupported());
+    }
+
+    // Attributes and last-write time last, so nothing else can move the
+    // observed values. Creation and access times are left at the new object's
+    // own values; the copy is not the source object.
+    let basic = FILE_BASIC_INFO {
+        LastWriteTime: basic.LastWriteTime,
+        FileAttributes: basic.FileAttributes,
+        ..basic
+    };
+    if unsafe {
+        SetFileInformationByHandle(
+            output.as_raw_handle(),
+            FileBasicInfo,
+            (&basic as *const FILE_BASIC_INFO).cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(unsupported());
+    }
+    output.sync_all().map_err(|_| RootError::Io)?;
+
+    let mut sha256 = [0u8; 32];
+    sha256.copy_from_slice(&hasher.finalize());
+    Ok((len, sha256))
 }
 
 #[cfg(windows)]
-fn wide(path: &std::path::Path) -> io::Result<Vec<u16>> {
-    path.to_str()
-        .map(|text| text.encode_utf16().chain([0]).collect())
-        .ok_or_else(|| io::Error::from_raw_os_error(87))
+fn wide(path: &std::path::Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    path.as_os_str().encode_wide().chain([0]).collect()
 }
 
+/// Move a single name without replacing an existing destination. No
+/// `MOVEFILE_COPY_ALLOWED`: a cross-volume move is refused rather than turned
+/// into a copy that would lose the staged identity.
 #[cfg(windows)]
-fn move_path(from: &std::path::Path, to: &std::path::Path) -> io::Result<()> {
+fn move_path_noreplace(from: &std::path::Path, to: &std::path::Path) -> io::Result<()> {
     use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
 
-    let from = wide(from)?;
-    let to = wide(to)?;
+    let from = wide(from);
+    let to = wide(to);
     if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) } != 0 {
         Ok(())
     } else {

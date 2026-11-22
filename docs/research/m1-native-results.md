@@ -197,12 +197,50 @@ both qualified volumes afterwards: 7 passed on each.
 - `cargo check -p marduk-platform --tests --target x86_64-pc-windows-msvc` — passed at `101b4f7`; compile-only, not NTFS runtime evidence.
 
 Linux ext4 and native NTFS remain `not run`. Windows compilation is not NTFS
-runtime evidence, `effects::volume_qualified` refuses every Windows volume, and
-Windows `replace` now reports `UnsupportedTarget(Configuration)` instead of
-offering an unproven exchange. The final-window substitution limitation in
+runtime evidence; see [Windows native effects](#windows-native-effects-implemented-2026-11-22-runtime-not-run)
+for the implemented surface and its unrun runtime rows. The final-window
+substitution limitation in
 [R02](../contracts/m1-recovery.md#native-seam-that-r03-must-qualify) is unchanged:
 the adapter detects divergence after an effect and retains displaced bytes; it
 does not claim prevention.
+
+## Windows native effects (implemented 2026-11-22, runtime not run)
+
+The Windows arms of `crates/platform/src/effects.rs` now implement the same
+contract as the Linux arms. This section records only what was actually run:
+`cargo check -p marduk-platform --all-targets --target x86_64-pc-windows-msvc`
+(type-check on a Linux host) and the host's Linux `cargo test -p
+marduk-platform`. No Windows runtime, NTFS volume, or power-cut evidence exists
+yet; `not run` is never a pass.
+
+| Primitive | Contract implemented | Linux runtime | Hosted `windows-2025` NTFS runtime | Power |
+|---|---|---|---|---|
+| `effects::copy_file` | `CREATE_NEW` destination, data stream, attributes, last-write time, owner/group/DACL, `FlushFileBuffers`; refuses an existing destination and fails closed with `UnsupportedTarget(Metadata)` if the supported metadata cannot be written | `effects_primitives::copy_preserves_bytes_and_last_write_time_and_refuses_existing` passed 2026-11-22 | not run | — |
+| `effects::publish` | one `MoveFileExW` with flags `0` (no `MOVEFILE_REPLACE_EXISTING`, no `MOVEFILE_COPY_ALLOWED`); an existing target fails and is left intact | `effects_primitives::publish_refuses_an_existing_target_and_leaves_it_intact` passed 2026-11-22 | not run | — |
+| `effects::replace` | exchange by three no-replace renames (target → retain, stage → target, temporary → retain); the staged object's file id, creation time, attributes and DACL are preserved, so the public target fingerprints as the sealed staged artifact; a failure returns an error, never `Ok` | `effects_primitives::replace_retains_the_displaced_file_and_keeps_the_staged_object` passed 2026-11-22 | not run | — |
+| `effects::detach` | one no-replace rename into the retain slot; an occupied slot fails, unknown bytes are never replaced | `effects_primitives::detach_preserves_an_unknown_file` passed 2026-11-22 | not run | — |
+| `effects::sync_directory` | `FlushFileBuffers` on a directory handle opened with `FILE_FLAG_BACKUP_SEMANTICS` | `effects_primitives::sync_directory_succeeds_on_a_real_directory` passed 2026-11-22 | not run | not claimed |
+| `effects::volume_qualified` | NTFS only, from `GetVolumeInformationByHandleW` on the opened root's volume; exFAT/FAT32/ReFS/unknown and unreadable roots stay unqualified | `effects_primitives::volume_qualification_reads_the_opened_root` passed 2026-11-22 (refusal branch) | not run | — |
+
+Design note: `ReplaceFileW` is deliberately not used. It merges the replaced
+file's creation time and DACL into the replacement, so the resulting public file
+would not match the sealed staged `Fingerprint` (identity includes the creation
+time; metadata includes the owner/group/DACL digest). The three-rename exchange
+moves the staged object itself, which keeps every witnessed field. The target
+name is absent between the first two moves, so this is not an atomic exchange;
+every failed step returns `RootError::Io` and the caller must re-observe.
+
+Windows `native_namespace_survives_claimed_barrier` remains blocked: the
+durability barrier still reports `UnsupportedTarget(Configuration)` because
+Windows documents no ordinary-token namespace persistence barrier. Client
+deploy/restore `dispatch` stays closed behind `native_effects_gate`.
+
+Commands run for this row set:
+
+- `cargo check -p marduk-platform --all-targets --target x86_64-pc-windows-msvc` — passed (compile only).
+- `cargo test -p marduk-platform` (host Linux) — passed, including 6/6 in `tests/effects_primitives.rs`.
+- `cargo fmt --all -- --check` and `cargo build --workspace --locked` — passed.
+
 
 ## Test-oracle correction
 

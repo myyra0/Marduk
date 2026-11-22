@@ -1544,6 +1544,12 @@ pub(crate) fn library_volume_qualified(root: &Path) -> bool {
     library_filesystem_qualified(magic)
 }
 
+/// Native effect writes use the same recorded volume classes as private
+/// staging: only Btrfs and tmpfs have runtime evidence on Linux.
+pub(crate) fn effects_volume_qualified(root: &Path) -> bool {
+    library_volume_qualified(root)
+}
+
 /// The effective group and every supplementary group can be restored without
 /// changing ownership.
 fn group_is_current(gid: u32) -> bool {
