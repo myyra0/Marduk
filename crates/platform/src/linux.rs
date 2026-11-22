@@ -832,6 +832,11 @@ impl StagedDirectory {
     /// Create missing private directory components relative to the held handle.
     /// An existing component is reopened without following a link; the owner is
     /// checked so a pre-created substitute cannot redirect later writes.
+    ///
+    /// The check proves the component is this user's directory, not that it is
+    /// on the revision's filesystem domain. A same-owner nested Btrfs subvolume
+    /// planted under `payload/` passes here and below; only the revision
+    /// directory itself re-proves its Btrfs tree id.
     fn ensure_dir_at(&self, relative: &[&str]) -> io::Result<File> {
         let mut current = self.file.try_clone()?;
         for component in checked_components(relative)? {

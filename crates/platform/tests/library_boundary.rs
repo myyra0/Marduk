@@ -156,6 +156,59 @@ fn redirect_during_owner_record_is_refused_before_payload_write() {
 
 #[test]
 #[ignore = "requires MARDUK_M1_BTRFS_SCRATCH"]
+fn redirected_payload_during_owner_record_is_refused_without_writes() {
+    let tmp = scratch();
+    let root = library(tmp.path());
+    let mut stage = NativeStage::open(&root).unwrap();
+    let gate = WriterGate::open(root.join("lock")).unwrap();
+    let guard = gate.try_lock().unwrap();
+    let outside = tmp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    let archive = zip();
+    let mut input = archive.as_slice();
+
+    let error = match stage.stage(&guard, allocation(1), &mut input, &mut |_owner| {
+        std::os::unix::fs::symlink(&outside, root.join(REVISIONS).join("1").join("payload"))
+            .unwrap();
+        Ok(())
+    }) {
+        Ok(_) => panic!("redirected payload during owner recording must be refused"),
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(
+            error,
+            ImportError::StageChanged | ImportError::StageUnavailable
+        ),
+        "{error:?}"
+    );
+    assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+}
+
+#[test]
+#[ignore = "requires MARDUK_M1_BTRFS_SCRATCH"]
+fn reobserve_reports_a_missing_payload_entry_as_changed() {
+    let tmp = scratch();
+    let root = library(tmp.path());
+    let mut stage = NativeStage::open(&root).unwrap();
+    let gate = WriterGate::open(root.join("lock")).unwrap();
+    let guard = gate.try_lock().unwrap();
+    let archive = zip();
+    let mut input = archive.as_slice();
+    let receipt = stage
+        .stage(&guard, allocation(1), &mut input, &mut |_owner| Ok(()))
+        .unwrap();
+
+    fs::remove_file(root.join(REVISIONS).join("1").join("payload").join(FILE)).unwrap();
+    assert_eq!(
+        stage.reobserve(&guard, receipt.evidence()).unwrap_err(),
+        ImportError::StageChanged
+    );
+}
+
+#[test]
+#[ignore = "requires MARDUK_M1_BTRFS_SCRATCH"]
 fn valid_private_root_stages_and_reobserves() {
     let tmp = scratch();
     let root = library(tmp.path());

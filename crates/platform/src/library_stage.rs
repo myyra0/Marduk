@@ -95,6 +95,9 @@ impl NativeStage {
             .map_err(fsops::stage_error)?;
         verify_tree(&revision, &evidence)?;
         flush(&revision, &evidence)?;
+        // The revision entry itself is new, so persist the `revisions/` directory
+        // before the receipt can claim a durable stage.
+        self.tree.sync_revisions().map_err(fsops::stage_error)?;
         // The receipt is issued only after the bound handles and their paths are
         // re-observed unchanged; content checks alone are not boundary evidence.
         self.tree
@@ -371,8 +374,10 @@ fn hash_regular(
     let mut file = revision
         .open_relative_file(components)
         .map_err(|error| match error.kind() {
-            io::ErrorKind::NotFound => ImportError::StageUnavailable,
-            _ => ImportError::StageChanged,
+            // A missing expected entry is a proved shape change. Permissions,
+            // descriptor exhaustion and transient I/O leave the stage unverified.
+            io::ErrorKind::NotFound => ImportError::StageChanged,
+            _ => ImportError::StageUnavailable,
         })?;
     if !file
         .metadata()
