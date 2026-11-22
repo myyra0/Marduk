@@ -581,54 +581,6 @@ mod library_contract {
     }
 
     #[test]
-    fn resolved_inputs_distinguishes_unknown_from_empty_revisions() {
-        use marduk_core::ids::InstalledRevisionId;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let mut catalog = Catalog::open_for_test(tmp.path()).unwrap();
-        let (a, _) = publish_a(&mut catalog);
-        let installed = InstalledRevisionId::new(a.get());
-        let inputs = catalog.resolved_inputs(profile()).unwrap();
-        assert_eq!(
-            inputs.manifests.get(&installed).map(Vec::len),
-            Some(1),
-            "a published revision with rows has a manifest"
-        );
-
-        catalog
-            .connection
-            .execute(
-                "DELETE FROM revision_files WHERE revision_id = ?1",
-                [sql_id(a)],
-            )
-            .unwrap();
-        let inputs = catalog.resolved_inputs(profile()).unwrap();
-        assert_eq!(
-            inputs.manifests.get(&installed).map(Vec::len),
-            Some(0),
-            "a published revision with no rows is an empty manifest"
-        );
-
-        catalog
-            .connection
-            .execute("PRAGMA foreign_keys = OFF", [])
-            .unwrap();
-        catalog
-            .connection
-            .execute("DELETE FROM installed_revisions WHERE id = ?1", [sql_id(a)])
-            .unwrap();
-        catalog
-            .connection
-            .execute("PRAGMA foreign_keys = ON", [])
-            .unwrap();
-        let inputs = catalog.resolved_inputs(profile()).unwrap();
-        assert!(
-            inputs.manifests.get(&installed).is_none(),
-            "an unknown revision has no manifest at all"
-        );
-    }
-
-    #[test]
     fn signed_sqlite_boundary_round_trips_without_revision_wrap() {
         let tmp = tempfile::tempdir().unwrap();
         let mut catalog = Catalog::open_for_test(tmp.path()).unwrap();

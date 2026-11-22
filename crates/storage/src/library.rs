@@ -45,6 +45,8 @@ mod boundary_tests;
 #[cfg(test)]
 mod contract_tests;
 #[cfg(test)]
+mod manifest_tests;
+#[cfg(test)]
 mod stage_tests;
 
 const REVISIONS_DIR: &str = "revisions";
