@@ -33,6 +33,20 @@ pub struct OperationJournal {
     gate: WriterGate,
 }
 
+/// The selected installation pair and its authoritative lease state.
+///
+/// The locator is retained so callers can reopen and re-verify the native
+/// pair. It is never a wire value, and it grants no write authority.
+#[derive(Clone, Debug)]
+pub struct SelectedInstallation {
+    pub id: u64,
+    pub locator: PathBuf,
+    pub installation: RootIdentity,
+    pub data: RootIdentity,
+    pub pending: Option<OperationStatus>,
+    pub active_generation: Option<u64>,
+}
+
 impl OperationJournal {
     /// Open (and migrate) the shared catalog under the application data root.
     pub fn open(app_data: &Path) -> Result<Self, DeployError> {
@@ -145,6 +159,59 @@ impl OperationJournal {
                 .map_err(|_| DeployError::Io)?;
         }
         transaction.commit().map_err(|_| DeployError::Io)
+    }
+
+    /// Read the selected installation, its locator and the lease state.
+    ///
+    /// This is the restart read for clients: it reports recorded work but never
+    /// resumes or retries it.
+    pub fn selected_installation(&mut self) -> Result<Option<SelectedInstallation>, DeployError> {
+        let read = self.connection.transaction().map_err(|_| DeployError::Io)?;
+        let row: Option<(i64, Vec<u8>, Vec<u8>, Vec<u8>, Option<i64>, Option<i64>)> = read
+            .query_row(
+                "SELECT i.id, i.location, i.installation, i.data, \
+                 l.pending_op, l.active_generation \
+                 FROM installations i \
+                 LEFT JOIN root_leases l \
+                   ON l.data = i.data AND l.installation = i.installation \
+                 WHERE i.selected = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| DeployError::Io)?;
+        let Some((id, location, installation, data, pending, active)) = row else {
+            return Ok(None);
+        };
+
+        let locator = decode_locator(&location).ok_or(DeployError::Io)?;
+        let installation = decode_root(&installation)?;
+        let data = decode_root(&data)?;
+        let pending = pending
+            .map(|operation| {
+                let id = OperationId::try_from_u64(row_id(operation)?)?;
+                read_status(&read, id)?.ok_or(DeployError::Io)
+            })
+            .transpose()?;
+        let active_generation = active.map(row_id).transpose()?;
+
+        Ok(Some(SelectedInstallation {
+            id: positive(id)?,
+            locator,
+            installation,
+            data,
+            pending,
+            active_generation,
+        }))
     }
 
     fn lock(&self) -> Result<WriterGuard, DeployError> {
@@ -1848,13 +1915,12 @@ fn empty_locator() -> Vec<u8> {
 
 #[cfg(unix)]
 fn valid_locator(location: &[u8]) -> bool {
-    matches!(location, [0, path @ ..] if !path.is_empty() && !path.contains(&0))
+    decode_locator(location).is_some()
 }
 
 #[cfg(windows)]
 fn valid_locator(location: &[u8]) -> bool {
-    matches!(location, [1, path @ ..] if !path.is_empty() && path.len() % 2 == 0
-        && path.chunks_exact(2).all(|unit| unit != [0, 0]))
+    decode_locator(location).is_some()
 }
 
 #[cfg(unix)]
@@ -1873,6 +1939,38 @@ fn encode_locator(locator: &Path) -> Vec<u8> {
         blob.extend_from_slice(&unit.to_le_bytes());
     }
     blob
+}
+
+#[cfg(unix)]
+fn decode_locator(location: &[u8]) -> Option<PathBuf> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    match location {
+        [0, path @ ..] if !path.is_empty() && !path.contains(&0) => {
+            Some(PathBuf::from(OsStr::from_bytes(path)))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn decode_locator(location: &[u8]) -> Option<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    match location {
+        [1, path @ ..]
+            if !path.is_empty()
+                && path.len() % 2 == 0
+                && path.chunks_exact(2).all(|unit| unit != [0, 0]) =>
+        {
+            let units = path
+                .chunks_exact(2)
+                .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+                .collect::<Vec<_>>();
+            Some(PathBuf::from(OsString::from_wide(&units)))
+        }
+        _ => None,
+    }
 }
 
 // Portable evidence encoding v1. Every blob is length-prefixed and rejected on
