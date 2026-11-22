@@ -426,8 +426,9 @@ pub fn copy_file(
 /// [`CopyError::DestinationExists`] and a transient lock as
 /// [`CopyError::Sharing`]. A source DACL that grants write-class access to a
 /// principal outside the current user and the SYSTEM/Administrators baseline is
-/// refused before it can be applied to the private effect area. Every
-/// post-create failure removes the partial
+/// refused before it can be applied to the private effect area. The DACL is
+/// applied protected, so the copy does not also inherit ACEs from its parent.
+/// Every post-create failure removes the partial
 /// destination before returning. `FlushFileBuffers` covers this file handle, not
 /// the directory entry.
 #[cfg(windows)]
@@ -446,7 +447,7 @@ pub fn copy_file(
     };
     use windows_sys::Win32::Security::{
         DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetKernelObjectSecurity,
-        OWNER_SECURITY_INFORMATION, SetKernelObjectSecurity,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SetKernelObjectSecurity,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
@@ -541,10 +542,12 @@ pub fn copy_file(
         if !source_dacl_grants_only_current_user(descriptor.as_mut_ptr().cast())? {
             return Err(unsupported());
         }
+        // Apply the source DACL protected: without PROTECTED the destination
+        // can also inherit ACEs from its parent, making the copy a superset.
         if unsafe {
             SetKernelObjectSecurity(
                 output.as_raw_handle(),
-                requested,
+                requested | PROTECTED_DACL_SECURITY_INFORMATION,
                 descriptor.as_mut_ptr().cast(),
             )
         } == 0
