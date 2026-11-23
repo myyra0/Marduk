@@ -1,19 +1,23 @@
 # M1-R03 native results
 
-Runtime evidence from 2026-11-22 (IST), code commit `29e587d`, base `ebd9e07`. Task 6 native-adapter rows were re-tested at `101b4f7` (recovery fix `7feb64b`), and the composition round trip was re-run at `af0fc6d` with scoped metadata that differs between the original and the staged payload (`2b6b51d` recorded the earlier composition run). The client-visible deploy and restore run is recorded at `97c03d9` in [Client-visible deploy and restore](#client-visible-deploy-and-restore-2026-11-22). The NTFS whole-composition run is recorded at `62b9b94b` in [Windows composition run](#windows-composition-run-2026-11-22). `not run` is never a pass. No qualifying power-cut result exists. [ADR 0004](../adr/0004-windows-writes-use-standard-flush.md) narrows the Windows barrier to standard flushing; that decision still excludes power-cut recovery from the claim.
+Running record of the native evidence behind M1's availability decisions. The matrices below
+are parsed by `crates/core/tests/availability_guard.rs`: a passing cell names the commit it ran
+at, and the build fails when the record and the code disagree. Dates are omitted; the revision
+is the identity of a run. Start with [M1 status](../m1/README.md) if you want the summary.
 
-Close-out 2026-11-22: the Task 5 gate blocked native wiring; a later Task 5 continuation connected private-library staging on the two Linux volume classes with runtime evidence (Btrfs and tmpfs), and the Windows staging adapter is implemented and witnessed on NTFS; see [Qualified library staging](#qualified-library-staging-connected-2026-11-22). Native game-directory preview, Apply and Restore are connected in the workspace proof lane on the two Linux volume classes (Task 6), and the NTFS whole-composition run now opens the same routes there. Client `dispatch` serves deploy and restore where the record proves the composition (Linux Btrfs and tmpfs, Windows NTFS). Crash/power-cut evidence is deferred. `not run` rows stay `not run`.
+`not run` is never a pass. No qualifying power-cut result exists. [ADR 0004](../adr/0004-windows-writes-use-standard-flush.md) narrows the Windows barrier to
+standard flushing, which excludes power-cut recovery from the claim.
 
 Environment: Linux 7.3.5-1-cachyos, x86-64, rustc 1.100.0, uid 1000 with `CapEff: 0` (ordinary user, no elevated token). tmpfs scratch: `/tmp` `rw,noatime,inode64,huge=advise`, fsid `b6b575e7…`, mount view 74, no Btrfs tree. Btrfs scratch: `/home` on `/dev/nvme0n1p2[/@home]` `rw,noatime,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/@home`, fsid `b68b24bc…`, view 61, tree 257. All fixtures are synthetic files under a disposable parent; no game, external root or elevated operation was touched.
 
 | Proof case | Linux Btrfs | Linux tmpfs | Linux ext4 | Hosted `windows-2025` NTFS | Power |
 |---|---|---|---|---|---|
-| `native_no_replace_honors_concurrent_create` | ran 2026-11-22 at `29e587d`, passed | ran 2026-11-22 at `29e587d`, passed | not run | not run | — |
-| `native_replace_records_actually_displaced_file` | ran 2026-11-22 at `29e587d`, passed | ran 2026-11-22 at `29e587d`, passed | not run | not run | — |
-| `native_rejects_root_and_parent_substitution` | ran 2026-11-22 at `29e587d`, passed | ran 2026-11-22 at `29e587d`, passed | not run | not run | — |
-| `native_detach_preserves_unknown_file` | ran 2026-11-22 at `29e587d`, passed | ran 2026-11-22 at `29e587d`, passed | not run | not run | — |
-| `native_error_does_not_prove_no_change` | ran 2026-11-22 at `29e587d`, passed | ran 2026-11-22 at `29e587d`, passed | not run | not run | — |
-| `native_namespace_survives_claimed_barrier` | ran 2026-11-22, passed (process-only, new create only) | ran 2026-11-22, passed (process-only, new create only) | not run | narrowed (ADR 0004: standard flush, power cut not covered) | Task 8, not run |
+| `native_no_replace_honors_concurrent_create` | ran at `29e587d`, passed | ran at `29e587d`, passed | not run | not run | — |
+| `native_replace_records_actually_displaced_file` | ran at `29e587d`, passed | ran at `29e587d`, passed | not run | not run | — |
+| `native_rejects_root_and_parent_substitution` | ran at `29e587d`, passed | ran at `29e587d`, passed | not run | not run | — |
+| `native_detach_preserves_unknown_file` | ran at `29e587d`, passed | ran at `29e587d`, passed | not run | not run | — |
+| `native_error_does_not_prove_no_change` | ran at `29e587d`, passed | ran at `29e587d`, passed | not run | not run | — |
+| `native_namespace_survives_claimed_barrier` | ran, passed (process-only, new create only) | ran, passed (process-only, new create only) | not run | narrowed (ADR 0004: standard flush, power cut not covered) | Task 8, not run |
 | `library_catalog_never_names_missing_payload` | not run (staging wired on this volume; catalog witness not run) | not run (staging wired on this volume; catalog witness not run) | not run (unqualified; `StageUnavailable`) | not run (catalog witness not run) | Task 8, not run |
 | `btrfs_cross_subvolume_copy_does_not_use_cross_subvolume_rename` | not run (subvolume teardown EPERM; two-subvolume `EXDEV`/substitution not run) | N/A | N/A | N/A | — |
 
@@ -43,56 +47,56 @@ Environment: Linux 7.3.5-1-cachyos, x86-64, rustc 1.100.0, uid 1000 with `CapEff
 
 The frozen `run.py` builds its probe with only `.rlib` artifact directories. In this workspace the `zeroize_derive` proc-macro artifact lives in a separate build directory, so the probe first failed with `E0463: can't find crate for marduk_storage`. Symlinking the hashed proc-macro `.so` into `target/debug` (already a search path) let the frozen script complete unchanged. The harness assertions themselves were not modified; no assertion failed.
 
-## Residual closure (2026-11-22)
+## Residual closure
 
 Adds `crates/platform/tests/native_proof_evidence.rs` detach witnesses, `library_stage.rs` error classification and a private `revisions/` mode. Frozen harness and oracle unchanged.
 
-### Library staging (disconnected 2026-11-22, superseded below)
+### Library staging (disconnected, superseded below)
 
 The Task 5 gate blocked native library wiring at that revision: `Catalog::open` used `StageAdapter::Unavailable` on every volume. The Btrfs library witness was therefore `not run` there, and the earlier Btrfs-only observation (selected from the catalog root's filesystem magic, `crates/platform/src/linux.rs:904` at the time) did not qualify the disconnected code. The frozen `library_contract` reported the same 5 passes under a Btrfs `TMPDIR` because staging was disconnected everywhere. This paragraph is history; the next section is the current state.
 
-### Qualified library staging (connected 2026-11-22)
+### Qualified library staging (connected
 
 Tested at commit `a2250e9`, base `252ce26`.
-Continuation of Task 5 after the 2026-11-22 ruling. `Catalog::open` now selects native staging only when `marduk_platform::library_volume_qualified` reports a volume class the availability record proves at the catalog layer: **Linux Btrfs** and **Linux tmpfs**. The platform reads the observed private library root with the crate's existing `fstatfs` path (`crates/platform/src/linux.rs`), not a `statfs` type string, and reports only the class; `crates/core/src/qualification.rs` decides availability. The catalog refuses with `StageUnavailable`:
+Continuation of Task 5 after the ruling. `Catalog::open` now selects native staging only when `marduk_platform::library_volume_qualified` reports a volume class the availability record proves at the catalog layer: **Linux Btrfs** and **Linux tmpfs**. The platform reads the observed private library root with the crate's existing `fstatfs` path (`crates/platform/src/linux.rs`), not a `statfs` type string, and reports only the class; `crates/core/src/qualification.rs` decides availability. The catalog refuses with `StageUnavailable`:
 
 - Linux ext4 and every other unrecognised magic, including `FUSE` (ntfs-3g) and `ntfs3`.
 - Windows product availability: the staging adapter is implemented and witnessed on native NTFS (below), but the record proves only the staging and primitive layers there, so `library_volume_qualified` and `effects_volume_qualified` stay `false` and catalog imports and deploys remain disconnected.
 - A qualified volume whose private boundary will not bind: a redirected root or `revisions/`, an owner or mount mismatch, or a two-subvolume/`EXDEV` layout with no evidence. `NativeStage::open` refusal is final; it is never retried through a weaker adapter.
 
-Wired: private staging (private archive snapshot, admitted member set, hashed payload under `revisions/<id>/`, `sync_revisions` before the receipt) and catalog publication of a prepared import into the library (SQLite membership only, after native re-observation). Separate from library staging, Task 6 connected the native copy adapter for game-directory preview, Apply and Restore in the workspace `proof_*` lane on qualified volumes. Client `dispatch` serves deploy and restore where the record proves the composition on the installation root's volume class (Linux Btrfs and tmpfs); see [Client-visible deploy and restore](#client-visible-deploy-and-restore-2026-11-22). Crash and power-cut behaviour is deferred, and no power-cut claim exists.
+Wired: private staging (private archive snapshot, admitted member set, hashed payload under `revisions/<id>/`, `sync_revisions` before the receipt) and catalog publication of a prepared import into the library (SQLite membership only, after native re-observation). Separate from library staging, Task 6 connected the native copy adapter for game-directory preview, Apply and Restore in the workspace `proof_*` lane on qualified volumes. Client `dispatch` serves deploy and restore where the record proves the composition on the installation root's volume class (Linux Btrfs and tmpfs); see [Client-visible deploy and restore](#client-visible-deploy-and-restore-. Crash and power-cut behaviour is deferred, and no power-cut claim exists.
 
 | Suite / test | Required volume | Exact run condition | Observed |
 |---|---|---|---|
-| `crates/storage/tests/qualified_stage.rs::qualified_volume_stages_the_payload_through_the_production_catalog` | tmpfs or Btrfs | `TMPDIR=/tmp cargo test --locked -p marduk-storage --test qualified_stage`; also run with `TMPDIR=/var/tmp` | passed on tmpfs and Btrfs 2026-11-22; asserts the volume class instead of skipping; payload read back at `revisions/<id>/payload/textures/synthetic.dds`, revision dir `0700`, `reconcile` re-observes the receipt |
+| `crates/storage/tests/qualified_stage.rs::qualified_volume_stages_the_payload_through_the_production_catalog` | tmpfs or Btrfs | `TMPDIR=/tmp cargo test --locked -p marduk-storage --test qualified_stage`; also run with `TMPDIR=/var/tmp` | passed on tmpfs and Btrfs; asserts the volume class instead of skipping; payload read back at `revisions/<id>/payload/textures/synthetic.dds`, revision dir `0700`, `reconcile` re-observes the receipt |
 | `crates/storage/src/library/stage_tests.rs::refused_volume_configuration_keeps_the_stage_unavailable` | any | `TMPDIR=/tmp cargo test --locked -p marduk-storage` | passed; `StageUnavailable`, no import row, no `revisions/` entry |
 | `crates/platform/src/linux_root_tests.rs` predicate tests (5) | any | `cargo test --locked -p marduk-platform --lib` | accept Btrfs/tmpfs; refuse ext4, FUSE/NTFS3 and unknown magic |
 | `crates/storage/tests/library_contract.rs` (5 tests) | any | `TMPDIR=/tmp cargo test --locked -p marduk-storage --test library_contract`; also with `TMPDIR=/var/tmp` | 5 passed on both; the volume-dependent test is now `production_stage_follows_the_qualified_volume` (refusal on unqualified, staging plus re-observation on qualified) |
 | `crates/storage/tests/production_refusal.rs` | any | `TMPDIR=/tmp cargo test --locked -p marduk-storage --test production_refusal` | 1 passed; an unprovable seeded stage row is never published on either adapter |
 | `crates/platform/tests/library_boundary.rs` (10 witnesses) | Btrfs | `MARDUK_M1_BTRFS_SCRATCH=/var/tmp cargo test -p marduk-platform --test library_boundary -- --ignored --test-threads=1` | 10 passed; without `--ignored` 10 ignored, none silently passing |
 | `crates/storage/src/library/contract_tests.rs` (10 unit tests, frozen oracle at `57de606`) | any | `Catalog::open_for_test` forces the fixture stage | 10 passed under `TMPDIR=/tmp`; the two post-freeze witnesses live in the unfrozen `extra_contract_tests.rs` |
-| `crates/workspace/tests/workflow.rs::import_preview_and_apply_round_trip_on_a_qualified_volume` | tmpfs or Btrfs on Linux, NTFS on Windows | `TMPDIR=/tmp` and `TMPDIR=/var/tmp cargo test --locked -p marduk-workspace --test workflow -- --exact import_preview_and_apply_round_trip_on_a_qualified_volume`; same test on the Windows VM | passed on tmpfs and Btrfs 2026-11-23 at `76f7850`, and on NTFS 2026-11-23 at `76f7850`; preview stages, apply publishes revision 1 with one member, replay returns the same snapshot. The test early-returns on an unqualified volume, so only these qualified runs are evidence |
+| `crates/workspace/tests/workflow.rs::import_preview_and_apply_round_trip_on_a_qualified_volume` | tmpfs or Btrfs on Linux, NTFS on Windows | `TMPDIR=/tmp` and `TMPDIR=/var/tmp cargo test --locked -p marduk-workspace --test workflow -- --exact import_preview_and_apply_round_trip_on_a_qualified_volume`; same test on the Windows VM | passed on tmpfs and Btrfs at `76f7850`, and on NTFS at `76f7850`; preview stages, apply publishes revision 1 with one member, replay returns the same snapshot. The test early-returns on an unqualified volume, so only these qualified runs are evidence |
 | `library_catalog_never_names_missing_payload` (`tests/platform/m1/native-publication/library.rs:134`) | tmpfs or Btrfs | `python tests/platform/m1/native-publication/run.py <scratch>` | `not run` in this continuation; the table row above stays `not run` |
 
 Library-staging witnesses. `import_preview_and_apply_round_trip_on_a_qualified_volume` is the catalog witness the record proves for the import route, because it publishes; the staging-only witnesses below remain recorded at their own rung. `windows_catalog_stages_a_payload_beside_its_root_pin` is the NTFS staging witness; the eight `library_staging_witnesses` rows are the recorded staging suite the record names.
 
 | Staging witness | Linux Btrfs | Linux tmpfs | Windows NTFS |
 |---|---|---|---|
-| `import_preview_and_apply_round_trip_on_a_qualified_volume` | ran 2026-11-23 at `76f7850`, passed (published revision 1, one member) | ran 2026-11-23 at `76f7850`, passed (published revision 1, one member) | ran 2026-11-23 at `76f7850`, passed (published revision 1, one member); this row, not the staging-only one, is what the import availability record cites |
-| `qualified_volume_stages_the_payload_through_the_production_catalog` | ran 2026-11-22 at `a2250e9`, passed | ran 2026-11-22 at `a2250e9`, passed | not run |
-| `windows_catalog_stages_a_payload_beside_its_root_pin` | not run | not run | ran 2026-11-22 at `62b9b94b`, passed |
-| `staged_revision_keeps_real_bytes_private_and_reobserves_after_reopen` | not run | not run | ran 2026-11-22 at 367ca69, passed |
-| `redirected_revisions_is_refused_without_writes` | not run | not run | ran 2026-11-22 at 367ca69, passed |
-| `redirected_revision_path_is_refused_without_writes` | not run | not run | ran 2026-11-22 at 367ca69, passed |
-| `redirected_payload_during_owner_record_is_refused_without_writes` | not run | not run | ran 2026-11-22 at 367ca69, passed |
-| `reclaim_removes_a_verified_private_stage` | not run | not run | ran 2026-11-22 at 367ca69, passed |
-| `reobserve_refuses_a_changed_bound_entry` | not run | not run | ran 2026-11-22 at 367ca69, passed |
-| `reobserve_refuses_an_added_payload_file` | not run | not run | ran 2026-11-22 at 367ca69, passed |
-| `reobserve_refuses_a_revision_redirected_while_unbound` | not run | not run | ran 2026-11-22 at 367ca69, passed |
+| `import_preview_and_apply_round_trip_on_a_qualified_volume` | ran at `76f7850`, passed (published revision 1, one member) | ran at `76f7850`, passed (published revision 1, one member) | ran at `76f7850`, passed (published revision 1, one member); this row, not the staging-only one, is what the import availability record cites |
+| `qualified_volume_stages_the_payload_through_the_production_catalog` | ran at `a2250e9`, passed | ran at `a2250e9`, passed | not run |
+| `windows_catalog_stages_a_payload_beside_its_root_pin` | not run | not run | ran at `62b9b94b`, passed |
+| `staged_revision_keeps_real_bytes_private_and_reobserves_after_reopen` | not run | not run | ran at 367ca69, passed |
+| `redirected_revisions_is_refused_without_writes` | not run | not run | ran at 367ca69, passed |
+| `redirected_revision_path_is_refused_without_writes` | not run | not run | ran at 367ca69, passed |
+| `redirected_payload_during_owner_record_is_refused_without_writes` | not run | not run | ran at 367ca69, passed |
+| `reclaim_removes_a_verified_private_stage` | not run | not run | ran at 367ca69, passed |
+| `reobserve_refuses_a_changed_bound_entry` | not run | not run | ran at 367ca69, passed |
+| `reobserve_refuses_an_added_payload_file` | not run | not run | ran at 367ca69, passed |
+| `reobserve_refuses_a_revision_redirected_while_unbound` | not run | not run | ran at 367ca69, passed |
 
-The runtime evidence behind the accepted magic set is the tmpfs/Btrfs effect table at the top of this document plus the catalog staging witnesses above. No ext4 catalog run exists; native NTFS catalog and composition rows are recorded in [Windows composition run](#windows-composition-run-2026-11-22). `VolumeClass::Other` is the catch-all: a new filesystem needs a `volume_class` mapping branch, a `PROOFS` row and a staging-matrix row; an unmapped magic stays unproven for every capability (`crates/platform/src/linux_root_tests.rs`).
+The runtime evidence behind the accepted magic set is the tmpfs/Btrfs effect table at the top of this document plus the catalog staging witnesses above. No ext4 catalog run exists; native NTFS catalog and composition rows are recorded in [Windows composition run](#windows-composition-run-. `VolumeClass::Other` is the catch-all: a new filesystem needs a `volume_class` mapping branch, a `PROOFS` row and a staging-matrix row; an unmapped magic stays unproven for every capability (`crates/platform/src/linux_root_tests.rs`).
 
-Windows product availability follows the record: NTFS import is proven at the catalog layer and NTFS deploy/restore at the composition layer by the run below, while every other Windows volume class stays refused. The private staging adapter itself is implemented and was re-run on NTFS after the 2026-11-22 review fixes:
+Windows product availability follows the record: NTFS import is proven at the catalog layer and NTFS deploy/restore at the composition layer by the run below, while every other Windows volume class stays refused. The private staging adapter itself is implemented and was re-run on NTFS after the review fixes:
 
 - Tree: `7bcd2c1` plus the staging review fix. VM: Windows 10 `DESKTOP-4NP2KM5`, `rustc 1.100.0`. Scratch volume `C:` reported `File System Name : NTFS` (`fsutil fsinfo volumeinfo C:`).
 - `cargo test -p marduk-platform --test library_staging_witnesses -- --nocapture` → `running 8 tests`, `test result: ok. 8 passed; 0 failed`, including `reobserve_refuses_an_added_payload_file`.
@@ -112,7 +116,7 @@ Restore run through the `proof_*` methods, so this witness stays independent of
 the client availability gate. This is the composition rung: the whole service
 composed and ran; the client-visible run is recorded separately below.
 
-### Client-visible deploy and restore (2026-11-22)
+### Client-visible deploy and restore
 
 `crates/workspace/tests/native_deployment.rs::dispatch_deploy_and_restore_through_the_whole_composition`
 drives `deploy_preview`, `deploy_apply` and `restore` through `Workspace::dispatch`
@@ -142,7 +146,7 @@ native_deployment -- --ignored --test-threads=1`, 6 passed on each volume):
 Crash and power-cut behaviour for Linux Btrfs and tmpfs is not covered by these
 runs and remains deferred; the process-restart witnesses above are not
 power-loss evidence. The NTFS composition and process-restart run is recorded in
-[Windows composition run](#windows-composition-run-2026-11-22); it is not
+[Windows composition run](#windows-composition-run-; it is not
 power-loss evidence either.
 
 The separate `deploy_evidence` test and its `evidence` feature entry points were
@@ -165,7 +169,7 @@ marduk-workspace --locked --test native_deployment -- --ignored
 The earlier NTFS composition attempt stopped at a sharing violation; the fixed
 run is recorded below.
 
-### Windows composition run (2026-11-22)
+### Windows composition run
 
 Code at `62b9b94b`, Windows 10 `DESKTOP-4NP2KM5`, `rustc 1.100.0`. The
 synthetic scratch and installation root were under `%TEMP%` on `C:`
@@ -175,36 +179,36 @@ repository was synced with `git archive 62b9b94b`, `scp` and `tar -xzf` over
 `C:\marduk`.
 
 - `cargo test -p marduk-workspace --locked --test native_deployment -- --ignored
-  --nocapture --test-threads=1` → `running 1 test`,
-  `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;
-  finished in 0.27s`, `WITNESS_EXIT_0`.
-  `qualified_native_round_trip_retains_backups_and_restores_the_original_tree`
-  drove the production `Catalog`, `OperationJournal` and `NativeEffects`
-  through setup, ZIP import (production catalog with native staging), member
-  order, preview, apply, restart, plan replay and restore.
+ --nocapture --test-threads=1` → `running 1 test`,
+ `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;
+ finished in 0.27s`, `WITNESS_EXIT_0`.
+ `qualified_native_round_trip_retains_backups_and_restores_the_original_tree`
+ drove the production `Catalog`, `OperationJournal` and `NativeEffects`
+ through setup, ZIP import (production catalog with native staging), member
+ order, preview, apply, restart, plan replay and restore.
 - Import reached the private stage while the catalog's app-root handle stayed
-  open. The two opens now coexist because the pinned app root shares read and
-  write (`FILE_SHARE_READ | FILE_SHARE_WRITE`) and denies delete sharing. The
-  dedicated witness at the same revision,
-  `cargo test -p marduk-storage --locked --test windows_catalog_staging --
-  --nocapture --test-threads=1`, ran 1 passed; 0 failed; 0 ignored; 0 measured;
-  0 filtered out; finished in 0.04s (`STAGING_EXIT_0`): `Catalog::open` on NTFS
-  reported `stage_available()`, prepared an archive, read its payload back from
-  `revisions/<id>/payload/textures/synthetic.dds`, and `reconcile` re-observed
-  the receipt.
+ open. The two opens now coexist because the pinned app root shares read and
+ write (`FILE_SHARE_READ | FILE_SHARE_WRITE`) and denies delete sharing. The
+ dedicated witness at the same revision,
+ `cargo test -p marduk-storage --locked --test windows_catalog_staging --
+ --nocapture --test-threads=1`, ran 1 passed; 0 failed; 0 ignored; 0 measured;
+ 0 filtered out; finished in 0.04s (`STAGING_EXIT_0`): `Catalog::open` on NTFS
+ reported `stage_available()`, prepared an archive, read its payload back from
+ `revisions/<id>/payload/textures/synthetic.dds`, and `reconcile` re-observed
+ the receipt.
 - Apply's first publish created the destination name while the identity-pinned
-  target-parent handle stayed open. The parent pin now shares read and write and
-  denies delete sharing, so the kernel's own destination open succeeds and the
-  move completes.
+ target-parent handle stayed open. The parent pin now shares read and write and
+ denies delete sharing, so the kernel's own destination open succeeds and the
+ move completes.
 - The deny-delete claim still holds with write sharing enabled:
-  `crates/platform/tests/windows_root_regressions.rs` ran 7 passed, 1 ignored
-  (`short_name_alias_is_never_an_absent_or_admitted_leaf`, needs 8.3 scratch) at
-  the same revision, including `pinned_ancestor_shares_write_but_refuses_delete`
-  (a write handle succeeds; renaming the pinned directory returns Win32 32) and
-  `pinned_target_parent_accepts_a_new_destination`.
+ `crates/platform/tests/windows_root_regressions.rs` ran 7 passed, 1 ignored
+ (`short_name_alias_is_never_an_absent_or_admitted_leaf`, needs 8.3 scratch) at
+ the same revision, including `pinned_ancestor_shares_write_but_refuses_delete`
+ (a write handle succeeds; renaming the pinned directory returns Win32 32) and
+ `pinned_target_parent_accepts_a_new_destination`.
 - `cargo test -p marduk-storage --locked --test catalog_sharing` → 3 passed at
-  the same revision: `catalog_root_pin_and_native_stage_coexist`,
-  `catalog_and_journal_open_together`, and the existing schema-sharing witness.
+ the same revision: `catalog_root_pin_and_native_stage_coexist`,
+ `catalog_and_journal_open_together`, and the existing schema-sharing witness.
 
 Exact composed effects observed by the witness: imported members are
 `textures/winner.dds = b\n` and `textures/a-only.dds = only-a\n`; after apply the
@@ -229,7 +233,7 @@ stays a decision.
 now gives the install target and the staged payload different admitted metadata
 before preview, so equal fingerprints on identical fixtures cannot stand in for
 preservation. The run used `TMPDIR=/tmp` (tmpfs) and `TMPDIR=/var/tmp` (Btrfs)
-with `--ignored --test-threads=1 --nocapture`, 5 passed on each, 2026-11-22:
+with `--ignored --test-threads=1 --nocapture`, 5 passed on each,:
 
 | Observation (identical on tmpfs and Btrfs) | Value |
 |---|---|
@@ -257,15 +261,15 @@ suite separately returns `UnsupportedTarget`/`Metadata` for the same condition.
 Two limits belong to the contract, not to this run:
 
 - A `user.*` xattr is **refused** metadata, not preserved metadata
-  ([M1 metadata scope](../contracts/m1-root-verification.md#m1-metadata-scope-approved-2026-11-22)).
-  The differential witness therefore preserves the admitted fields
-  (owner/group/mode/mtime) and proves the xattr class by refusal, which is what
-  the policy says. No policy text was changed.
+ ([M1 metadata scope](../contracts/m1-root-verification.md#m1-metadata-scope-approved-).
+ The differential witness therefore preserves the admitted fields
+ (owner/group/mode/mtime) and proves the xattr class by refusal, which is what
+ the policy says. No policy text was changed.
 - `trusted.*` is unobserved by an ordinary user: `setxattr` returns `EPERM`
-  (os error 1), so the excluded class cannot be attached for a runtime observation
-  here. The contract already classes `trusted.*` as unobserved and outside the
-  verified Restore guarantee; it does not promise a typed refusal for it. That
-  sub-case stays `not run`; no privilege was enabled.
+ (os error 1), so the excluded class cannot be attached for a runtime observation
+ here. The contract already classes `trusted.*` as unobserved and outside the
+ verified Restore guarantee; it does not promise a typed refusal for it. That
+ sub-case stays `not run`; no privilege was enabled.
 
 Windows staging: `crates/platform/tests/effects_primitives.rs::staged_copy_preserves_owner_group_dacl_attributes_and_last_write`
 is a Windows-only witness for the copy used to stage a payload. It tightens the
@@ -289,21 +293,20 @@ This witness is the primitive copy behind staging; the Windows row stays
 - `library_stage.rs:274` maps `ArchiveError::Io` from `admit_zip` to `StageUnavailable`; every other admission error stays `StageChanged`. No new test drives either branch: both need an injected syscall failure, so only the classification code changed.
 - `Catalog::open` creates `revisions/` with mode `0700` (`private_directory`); `revisions_directory_is_private_to_the_owner` asserts `0700` on create and after reopen.
 
-
-### Handle-relative private staging (2026-11-22)
+### Handle-relative private staging
 
 Base `8110c38`. `NativeStage` now keeps every archive and payload effect on the verified revision handle: parents are created with `mkdirat(0700)`, leaves with `openat2(O_CREAT|O_EXCL|O_NOFOLLOW)`, and hashing, listing, fsyncs and reclaim unlinks resolve beneath the handle with `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_XDEV`. The revision name is removed through the bound `revisions/` handle. This closes the path-join window for bytes; it does not qualify publication.
 
 - `MARDUK_M1_BTRFS_SCRATCH=/var/tmp cargo test -p marduk-platform --test library_boundary` — 8 witnesses ignored without `--ignored` (none pass silently); with `--ignored --test-threads=1`, 8 passed. (The suite has since grown to 10 witnesses; the qualified re-run records 10 passed.)
 - New witnesses redirect a staged revision after its handle was opened and require `StageChanged`/`StageUnavailable` from `reobserve` and `reclaim` with the redirect target untouched and the original revision retained.
 - `TMPDIR=/tmp cargo test -p marduk-platform`, `TMPDIR=/tmp cargo test -p marduk-storage`, `cargo fmt --all -- --check`, `cargo build --workspace --locked`, `TMPDIR=/tmp cargo test --workspace --locked` — passed.
-- Windows compile check passed; the NTFS staging capability is implemented and witnessed at the adapter layer below. The later NTFS composition run opens `Catalog::open` native staging and Native Apply/Restore through the record; see [Windows composition run](#windows-composition-run-2026-11-22).
+- Windows compile check passed; the NTFS staging capability is implemented and witnessed at the adapter layer below. The later NTFS composition run opens `Catalog::open` native staging and Native Apply/Restore through the record; see [Windows composition run](#windows-composition-run-.
 
-**Known limitation (accepted by the 2026-11-22 user ruling):** On Linux and Windows, a same-privilege process can substitute the parent or leaf between the final live-handle check and the syscall. The [R02 contract](../contracts/m1-recovery.md#native-seam-that-r03-must-qualify) requires post-effect reobservation to detect divergence, retention of actually displaced bytes, and refusal to retry automatically on divergence. It does not claim prevention. A syscall error is not evidence of no change.
+**Known limitation (accepted by the user ruling):** On Linux and Windows, a same-privilege process can substitute the parent or leaf between the final live-handle check and the syscall. The [R02 contract](../contracts/m1-recovery.md#native-seam-that-r03-must-qualify) requires post-effect reobservation to detect divergence, retention of actually displaced bytes, and refusal to retry automatically on divergence. It does not claim prevention. A syscall error is not evidence of no change.
 
 The ruling changes the qualification criterion; it supplies no runtime evidence. Native staging is now wired on Linux Btrfs, Linux tmpfs and Windows NTFS through the record. Game-directory publication through the native adapter is connected on those volume classes, and client Apply and Restore are served there because the record proves the composition. Power-cut behaviour remains unqualified.
 
-## Native copy adapter (Task 6, 2026-11-22)
+## Native copy adapter (Task 6,
 
 Base `5fe1a02`. Adapter commit `b522b48`; primitive promotion `3f03ac8`;
 Windows compile fix `8fd7f79`; restart-durability fix `7feb64b`; preview/manifest
@@ -321,29 +324,29 @@ routes. `dispatch` and status ask the availability record through one decision
 point for the installation root's volume class; the routes are available where
 the record proves the composition, and no real game directory was written.
 
-All rows below re-ran on 2026-11-22 at `101b4f7` on both qualified Linux volume
+All rows below re-ran on at `101b4f7` on both qualified Linux volume
 classes.
 
 | Witness | Linux Btrfs | Linux tmpfs | Linux ext4 | Windows NTFS |
 |---|---|---|---|---|
-| `qualified_native_round_trip_retains_backups_and_restores_the_original_tree` (workspace: setup → import → order → preview → apply → restart → replay → restore) | ran 2026-11-22 at `101b4f7`, passed; re-ran with scoped metadata at `af0fc6d`, passed | ran 2026-11-22 at `101b4f7`, passed; re-ran with scoped metadata at `af0fc6d`, passed | not run | ran 2026-11-22 at `62b9b94b`, passed |
-| `visible_xattr_on_an_original_is_refused_before_any_write` (workspace preview) | ran 2026-11-22 at `af0fc6d`, passed (`user.*`); `trusted.*` not run | ran 2026-11-22 at `af0fc6d`, passed (`user.*`); `trusted.*` not run | not run | not run |
-| `restart_after_apply_before_ack_rolls_back_and_never_reapplies` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
-| `restart_after_record_undo_uses_the_sealed_stage_fingerprint` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
-| `restart_mid_restore_continues_in_reverse_order` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
-| `concurrent_edit_during_apply_conflicts_and_preserves_external_bytes` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
-| `restore_time_external_edit_conflicts_and_preserves_external_bytes` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
-| `recorded_locator_mismatch_is_a_typed_refusal` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
-| `unqualified_installation_root_is_refused_before_any_write` | ran 2026-11-22 at `101b4f7`, passed (procfs installation) | ran 2026-11-22 at `101b4f7`, passed (procfs installation) | not run | not run |
-| `unqualified_app_root_is_refused_before_any_write` | ran 2026-11-22 at `101b4f7`, passed (sysfs app root) | ran 2026-11-22 at `101b4f7`, passed (sysfs app root) | not run | not run |
-| `unreadable_private_slot_is_unavailable_not_absent` | ran 2026-11-22 at `101b4f7`, passed | ran 2026-11-22 at `101b4f7`, passed | not run | not run |
-| `prepared_private_artifacts_are_durable_and_unpublished` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run |
-| `private_chain_is_synced_before_the_first_public_effect` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run |
-| `sync_chain_stops_at_the_resolved_root_for_a_symlinked_library_spelling` | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run |
-| `unqualified_root_answers_a_claimed_plan_and_pending_restore` (workspace) | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run |
-| `clean_unqualified_root_answers_before_opening_a_native_port` (workspace) | ran 2026-11-22, passed | ran 2026-11-22, passed | not run | not run |
-| `dispatch_deploy_and_restore_through_the_whole_composition` (client-visible preview, apply and restore) | ran 2026-11-22 at `97c03d9`, passed | ran 2026-11-22 at `97c03d9`, passed | not run | not run |
-| `unqualified_installation_root_keeps_client_deploy_and_restore_refused` (same three routes) | ran 2026-11-22 at `97c03d9`, passed | ran 2026-11-22 at `97c03d9`, passed | not run | not run |
+| `qualified_native_round_trip_retains_backups_and_restores_the_original_tree` (workspace: setup → import → order → preview → apply → restart → replay → restore) | ran at `101b4f7`, passed; re-ran with scoped metadata at `af0fc6d`, passed | ran at `101b4f7`, passed; re-ran with scoped metadata at `af0fc6d`, passed | not run | ran at `62b9b94b`, passed |
+| `visible_xattr_on_an_original_is_refused_before_any_write` (workspace preview) | ran at `af0fc6d`, passed (`user.*`); `trusted.*` not run | ran at `af0fc6d`, passed (`user.*`); `trusted.*` not run | not run | not run |
+| `restart_after_apply_before_ack_rolls_back_and_never_reapplies` | ran at `101b4f7`, passed | ran at `101b4f7`, passed | not run | not run |
+| `restart_after_record_undo_uses_the_sealed_stage_fingerprint` | ran at `101b4f7`, passed | ran at `101b4f7`, passed | not run | not run |
+| `restart_mid_restore_continues_in_reverse_order` | ran at `101b4f7`, passed | ran at `101b4f7`, passed | not run | not run |
+| `concurrent_edit_during_apply_conflicts_and_preserves_external_bytes` | ran at `101b4f7`, passed | ran at `101b4f7`, passed | not run | not run |
+| `restore_time_external_edit_conflicts_and_preserves_external_bytes` | ran at `101b4f7`, passed | ran at `101b4f7`, passed | not run | not run |
+| `recorded_locator_mismatch_is_a_typed_refusal` | ran at `101b4f7`, passed | ran at `101b4f7`, passed | not run | not run |
+| `unqualified_installation_root_is_refused_before_any_write` | ran at `101b4f7`, passed (procfs installation) | ran at `101b4f7`, passed (procfs installation) | not run | not run |
+| `unqualified_app_root_is_refused_before_any_write` | ran at `101b4f7`, passed (sysfs app root) | ran at `101b4f7`, passed (sysfs app root) | not run | not run |
+| `unreadable_private_slot_is_unavailable_not_absent` | ran at `101b4f7`, passed | ran at `101b4f7`, passed | not run | not run |
+| `prepared_private_artifacts_are_durable_and_unpublished` | ran, passed | ran, passed | not run | not run |
+| `private_chain_is_synced_before_the_first_public_effect` | ran, passed | ran, passed | not run | not run |
+| `sync_chain_stops_at_the_resolved_root_for_a_symlinked_library_spelling` | ran, passed | ran, passed | not run | not run |
+| `unqualified_root_answers_a_claimed_plan_and_pending_restore` (workspace) | ran, passed | ran, passed | not run | not run |
+| `clean_unqualified_root_answers_before_opening_a_native_port` (workspace) | ran, passed | ran, passed | not run | not run |
+| `dispatch_deploy_and_restore_through_the_whole_composition` (client-visible preview, apply and restore) | ran at `97c03d9`, passed | ran at `97c03d9`, passed | not run | not run |
+| `unqualified_installation_root_keeps_client_deploy_and_restore_refused` (same three routes) | ran at `97c03d9`, passed | ran at `97c03d9`, passed | not run | not run |
 
 The workspace round trip uses disposable synthetic roots only. It verifies the
 deployed bytes, the retained `original` backups for replaced files, the absent
@@ -356,27 +359,27 @@ under recovery, and proves a second recovery does not reapply.
 ### Restart durability and evidence correction (`101b4f7`)
 
 - Recovery no longer depends on the map that `prepare` built. Every
-  `inspect_step` copies the sealed `staged` fingerprint from the journal-derived
-  `PreparedStep` before `execute`/`execute_undo`, so a reopened adapter can
-  classify and resume an exchange. Both restart witnesses above cut the port and
-  reopen before recovery and assert real target bytes and the terminal phase.
+ `inspect_step` copies the sealed `staged` fingerprint from the journal-derived
+ `PreparedStep` before `execute`/`execute_undo`, so a reopened adapter can
+ classify and resume an exchange. Both restart witnesses above cut the port and
+ reopen before recovery and assert real target bytes and the terminal phase.
 - `artifact` maps only a `symlink_metadata` `NotFound` to `Absent`. A stat that
-  succeeds followed by an open/read failure is `Unavailable`, so an unreadable
-  slot cannot satisfy `matches_post` as if it were empty.
+ succeeds followed by an open/read failure is `Unavailable`, so an unreadable
+ slot cannot satisfy `matches_post` as if it were empty.
 - `prepare` fsyncs the operation directory and its ancestors up to the app data
-  root before returning. `prepare_persists_private_artifacts_before_publication`
-  reopens the port after prepare, verifies the private evidence and the unchanged
-  public tree, and resolves the prepared operation as `Cancelled`. This is a
-  process-restart witness, not power-loss evidence for directory fsync ordering.
+ root before returning. `prepare_persists_private_artifacts_before_publication`
+ reopens the port after prepare, verifies the private evidence and the unchanged
+ public tree, and resolves the prepared operation as `Cancelled`. This is a
+ process-restart witness, not power-loss evidence for directory fsync ordering.
 - The workspace consults `Journal::claimed` for Apply and `root_state`/`status`
-  for Restore before opening the native port, so a claimed replay reports its
-  recorded status and a clean root reports `NoActiveDeployment` instead of
-  `UnsupportedTarget`.
+ for Restore before opening the native port, so a claimed replay reports its
+ recorded status and a clean root reports `NoActiveDeployment` instead of
+ `UnsupportedTarget`.
 - `resolved_inputs` inserts a manifest only for a published revision: an unknown
-  revision is omitted (`MissingManifest` can fire) and a published revision with
-  no rows is an empty manifest.
+ revision is omitted (`MissingManifest` can fire) and a published revision with
+ no rows is an empty manifest.
 - Preview `winner`/`candidates` are member ids, matching the fixture and the TS
-  DTO; a fixture drift witness asserts they are never installed revision ids.
+ DTO; a fixture drift witness asserts they are never installed revision ids.
 
 ### Primitive correction
 
@@ -401,7 +404,7 @@ both qualified volumes afterwards: 7 passed on each.
 - `cargo check -p marduk-platform --tests --target x86_64-pc-windows-msvc` — passed at `101b4f7`; compile-only, not NTFS runtime evidence.
 
 Linux ext4 and native NTFS remain `not run`. Windows compilation is not NTFS
-runtime evidence; see [Windows native effects](#windows-native-effects-implemented-2026-11-22-runtime-not-run)
+runtime evidence; see [Windows native effects](#windows-native-effects-implemented--runtime-not-run)
 for the implemented surface and its unrun runtime rows. The final-window
 substitution limitation in
 [R02](../contracts/m1-recovery.md#native-seam-that-r03-must-qualify) is unchanged:
@@ -419,12 +422,12 @@ restore through the production adapter. Power-cut evidence still does not exist;
 
 | Primitive | Contract implemented | Linux runtime | Hosted `windows-2025` NTFS runtime | Power |
 |---|---|---|---|---|
-| `effects::copy_file` | `CREATE_NEW` destination, data stream, attributes, creation/access/last-write times, owner/group/DACL, `FlushFileBuffers`; an occupied destination maps to `CopyError::DestinationExists` (conflict), a lock to `CopyError::Sharing` (retryable `Io`), and only unreproducible metadata to `Unsupported(Metadata)`; a source DACL that grants write (concrete bits, `GENERIC_WRITE`, `GENERIC_ALL`, or fail-closed `MAXIMUM_ALLOWED`) to a principal other than the current user or the SYSTEM/Administrators baseline is refused before it reaches the private area, including inherited grants, and every post-create failure removes the partial file | `effects_primitives::copy_preserves_bytes_and_last_write_time_and_refuses_existing` passed 2026-11-22 (Linux) | ran 2026-11-22 at `eb39be0`, passed | — |
-| `effects::publish` | one `MoveFileExW` with flags `0` (no `MOVEFILE_REPLACE_EXISTING`, no `MOVEFILE_COPY_ALLOWED`); an existing target fails and is left intact; the staged object's creation time is read through a bound handle before the move and restored through that handle after it, so a name vacated inside the NTFS tunneling window cannot re-apply the previous object's birth time, and a denied attribute write fails before either name changes | `effects_primitives::publish_refuses_an_existing_target_and_leaves_it_intact` passed 2026-11-22; `publish_keeps_the_staged_birth_time_on_a_recently_vacated_name` failed before the fix and passes after it, native NTFS 2026-11-23 | ran 2026-11-22 at `eb39be0`, passed; tunneling witness ran 2026-11-23, passed | — |
-| `effects::replace` | exchange by two no-replace renames in production (target → `<operation>/displaced`, stage → target); a caller that retains at a different path adds a third rename from that slot; a cut after the first rename leaves the canonical `displaced` slot plus the staged object, and production recovery reverts a pending deploy or completes a pending restore from that shape (see [Post-gate fixes](#post-gate-fixes-2026-11-23)); the staged object's file id, creation time, attributes and DACL are preserved, so the public target fingerprints as the sealed staged artifact; a failure returns an error, never `Ok` | `effects_primitives::replace_retains_the_displaced_file_and_keeps_the_staged_object` passed 2026-11-22 | ran 2026-11-22 at `eb39be0`, passed | — |
-| `effects::detach` | one no-replace rename into the retain slot; an occupied slot fails, unknown bytes are never replaced | `effects_primitives::detach_preserves_an_unknown_file` passed 2026-11-22 | ran 2026-11-22 at `eb39be0`, passed | — |
-| `effects::sync_directory` | `FlushFileBuffers` on a directory handle opened with `FILE_FLAG_BACKUP_SEMANTICS`; not a namespace or power-cut barrier | `effects_primitives::sync_directory_succeeds_on_a_real_directory` passed 2026-11-22 | ran 2026-11-22 at `eb39be0`, passed | not claimed |
-| `effects::volume_qualified` | a record query: NTFS is true for the adapter and deploy routes where the composition proof exists; the NTFS probe (from `GetVolumeInformationByHandleW` on the opened root) supplies the class, not the decision | `effects_primitives::volume_qualification_reads_the_opened_root` passed 2026-11-22 (refusal branch) | not run | — |
+| `effects::copy_file` | `CREATE_NEW` destination, data stream, attributes, creation/access/last-write times, owner/group/DACL, `FlushFileBuffers`; an occupied destination maps to `CopyError::DestinationExists` (conflict), a lock to `CopyError::Sharing` (retryable `Io`), and only unreproducible metadata to `Unsupported(Metadata)`; a source DACL that grants write (concrete bits, `GENERIC_WRITE`, `GENERIC_ALL`, or fail-closed `MAXIMUM_ALLOWED`) to a principal other than the current user or the SYSTEM/Administrators baseline is refused before it reaches the private area, including inherited grants, and every post-create failure removes the partial file | `effects_primitives::copy_preserves_bytes_and_last_write_time_and_refuses_existing` passed (Linux) | ran at `eb39be0`, passed | — |
+| `effects::publish` | one `MoveFileExW` with flags `0` (no `MOVEFILE_REPLACE_EXISTING`, no `MOVEFILE_COPY_ALLOWED`); an existing target fails and is left intact; the staged object's creation time is read through a bound handle before the move and restored through that handle after it, so a name vacated inside the NTFS tunneling window cannot re-apply the previous object's birth time, and a denied attribute write fails before either name changes | `effects_primitives::publish_refuses_an_existing_target_and_leaves_it_intact` passed; `publish_keeps_the_staged_birth_time_on_a_recently_vacated_name` failed before the fix and passes after it, native NTFS | ran at `eb39be0`, passed; tunneling witness ran, passed | — |
+| `effects::replace` | exchange by two no-replace renames in production (target → `<operation>/displaced`, stage → target); a caller that retains at a different path adds a third rename from that slot; a cut after the first rename leaves the canonical `displaced` slot plus the staged object, and production recovery reverts a pending deploy or completes a pending restore from that shape (see [Post-gate fixes](#post-gate-fixes-); the staged object's file id, creation time, attributes and DACL are preserved, so the public target fingerprints as the sealed staged artifact; a failure returns an error, never `Ok` | `effects_primitives::replace_retains_the_displaced_file_and_keeps_the_staged_object` passed | ran at `eb39be0`, passed | — |
+| `effects::detach` | one no-replace rename into the retain slot; an occupied slot fails, unknown bytes are never replaced | `effects_primitives::detach_preserves_an_unknown_file` passed | ran at `eb39be0`, passed | — |
+| `effects::sync_directory` | `FlushFileBuffers` on a directory handle opened with `FILE_FLAG_BACKUP_SEMANTICS`; not a namespace or power-cut barrier | `effects_primitives::sync_directory_succeeds_on_a_real_directory` passed | ran at `eb39be0`, passed | not claimed |
+| `effects::volume_qualified` | a record query: NTFS is true for the adapter and deploy routes where the composition proof exists; the NTFS probe (from `GetVolumeInformationByHandleW` on the opened root) supplies the class, not the decision | `effects_primitives::volume_qualification_reads_the_opened_root` passed (refusal branch) | not run | — |
 
 The source-DACL witnesses `copy_refuses_concrete_file_write_data_in_source_dacl`,
 `copy_refuses_generic_write_in_source_dacl` and
@@ -435,7 +438,7 @@ and this record has no runtime result for them; they do not open an availability
 route.
 
 The NTFS adapter and deploy answer comes from the whole-composition row at
-`62b9b94b` (see [Windows composition run](#windows-composition-run-2026-11-22)),
+`62b9b94b` (see [Windows composition run](#windows-composition-run-),
 not from the primitive `volume_qualified` witness above.
 
 Design note: `ReplaceFileW` is deliberately not used. It merges the replaced
@@ -464,7 +467,7 @@ Commands run for this row set:
 - `cargo test -p marduk-platform` (host Linux) — passed, including 6/6 in `tests/effects_primitives.rs`.
 - `cargo fmt --all -- --check` and `cargo build --workspace --locked` — passed.
 
-### Windows NTFS namespace barrier review (2026-11-22, base `495678a`)
+### Windows NTFS namespace barrier review, base `495678a`)
 
 **Not approved as a barrier; ADR 0004 narrows the guarantee instead.** For local
 NTFS and an ordinary Windows token, flushing file data and then calling
@@ -497,97 +500,97 @@ shows the actual sync call.
 **Windows contracts and limits.**
 
 - [`CreateFileW`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew)
-  documents `OPEN_EXISTING` and `FILE_FLAG_BACKUP_SEMANTICS` for directory
-  handles. The flag enables the open; it doesn't override access checks unless
-  the requisite backup/restore privileges are present.
-  [`FlushFileBuffers`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers)
-  documents `GENERIC_WRITE`. An ordinary user can get that access in a personal
-  directory whose DACL grants it; ownership or permission to add a file alone
-  doesn't grant the whole mask (it includes `FILE_ADD_SUBDIRECTORY` and
-  write-attribute rights). See [file access rules](https://learn.microsoft.com/en-us/windows/win32/fileio/file-security-and-access-rights).
-  A narrower `FILE_ADD_FILE` mask has reportedly worked on NTFS
-  ([RocksDB draft](https://github.com/meta/rocksdb/pull/15682)); that's not the
-  Win32 contract. A raw volume flush is documented but requires administrative
-  privileges. The upstream draft also reports that opening the volume-root
-  directory for generic write can fail on a normal non-elevated token.
+ documents `OPEN_EXISTING` and `FILE_FLAG_BACKUP_SEMANTICS` for directory
+ handles. The flag enables the open; it doesn't override access checks unless
+ the requisite backup/restore privileges are present.
+ [`FlushFileBuffers`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers)
+ documents `GENERIC_WRITE`. An ordinary user can get that access in a personal
+ directory whose DACL grants it; ownership or permission to add a file alone
+ doesn't grant the whole mask (it includes `FILE_ADD_SUBDIRECTORY` and
+ write-attribute rights). See [file access rules](https://learn.microsoft.com/en-us/windows/win32/fileio/file-security-and-access-rights).
+ A narrower `FILE_ADD_FILE` mask has reportedly worked on NTFS
+ ([RocksDB draft](https://github.com/meta/rocksdb/pull/15682)); that's not the
+ Win32 contract. A raw volume flush is documented but requires administrative
+ privileges. The upstream draft also reports that opening the volume-root
+ directory for generic write can fail on a normal non-elevated token.
 - [MS-FSA §2.1.5.7](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/0de7dc40-9627-437e-a4df-c4696cdc3d02)
-  says the object-store directory flush persists the directory structure;
-  [product note 80](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/4e3695bd-7574-4f24-a223-b4679c065b63)
-  identifies NTFS as implementing it. That is good reason to test the candidate,
-  but not a local Win32 mapping that specifies which preceding child-name
-  changes and journal records a writable directory handle commits. The
-  [Microsoft Q&A moderator's distinction](https://learn.microsoft.com/en-us/answers/a/13008957)
-  is consistent with this reading; it isn't an API specification.
+ says the object-store directory flush persists the directory structure;
+ [product note 80](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/4e3695bd-7574-4f24-a223-b4679c065b63)
+ identifies NTFS as implementing it. That is good reason to test the candidate,
+ but not a local Win32 mapping that specifies which preceding child-name
+ changes and journal records a writable directory handle commits. The
+ [Microsoft Q&A moderator's distinction](https://learn.microsoft.com/en-us/answers/a/13008957)
+ is consistent with this reading; it isn't an API specification.
 - [`MoveFileExW`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw)
-  says `MOVEFILE_WRITE_THROUGH` doesn't return until the file is moved on disk,
-  but the explicit flush guarantee is for a move implemented as copy/delete
-  (the flush is at the end of the copy). There is no comparably explicit
-  power-loss guarantee for both bindings of an in-volume rename. Copy/delete
-  is forbidden here. Adding only `MOVEFILE_WRITE_THROUGH` is a useful comparison
-  arm, not a substitute barrier. `MOVEFILE_REPLACE_EXISTING` would not retain
-  the displaced file. [`ReplaceFileW`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-replacefilew)
-  is a different API: `REPLACEFILE_WRITE_THROUGH` is unsupported, and even
-  with a backup name the attribute merge breaks the staged fingerprint.
+ says `MOVEFILE_WRITE_THROUGH` doesn't return until the file is moved on disk,
+ but the explicit flush guarantee is for a move implemented as copy/delete
+ (the flush is at the end of the copy). There is no comparably explicit
+ power-loss guarantee for both bindings of an in-volume rename. Copy/delete
+ is forbidden here. Adding only `MOVEFILE_WRITE_THROUGH` is a useful comparison
+ arm, not a substitute barrier. `MOVEFILE_REPLACE_EXISTING` would not retain
+ the displaced file. [`ReplaceFileW`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-replacefilew)
+ is a different API: `REPLACEFILE_WRITE_THROUGH` is unsupported, and even
+ with a backup name the attribute merge breaks the staged fingerprint.
 - [`NtFlushBuffersFileEx`](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntflushbuffersfileex)
-  with flags `0` is the full flush form (cached data and metadata plus
-  storage-cache synchronization) and requires write or append access. It
-  doesn't specify a stronger name-binding guarantee. `FILE_DATA_ONLY` omits
-  metadata and storage synchronization; `NO_SYNC` omits storage synchronization;
-  `FILE_DATA_SYNC_ONLY` is invalid for directory handles. No flag cited here
-  provides a better ordinary-token namespace barrier.
+ with flags `0` is the full flush form (cached data and metadata plus
+ storage-cache synchronization) and requires write or append access. It
+ doesn't specify a stronger name-binding guarantee. `FILE_DATA_ONLY` omits
+ metadata and storage synchronization; `NO_SYNC` omits storage synchronization;
+ `FILE_DATA_SYNC_ONLY` is invalid for directory handles. No flag cited here
+ provides a better ordinary-token namespace barrier.
 - [`FILE_FLAG_WRITE_THROUGH`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew)
-  covers metadata that results from the write-through request, including an
-  NTFS rename in Microsoft's description. Setting it on an unrelated open
-  doesn't order a later pathname operation. Even a handle-based rename on a
-  write-through handle deserves direct measurement, not inference from the
-  flag. NTFS journal replay restores [filesystem consistency](https://learn.microsoft.com/en-us/windows-server/storage/file-server/ntfs-overview),
-  not necessarily the latest visible name. Home metadata pages need not be
-  durable if the complete redo is durable; submitting a device flush doesn't
-  show that either reached it. A flush/FUA is also only as good as the
-  [filter, controller and device cache path](https://learn.microsoft.com/en-us/windows-hardware/drivers/storage/querying-for-the-write-cache-property)
-  that honors it.
+ covers metadata that results from the write-through request, including an
+ NTFS rename in Microsoft's description. Setting it on an unrelated open
+ doesn't order a later pathname operation. Even a handle-based rename on a
+ write-through handle deserves direct measurement, not inference from the
+ flag. NTFS journal replay restores [filesystem consistency](https://learn.microsoft.com/en-us/windows-server/storage/file-server/ntfs-overview),
+ not necessarily the latest visible name. Home metadata pages need not be
+ durable if the complete redo is durable; submitting a device flush doesn't
+ show that either reached it. A flush/FUA is also only as good as the
+ [filter, controller and device cache path](https://learn.microsoft.com/en-us/windows-hardware/drivers/storage/querying-for-the-write-cache-property)
+ that honors it.
 
 **Upstream practice (not Marduk evidence).**
 
 - [SQLite `os_win.c`](https://github.com/sqlite/sqlite/blob/master/src/os_win.c#L2180-L2220):
-  `winSync` flushes the mapped view when present, then the file handle.
-  [`winDelete`](https://github.com/sqlite/sqlite/blob/master/src/os_win.c#L4552-L4567)
-  explicitly ignores `syncDir` on Win32; no reason or parent-flush guarantee
-  is given there.
+ `winSync` flushes the mapped view when present, then the file handle.
+ [`winDelete`](https://github.com/sqlite/sqlite/blob/master/src/os_win.c#L4552-L4567)
+ explicitly ignores `syncDir` on Win32; no reason or parent-flush guarantee
+ is given there.
 - [LMDB `mdb.c`](https://github.com/LMDB/lmdb/blob/mdb.master/libraries/liblmdb/mdb.c#L2897-L2935):
-  `mdb_env_sync0` says the Windows commit normally uses write-through writes.
-  Forced sync uses the data-file handle (`MDB_FDATASYNC` is `FlushFileBuffers`
-  on Windows); mapped sync also flushes the view. Transaction publication
-  updates database pages and metadata in the existing file, not a directory
-  entry per commit; there is no directory sync in this path.
+ `mdb_env_sync0` says the Windows commit normally uses write-through writes.
+ Forced sync uses the data-file handle (`MDB_FDATASYNC` is `FlushFileBuffers`
+ on Windows); mapped sync also flushes the view. Transaction publication
+ updates database pages and metadata in the existing file, not a directory
+ entry per commit; there is no directory sync in this path.
 - [RocksDB `WinDirectory::Fsync`](https://github.com/facebook/rocksdb/blob/ff683b119cbf42aa616eaeb5fbcec22ee40defb3/port/win/io_win.cc#L1085-L1088)
-  is a no-op returning success. Its [directory open](https://github.com/facebook/rocksdb/blob/ff683b119cbf42aa616eaeb5fbcec22ee40defb3/port/win/env_win.cc#L574-L607)
-  requests zero access for metadata queries, not write access. File sync
-  uses `FlushFileBuffers`; `RenameFile` uses `MOVEFILE_REPLACE_EXISTING`
-  without write-through. The draft to add a directory flush is not merged.
+ is a no-op returning success. Its [directory open](https://github.com/facebook/rocksdb/blob/ff683b119cbf42aa616eaeb5fbcec22ee40defb3/port/win/env_win.cc#L574-L607)
+ requests zero access for metadata queries, not write access. File sync
+ uses `FlushFileBuffers`; `RenameFile` uses `MOVEFILE_REPLACE_EXISTING`
+ without write-through. The draft to add a directory flush is not merged.
 - [LevelDB `env_windows.cc`](https://github.com/google/leveldb/blob/main/util/env_windows.cc#L312-L326)
-  flushes the file and explicitly skips parent sync, saying creation updates
-  the metadata. That comment isn't a durability guarantee. The Windows
-  rename uses `MoveFileA`, with `ReplaceFileA` as fallback for an existing
-  destination; the [directory-flush proposal](https://github.com/google/leveldb/pull/1388)
-  is not merged.
+ flushes the file and explicitly skips parent sync, saying creation updates
+ the metadata. That comment isn't a durability guarantee. The Windows
+ rename uses `MoveFileA`, with `ReplaceFileA` as fallback for an existing
+ destination; the [directory-flush proposal](https://github.com/google/leveldb/pull/1388)
+ is not merged.
 - [libuv `src/win/fs.c`](https://github.com/libuv/libuv/blob/v1.x/src/win/fs.c#L2340-L2356):
-  `uv_fs_fsync`/`fdatasync` use `FlushFileBuffers` on the supplied file
-  descriptor; `uv_fs_rename` uses `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`.
-  It doesn't sync the parent in rename or promise a family of durable renames.
+ `uv_fs_fsync`/`fdatasync` use `FlushFileBuffers` on the supplied file
+ descriptor; `uv_fs_rename` uses `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`.
+ It doesn't sync the parent in rename or promise a family of durable renames.
 - [sled 0.34.7](https://github.com/spacejam/sled/blob/v0.34.7/src/pagecache/iobuf.rs#L748-L757)
-  syncs the log file; its [snapshot writer](https://github.com/spacejam/sled/blob/v0.34.7/src/pagecache/snapshot.rs#L556-L563)
-  syncs the temporary snapshot then uses `std::fs::rename`, with no parent
-  sync there on any OS. [redb's file backend](https://github.com/cberner/redb/blob/2fc790d14fb62f39137b13f7943df433bec082c2/src/tree_store/page_store/file_backend/optimized.rs#L331-L337)
-  syncs the database file with `sync_data`; commits aren't a filesystem
-  rename protocol and don't sync the parent.
+ syncs the log file; its [snapshot writer](https://github.com/spacejam/sled/blob/v0.34.7/src/pagecache/snapshot.rs#L556-L563)
+ syncs the temporary snapshot then uses `std::fs::rename`, with no parent
+ sync there on any OS. [redb's file backend](https://github.com/cberner/redb/blob/2fc790d14fb62f39137b13f7943df433bec082c2/src/tree_store/page_store/file_backend/optimized.rs#L331-L337)
+ syncs the database file with `sync_data`; commits aren't a filesystem
+ rename protocol and don't sync the parent.
 - [Rust `atomicwrites`](https://github.com/untitaker/rust-atomicwrites/blob/master/src/lib.rs#L314-L334)
-  syncs the temporary file, syncs parents on Unix, and substitutes
-  `MoveFileExW(MOVEFILE_WRITE_THROUGH)` on Windows (also
-  `MOVEFILE_REPLACE_EXISTING` for overwrite). [Rust `tempfile::persist`](https://docs.rs/tempfile/latest/tempfile/struct.NamedTempFile.html#method.persist)
-  explicitly says it doesn't synchronize the file contents or containing
-  directory. These are publication APIs, not precedents for the M1 recovery
-  guarantee.
+ syncs the temporary file, syncs parents on Unix, and substitutes
+ `MoveFileExW(MOVEFILE_WRITE_THROUGH)` on Windows (also
+ `MOVEFILE_REPLACE_EXISTING` for overwrite). [Rust `tempfile::persist`](https://docs.rs/tempfile/latest/tempfile/struct.NamedTempFile.html#method.persist)
+ explicitly says it doesn't synchronize the file contents or containing
+ directory. These are publication APIs, not precedents for the M1 recovery
+ guarantee.
 
 **What decided the refusal.** The published API scope leaves a gap, and
 third-party [E17 block traces](https://github.com/takomitkm/leveldb/blob/main/docs/powercut/E17-RESULTS.md)
@@ -642,11 +645,11 @@ than recording a pass. Any result is scoped to the recorded configuration.
 
 ## Test-oracle correction
 
-`crates/storage/tests/library_contract.rs` was changed at `a2250e9` from an unconditional `StageUnavailable` assertion to a both-branch assertion because the 2026-11-22 user ruling connected native staging on qualified volumes; the refusal branch still asserts `StageUnavailable`, the initial profile and zero `revisions/` entries, and the qualified branch asserts a prepared receipt plus reopen/`reconcile`; approved by the orchestrator as scope-mandated; `qualified_stage` is the positive guard and must not become a silent skip.
+`crates/storage/tests/library_contract.rs` was changed at `a2250e9` from an unconditional `StageUnavailable` assertion to a both-branch assertion because the user ruling connected native staging on qualified volumes; the refusal branch still asserts `StageUnavailable`, the initial profile and zero `revisions/` entries, and the qualified branch asserts a prepared receipt plus reopen/`reconcile`; approved by the orchestrator as scope-mandated; `qualified_stage` is the positive guard and must not become a silent skip.
 
 `tests/platform/m1/native-publication/subvolumes.rs` lost an adapter-side `AfterNativeEffect { raw_error: Some(EXDEV) }` assertion at `192a3b6`, when `native_proof::replace` began calling the promoted `effects::replace`, which returns `RootError` with no errno payload. The arm is unrepresentable on that path, so restoring it would be vacuous rather than a restored witness. Approved by the orchestrator as a coverage reduction with compensating controls: the direct `renameat2` control in the same file still asserts `EXDEV`, and the adapter cannot attempt a cross-volume rename because the recorded rename-domain precondition refuses it before any effect. Recorded here because an oracle change requires explicit approval and must not be silent. Widening effect errors to carry the raw OS error would restore the assertion if it is ever wanted.
 
-## Post-gate fixes (2026-11-23)
+## Post-gate fixes
 
 Evidence added after the final whole-packet review blocked at `2d80c99`. Each row is a run, not a
 derivation; `not run` is never a pass.
@@ -665,5 +668,5 @@ derivation; `not run` is never a pass.
 | `publish_keeps_the_staged_birth_time_on_a_recently_vacated_name` | NTFS, a restore detaches the name and a deploy refills it inside the tunneling window | `cargo test -p marduk-platform --test effects_primitives -- --exact publish_keeps_the_staged_birth_time_on_a_recently_vacated_name` | failed before the fix (observed creation time is the detached object's), passes after it; `publish_refuses_a_denied_attribute_write_before_moving_anything` also passes | `196a477` |
 | `cargo test -p marduk-workspace --test native_deployment -- --ignored` regression | NTFS after the lease and tunneling fixes | as above | 4 compiled Windows witnesses pass, including `windows_exchange_process_cut` | `196a477` |
 
-Not run at this point: the hosted CI step that asserts `/dev/shm` is tmpfs. Power-cut durability, the Windows namespace-barrier experiment, a real Skyrim SE install, ext4 and Btrfs cross-subvolume remain as recorded in `docs/known-issues.md`.
+Not run at this point: the hosted CI step that asserts `/dev/shm` is tmpfs. Power-cut durability, the Windows namespace-barrier experiment, a real Skyrim SE install, ext4 and Btrfs cross-subvolume remain as recorded in `docs/m1/limitations.md`.
 | `a_live_plan_claim_survives_restore_and_recover`, `a_crashed_recovery_claim_is_cleared_when_the_journal_is_idle` | tmpfs and Btrfs | `TMPDIR=/tmp` and `/var/tmp cargo test -p marduk-workspace --test installation_lease -- --ignored --test-threads=1` | 7 passed each; a `plan:` claim survives an idle-journal restore and recover, and only a `recovery:` claim is cleared | `dfcbb09` |

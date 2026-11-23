@@ -1,6 +1,5 @@
 # ADR 0004: Windows deploy uses standard filesystem flushing, without a power-cut guarantee
 
-Date: 2026-11-22
 Status: accepted
 Supersedes: the Windows namespace-barrier refusal in `native_effects::durability_barrier` and the `Theoretical` barrier entry in the availability record
 

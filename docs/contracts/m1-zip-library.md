@@ -1,6 +1,6 @@
 # M1-C02: ZIP admission and immutable library publication
 
-**Status:** Proposed worker contract, not implemented. [M1-C02](../superpowers/plans/2026-11-20-m1-working-core.md#m1-c02--local-library-zip-admission-and-metadata) owns the archive and library modules. [Archive research](../research/archive-crosswalk.md) covers later formats.
+**Status:** Implemented. [M1-C02](../superpowers/plans/2026-11-20-m1-working-core.md#m1-c02--local-library-zip-admission-and-metadata) owns the archive and library modules. [Archive research](../research/archive-crosswalk.md) covers later formats.
 
 ## What we do differently
 

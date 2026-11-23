@@ -1,6 +1,6 @@
 # M1-R01: verify the configured root and resolve file intents
 
-**Status:** Proposed platform interface and acceptance design. R01 proves identity and bounded lookup; it does not approve any write primitive or persistence guarantee. [R03](m1-native-proof.md) qualifies effects and [R02](m1-recovery.md) consumes their results.
+**Status:** Implemented. R01 proves identity and bounded lookup; it does not by itself approve a write primitive or persistence guarantee. [R03](m1-native-proof.md) qualifies effects and [R02](m1-recovery.md) consumes their results.
 
 ## Interface
 
@@ -37,7 +37,7 @@ Linux root tokens include the mount view ID reported by `statx` (`STATX_MNT_ID`)
 
 Future command: `cargo test -p marduk-platform --test root_contract`. Record kernel/OS, actual filesystem/driver, mount/subvolume layout, and exact skips. A pass never substitutes for tested native publication or power-loss recovery. The Btrfs snapshot row above has no recorded run: it stays `not run` and is not a pass.
 
-## M1 metadata scope (approved 2026-11-22)
+## M1 metadata scope (approved)
 
 Root discovery, read-only validation and binding establish identity and layout, not write eligibility. Write eligibility is per affected original and per qualified native filesystem/operation. Apply and Restore require fresh bound-object evidence before mutation; a failed, partial or ambiguous required probe, an unsupported object, or detected metadata outside the allowlist refuses the operation before plan approval or game staging. A later discrepancy stops the operation, preserves recovery evidence and reports conflict; it is not permission to fall back.
 

@@ -1,6 +1,6 @@
 # M1-C01: priority resolution contract
 
-**Status:** Proposed worker brief contract, not implementation or execution approval. [M1-C01](../superpowers/plans/2026-11-20-m1-working-core.md#m1-c01--workspace-shared-domain-and-resolver) owns these files and tests. Its inputs are synthetic archive manifests; OS and archive readers are not dependencies of the resolver.
+**Status:** Implemented and witnessed. [M1-C01](../superpowers/plans/2026-11-20-m1-working-core.md#m1-c01--workspace-shared-domain-and-resolver) owns these files and tests. Its inputs are synthetic archive manifests; OS and archive readers are not dependencies of the resolver.
 
 ## Module ownership and interface
 

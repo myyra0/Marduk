@@ -1,6 +1,6 @@
 # M1-U01: desktop and CLI contract
 
-**Status:** Partially implemented transport/interaction contract. The shared workspace, CLI and Tauri shell exist; client-visible Deploy Preview, Deploy Apply and Restore are available where the availability record proves the composition rung (Linux Btrfs and tmpfs, Windows NTFS). It covers the single M1 workflow only, not the future headless protocol or a visual layout. [Core resolution](m1-file-resolution.md), [ZIP/library](m1-zip-library.md), [native roots](m1-root-verification.md), and [recovery](m1-recovery.md) own behavior and effects.
+**Status:** Implemented transport and interaction contract for the single M1 workflow. The shared workspace, CLI and Tauri shell exist; client-visible Deploy Preview, Deploy Apply and Restore are available where the availability record proves the composition rung (Linux Btrfs and tmpfs, Windows NTFS). It covers the single M1 workflow only, not the future headless protocol or a visual layout. [Core resolution](m1-file-resolution.md), [ZIP/library](m1-zip-library.md), [native roots](m1-root-verification.md), and [recovery](m1-recovery.md) own behavior and effects.
 
 ## Shared operations, not separate engines
 

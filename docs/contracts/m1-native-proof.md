@@ -1,6 +1,6 @@
 # M1-R03: qualify native placement and durability
 
-**Status:** Proposal and runbook, not run. This packet creates only an approved disposable proof on synthetic local volumes; it does not implement the production deployment adapter. [R02](m1-recovery.md) consumes the result, and [R04](../superpowers/plans/2026-11-20-m1-working-core.md#m1-r04--recovery-storage-and-game-smoke-checkpoint) proves the integrated application separately.
+**Status:** Runbook. It defines what the primitive runs must show; the runs themselves are recorded in [evidence](../research/m1-native-results.md). [R02](m1-recovery.md) consumes the outcomes, and the workspace witnesses prove the integrated path.
 
 ## Candidates
 

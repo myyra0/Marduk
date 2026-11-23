@@ -1,6 +1,6 @@
 # ADR 0005: arbitrate installation ownership outside app-data
 
-**Status:** Accepted, 2026-11-23. Linux runtime proof and native Windows runtime proof recorded (platform 7/7, workspace 3/3 on NTFS).
+**Status:** Accepted. Linux runtime proof and native Windows runtime proof recorded (platform 7/7, workspace 3/3 on NTFS).
 
 ## Context
 
@@ -62,7 +62,7 @@ clients that resolve the same state directory, not to the account as a whole. Re
 atomic (temp file, replace, directory flush) and release removes the record under the gate, but the
 journal-idle check that precedes a release is not serialized with the lease gate. Only the exact
 claim reference that a call wrote can be cleared, so a stale call cannot clear a newer claim; the
-remaining window is recorded rather than claimed closed (user ruling, 2026-11-23).
+remaining window is recorded rather than claimed closed (user ruling).
 
 Enabling client deploy or restore is the availability record's decision: a recorded composition proof
 on that volume. It is not a statement that a real game install has been written; no real Skyrim SE
