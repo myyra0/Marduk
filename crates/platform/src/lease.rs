@@ -16,7 +16,8 @@
 //!
 //! The record names the owning catalog root and the operation or generation it
 //! holds. A present-but-unparseable record is a typed refusal: it is never
-//! read as absent.
+//! read as absent. Absence of the record is the only vacant state; an empty
+//! file is a crash artifact, not an invitation to claim.
 
 use std::fmt;
 use std::fs::File;
@@ -75,6 +76,7 @@ pub enum LeaseClaim {
 /// objects share its containment checks without sharing a data path.
 pub struct InstallationLease {
     dir: File,
+    dir_path: PathBuf,
     lock: String,
     record: String,
 }
@@ -83,20 +85,20 @@ impl InstallationLease {
     /// Open the lease directory, creating it (and its parents) when absent.
     pub fn open(leases: &Path, key: &str) -> Result<Self, LeaseError> {
         let dir = crate::open_private_directory(leases).map_err(root_error)?;
-        Self::pin(dir, key)
+        Self::pin(dir, leases, key)
     }
 
     /// Open the lease directory only when it already exists. A missing
     /// directory has no record and creates nothing.
     pub fn open_existing(leases: &Path, key: &str) -> Result<Option<Self>, LeaseError> {
         match crate::open_existing_private_directory(leases) {
-            Ok(dir) => Self::pin(dir, key).map(Some),
+            Ok(dir) => Self::pin(dir, leases, key).map(Some),
             Err(RootError::TargetUnavailable) => Ok(None),
             Err(error) => Err(root_error(error)),
         }
     }
 
-    fn pin(dir: File, key: &str) -> Result<Self, LeaseError> {
+    fn pin(dir: File, dir_path: &Path, key: &str) -> Result<Self, LeaseError> {
         if key.len() != 64
             || !key
                 .bytes()
@@ -110,6 +112,7 @@ impl InstallationLease {
         }
         Ok(Self {
             dir,
+            dir_path: dir_path.to_path_buf(),
             lock: format!("{key}.lock"),
             record: format!("{key}.lease"),
         })
@@ -125,7 +128,10 @@ impl InstallationLease {
     /// Claim the installation for `record`, or report the foreign owner.
     ///
     /// Examination and replacement happen under one held gate, so two catalogs
-    /// cannot both observe a vacant record and then both write.
+    /// cannot both observe a vacant record and then both write. The new bytes
+    /// reach a fresh sibling first and one atomic replace publishes them, so the
+    /// live record is never truncated: a cut leaves the previous record or the
+    /// new one.
     pub fn claim(&self, record: &LeaseRecord) -> Result<LeaseClaim, LeaseError> {
         let gate = self.gate()?;
         let _guard = gate.try_lock().map_err(gate_error)?;
@@ -134,20 +140,49 @@ impl InstallationLease {
                 return Ok(LeaseClaim::Foreign(current.app_data));
             }
         }
-        crate::write_private_file(&self.dir, &self.record, &encode(record)).map_err(root_error)?;
+        self.publish(&encode(record))?;
         Ok(LeaseClaim::Acquired)
     }
 
     /// Clear the record only when it names `app_data`, under one held gate.
-    /// Returns whether this catalog owned it. The gate object stays, so a gate
-    /// opened before the clear keeps a stable identity; the record is cleared to
-    /// zero length rather than removed.
+    /// Returns whether this catalog owned it. Removal is an unlink, never an
+    /// empty write: absence is the one vacant state.
     pub fn release(&self, app_data: &Path) -> Result<bool, LeaseError> {
+        self.clear_matching(|current| current.app_data == app_data)
+    }
+
+    /// Clear the record only when it names both `app_data` and `reference`,
+    /// under one held gate. `None` matches only a record without a reference, so
+    /// an older call cannot clear a newer claim. Returns whether it was removed.
+    pub fn clear_if(&self, app_data: &Path, reference: Option<&str>) -> Result<bool, LeaseError> {
+        self.clear_matching(|current| {
+            current.app_data == app_data && current.reference.as_deref() == reference
+        })
+    }
+
+    /// Write `bytes` to a fresh sibling, then replace the record with it in one
+    /// namespace operation and flush the directory. A leftover sibling is not a
+    /// record; a later claim removes it before creating its own.
+    fn publish(&self, bytes: &[u8]) -> Result<(), LeaseError> {
+        let temporary = format!("{}.tmp", self.record);
+        crate::native::remove_private_file(&self.dir, &temporary).map_err(root_error)?;
+        crate::native::create_private_file(&self.dir, &temporary, bytes).map_err(root_error)?;
+        crate::native::replace_private_file(&self.dir, &temporary, &self.record)
+            .map_err(root_error)?;
+        crate::effects::sync_bound_directory(&self.dir, &self.dir_path).map_err(root_error)
+    }
+
+    fn clear_matching(
+        &self,
+        matches: impl FnOnce(&LeaseRecord) -> bool,
+    ) -> Result<bool, LeaseError> {
         let gate = self.gate()?;
         let _guard = gate.try_lock().map_err(gate_error)?;
         match read_locked(&self.dir, &self.record)? {
-            Some(current) if current.app_data == app_data => {
-                crate::write_private_file(&self.dir, &self.record, b"").map_err(root_error)?;
+            Some(current) if matches(&current) => {
+                crate::native::remove_private_file(&self.dir, &self.record).map_err(root_error)?;
+                crate::effects::sync_bound_directory(&self.dir, &self.dir_path)
+                    .map_err(root_error)?;
                 Ok(true)
             }
             _ => Ok(false),
@@ -199,8 +234,11 @@ fn decode(bytes: Option<&[u8]>) -> Result<Option<LeaseRecord>, LeaseError> {
     let Some(bytes) = bytes else {
         return Ok(None);
     };
+    // A present file with no bytes is the exact shape a truncate-then-write cut
+    // leaves; treating it as vacant would let a second catalog claim a
+    // deployment that still exists.
     if bytes.is_empty() {
-        return Ok(None);
+        return Err(LeaseError::Unreadable);
     }
     let text = std::str::from_utf8(bytes).map_err(|_| LeaseError::Unreadable)?;
     let mut lines = text.split('\n');

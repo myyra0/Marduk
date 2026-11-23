@@ -1,7 +1,7 @@
 //! Installation lease primitives: key stability and record arbitration.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use marduk_platform::effects::directory_identity;
 use marduk_platform::lease::{InstallationLease, LeaseClaim, LeaseError, LeaseRecord};
@@ -115,10 +115,35 @@ fn an_unparseable_record_is_a_typed_refusal_not_absence() {
             Err(LeaseError::Unreadable)
         );
     }
+}
 
-    // A zero-length file is the cleared form and reads as vacant.
+#[test]
+fn an_empty_record_is_unreadable_and_is_never_taken_as_vacant() {
+    let temp = scratch();
+    let leases = temp.path().join("marduk").join("leases");
+    let key = lease_key([8u8; 32]);
+    let lease = InstallationLease::open(&leases, &key).unwrap();
+    let owner = record("/data/owner", Some("generation:1"));
+    lease.claim(&owner).unwrap();
+    let path = leases.join(format!("{key}.lease"));
+
+    // The exact shape a truncate-then-write cut leaves behind.
     fs::write(&path, b"").unwrap();
-    assert_eq!(lease.read().unwrap(), None);
+    assert_eq!(lease.read(), Err(LeaseError::Unreadable));
+    assert_eq!(
+        lease.claim(&record("/data/other", None)),
+        Err(LeaseError::Unreadable),
+        "a crash-shaped record is never read as vacant"
+    );
+    assert_eq!(
+        lease.clear_if(&owner.app_data, Some("generation:1")),
+        Err(LeaseError::Unreadable)
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        b"",
+        "the crash shape is preserved for inspection"
+    );
 }
 
 #[test]
@@ -208,6 +233,121 @@ fn a_torn_record_refuses_and_a_non_owner_release_leaves_it_intact() {
         fs::read(&path).unwrap(),
         torn,
         "a refused read leaves the torn bytes for inspection"
+    );
+}
+
+#[test]
+fn clear_if_needs_the_exact_reference_and_never_clears_a_newer_claim() {
+    let temp = scratch();
+    let leases = temp.path().join("marduk").join("leases");
+    let key = lease_key([10u8; 32]);
+    let lease = InstallationLease::open(&leases, &key).unwrap();
+    let older = record("/data/owner", Some("plan:1"));
+    let newer = record("/data/owner", Some("plan:2"));
+    lease.claim(&older).unwrap();
+
+    assert!(
+        !lease
+            .clear_if(Path::new("/data/other"), Some("plan:1"))
+            .unwrap(),
+        "another catalog never clears this record"
+    );
+    assert!(
+        !lease
+            .clear_if(Path::new("/data/owner"), Some("plan:0"))
+            .unwrap(),
+        "a different reference is not this claim"
+    );
+    assert_eq!(lease.read().unwrap(), Some(older.clone()));
+
+    lease.claim(&newer).unwrap();
+    assert!(
+        !lease
+            .clear_if(Path::new("/data/owner"), Some("plan:1"))
+            .unwrap(),
+        "an older call cannot clear a newer claim"
+    );
+    assert_eq!(lease.read().unwrap(), Some(newer.clone()));
+    assert!(
+        lease
+            .clear_if(Path::new("/data/owner"), Some("plan:2"))
+            .unwrap(),
+        "the matching claim clears"
+    );
+    assert_eq!(lease.read().unwrap(), None);
+
+    // `None` matches only a record written without a reference.
+    let bare = record("/data/owner", None);
+    lease.claim(&bare).unwrap();
+    assert!(
+        !lease
+            .clear_if(Path::new("/data/owner"), Some("plan:2"))
+            .unwrap()
+    );
+    assert_eq!(lease.read().unwrap(), Some(bare.clone()));
+    assert!(lease.clear_if(Path::new("/data/owner"), None).unwrap());
+    assert_eq!(lease.read().unwrap(), None);
+}
+
+#[test]
+fn a_claim_publishes_a_whole_record_and_consumes_its_temporary() {
+    let temp = scratch();
+    let leases = temp.path().join("marduk").join("leases");
+    let key = lease_key([11u8; 32]);
+    let writer = InstallationLease::open(&leases, &key).unwrap();
+    let reader = InstallationLease::open(&leases, &key).unwrap();
+    let path = leases.join(format!("{key}.lease"));
+    let temporary = leases.join(format!("{key}.lease.tmp"));
+
+    let first = record("/data/owner", Some("generation:1"));
+    writer.claim(&first).unwrap();
+    assert_eq!(reader.read().unwrap(), Some(first));
+    assert!(!fs::read(&path).unwrap().is_empty());
+
+    for generation in 2..=8 {
+        let reference = format!("generation:{generation}");
+        let next = record("/data/owner", Some(&reference));
+        writer.claim(&next).unwrap();
+        assert_eq!(
+            reader.read().unwrap(),
+            Some(next),
+            "the other handle only ever sees a whole record"
+        );
+        assert!(
+            !fs::read(&path).unwrap().is_empty(),
+            "no empty intermediate remains after the claim"
+        );
+    }
+
+    // A leftover from a cut before the replace is not a record and a later
+    // claim removes it.
+    fs::write(&temporary, b"stale leftover").unwrap();
+    let last = record("/data/owner", Some("generation:9"));
+    writer.claim(&last).unwrap();
+    assert_eq!(reader.read().unwrap(), Some(last));
+    assert!(!temporary.exists(), "the later claim cleans the temporary");
+}
+
+#[test]
+fn a_failed_publication_leaves_the_previous_record_intact() {
+    let temp = scratch();
+    let leases = temp.path().join("marduk").join("leases");
+    let key = lease_key([12u8; 32]);
+    let lease = InstallationLease::open(&leases, &key).unwrap();
+    let owner = record("/data/owner", Some("generation:1"));
+    lease.claim(&owner).unwrap();
+
+    // A directory squatting on the temporary name means no fresh sibling can be
+    // created, so the replace is never reached.
+    fs::create_dir(leases.join(format!("{key}.lease.tmp"))).unwrap();
+    assert_eq!(
+        lease.claim(&record("/data/owner", Some("generation:2"))),
+        Err(LeaseError::Io)
+    );
+    assert_eq!(
+        lease.read().unwrap(),
+        Some(owner),
+        "the previous record is still whole"
     );
 }
 

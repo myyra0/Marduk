@@ -11,10 +11,11 @@ use windows_sys::Win32::Foundation::{
     INVALID_HANDLE_VALUE, WIN32_ERROR,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    GetFileInformationByHandle, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
-    OPEN_ALWAYS, OPEN_EXISTING, UnlockFileEx,
+    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, LOCKFILE_EXCLUSIVE_LOCK,
+    LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, UnlockFileEx,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
@@ -203,6 +204,56 @@ pub(crate) fn write_private_file(parent: &File, name: &str, bytes: &[u8]) -> Res
     use std::io::Write;
     (&file).write_all(bytes).map_err(|_| RootError::Io)?;
     file.sync_all().map_err(|_| RootError::Io)
+}
+
+/// Create `parent/name` when and only when the name is absent, write `bytes`,
+/// and make them durable. An existing name is never truncated.
+pub(crate) fn create_private_file(
+    parent: &File,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), RootError> {
+    let path = root::private_child_path(parent, name)?;
+    let file = open_lease_file(&path, GENERIC_WRITE, CREATE_NEW).map_err(|_| RootError::Io)?;
+    check_lease_file(&file)?;
+    use std::io::Write;
+    (&file).write_all(bytes).map_err(|_| RootError::Io)?;
+    file.sync_all().map_err(|_| RootError::Io)
+}
+
+/// Replace `parent/to` with `parent/from`, flushing both the object and the
+/// namespace entry. The destination is an app-owned lease record, so replacing
+/// it is permitted here; game-file publication keeps its no-clobber rule.
+pub(crate) fn replace_private_file(parent: &File, from: &str, to: &str) -> Result<(), RootError> {
+    let from = root::private_child_path(parent, from)?;
+    let to = root::private_child_path(parent, to)?;
+    let from = wide(&from);
+    let to = wide(&to);
+    if unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } != 0
+    {
+        return Ok(());
+    }
+    Err(RootError::Io)
+}
+
+/// Remove `parent/name`. `Ok(false)` means it was already absent.
+pub(crate) fn remove_private_file(parent: &File, name: &str) -> Result<bool, RootError> {
+    let path = root::private_child_path(parent, name)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(RootError::Io),
+    }
+}
+
+fn wide(path: &Path) -> Vec<u16> {
+    path.as_os_str().encode_wide().chain([0]).collect()
 }
 
 fn open_lease_file(path: &Path, access: u32, disposition: u32) -> Result<File, u32> {

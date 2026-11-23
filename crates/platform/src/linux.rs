@@ -1414,6 +1414,51 @@ pub(crate) fn write_private_file(parent: &File, name: &str, bytes: &[u8]) -> Res
     (&file).sync_all().map_err(|_| RootError::Io)
 }
 
+/// Create `parent/name` when and only when the name is absent, write `bytes`,
+/// and make them durable. An existing name is never truncated.
+pub(crate) fn create_private_file(
+    parent: &File,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), RootError> {
+    if !ordinary_component(name) {
+        return Err(RootError::TargetUnavailable);
+    }
+    let flags =
+        (libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
+    let file = openat2_mode(parent.as_raw_fd(), OsStr::new(name), flags, 0o600, NO_LINKS)
+        .map_err(|_| RootError::Io)?;
+    private_regular_file(&file)?;
+    (&file).write_all(bytes).map_err(|_| RootError::Io)?;
+    (&file).sync_all().map_err(|_| RootError::Io)
+}
+
+/// Replace `parent/to` with `parent/from` in one namespace operation. Both
+/// names share the pinned directory, so this never crosses a mount and a reader
+/// sees either the old object or the new one, never a truncated file.
+pub(crate) fn replace_private_file(parent: &File, from: &str, to: &str) -> Result<(), RootError> {
+    if !ordinary_component(from) || !ordinary_component(to) {
+        return Err(RootError::TargetUnavailable);
+    }
+    renameat2(parent, from, parent, to, 0).map_err(|_| RootError::Io)
+}
+
+/// Remove `parent/name`. `Ok(false)` means it was already absent.
+pub(crate) fn remove_private_file(parent: &File, name: &str) -> Result<bool, RootError> {
+    if !ordinary_component(name) {
+        return Err(RootError::TargetUnavailable);
+    }
+    let name = CString::new(name).map_err(|_| RootError::TargetUnavailable)?;
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ENOENT) => Ok(false),
+        _ => Err(RootError::Io),
+    }
+}
+
 fn private_regular_file(file: &File) -> Result<(), RootError> {
     let stx = statx_fd(file)?;
     if stx.stx_mode as u32 & libc::S_IFMT != libc::S_IFREG
