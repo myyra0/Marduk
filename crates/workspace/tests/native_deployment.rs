@@ -171,10 +171,18 @@ struct Fixture {
     game: PathBuf,
     workspace: Workspace,
     initial: BTreeMap<String, Vec<u8>>,
+    /// The archive member spelling of the winner. The case-mismatch witness
+    /// spells it differently from the on-disk original so the bound leaf
+    /// records the native spelling and the archive supplies the planned one.
+    archive_winner: &'static str,
 }
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_archive_winner("textures/winner.dds")
+    }
+
+    fn with_archive_winner(archive_winner: &'static str) -> Self {
         let temp = tempfile::tempdir().unwrap();
         assert!(
             marduk_platform::effects::volume_qualified(temp.path()),
@@ -200,6 +208,7 @@ impl Fixture {
             game,
             workspace,
             initial,
+            archive_winner,
         }
     }
 
@@ -216,11 +225,13 @@ impl Fixture {
     }
 
     fn zip(&self) -> PathBuf {
+        let directory = &self.archive_winner[..self.archive_winner.rfind('/').unwrap()];
+        let only = format!("{directory}/a-only.dds");
         self.zip_records(
             "native.zip",
             &[
-                Record::file(b"textures/winner.dds", POST),
-                Record::file(b"textures/a-only.dds", ONLY),
+                Record::file(self.archive_winner.as_bytes(), POST),
+                Record::file(only.as_bytes(), ONLY),
             ],
         )
     }
@@ -353,15 +364,34 @@ fn windows_exchange_process_cut() {
                 .unwrap();
             let mut port = NativeEffects::open(&app, &selected.locator, LAYOUT).unwrap();
             port.inspect_step(&step);
-            assert!(matches!(
-                port.replace_existing_retain_displaced(
-                    &step.spec.target,
-                    expected,
-                    step.staged.as_ref().unwrap().0,
-                    step.retain,
-                ),
-                EffectOutcome::Ambiguous(_)
-            ));
+            let outcome = port.replace_existing_retain_displaced(
+                &step.spec.target,
+                expected,
+                step.staged.as_ref().unwrap().0,
+                step.retain,
+            );
+            // The cut is the on-disk state, not the reported outcome: exit
+            // without unwinding or acknowledging so the fresh process must
+            // classify it. A case-mismatched leaf may make that classification
+            // itself fail, which is what the recovery half of this witness
+            // exposes; the after-cut shape is asserted by the parent.
+            let planned_leaf = step
+                .spec
+                .target
+                .target
+                .relative
+                .as_str()
+                .rsplit('/')
+                .next()
+                .unwrap();
+            if planned_leaf == step.spec.target.leaf {
+                assert!(
+                    matches!(outcome, EffectOutcome::Ambiguous(_)),
+                    "{outcome:?}"
+                );
+            } else {
+                println!("case-mismatched cut outcome: {outcome:?}");
+            }
             exit(CUT);
         }
         let mut workspace = Workspace::open(&app).unwrap();
@@ -373,8 +403,13 @@ fn windows_exchange_process_cut() {
         return;
     }
 
-    for restoring in [false, true] {
-        let mut fixture = Fixture::new();
+    for (mismatched_case, restoring) in [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let mut fixture = if mismatched_case {
+            Fixture::with_archive_winner("Textures/Winner.dds")
+        } else {
+            Fixture::new()
+        };
         let plan_id = if restoring {
             fixture.apply_one();
             None
@@ -455,8 +490,25 @@ fn windows_exchange_process_cut() {
             .collect();
         let winner = steps
             .iter()
-            .find(|step| step.staged.is_some() && step.spec.target.leaf == "winner.dds")
+            .find(|step| {
+                step.staged.is_some()
+                    && step.spec.target.target.relative.as_str() == fixture.archive_winner
+            })
             .unwrap();
+        let recorded_leaf = winner.spec.target.leaf.clone();
+        // The plan binds the native spelling of the existing original, which
+        // the case-mismatch fixture keeps distinct from the archive's spelling.
+        assert!(
+            recorded_leaf.eq_ignore_ascii_case("winner.dds"),
+            "bound leaf names the winner: {recorded_leaf}"
+        );
+        if mismatched_case {
+            let archive_leaf = fixture.archive_winner.rsplit('/').next().unwrap();
+            assert_ne!(
+                recorded_leaf, archive_leaf,
+                "the archive spelling and the bound leaf must differ"
+            );
+        }
         let ordinal = winner.ordinal;
         let directory = slots(&fixture.app, op, ordinal);
         journal.seal(op, steps).unwrap();
@@ -491,7 +543,7 @@ fn windows_exchange_process_cut() {
         assert_eq!(fs::read(directory.join("displaced")).unwrap(), pre_bytes);
         assert!(!directory.join("alternate").exists());
         println!(
-            "NTFS cut {phase:?}: target=absent stage={stage_bytes:?} displaced={pre_bytes:?} alternate=absent"
+            "NTFS cut {phase:?} case-mismatch={mismatched_case}: target=absent stage={stage_bytes:?} displaced={pre_bytes:?} alternate=absent"
         );
         assert!(child("recover").success());
         let mut journal = OperationJournal::open(&fixture.app).unwrap();
@@ -506,6 +558,18 @@ fn windows_exchange_process_cut() {
         );
         assert_eq!(fs::read(&target).unwrap(), BASE);
         assert!(!fixture.game.join("Data/textures/a-only.dds").exists());
+        // Resume names the recorded native spelling, so the recovered tree has
+        // exactly one winner entry and it is the detached object's name.
+        let names = entry_names(&fixture.game.join("Data/textures"));
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.eq_ignore_ascii_case("winner.dds"))
+                .count(),
+            1,
+            "{names:?}"
+        );
+        assert!(names.iter().any(|name| name == &recorded_leaf), "{names:?}");
         if restoring {
             assert_eq!(
                 marduk_platform::effects::fingerprint_path(&target).unwrap(),

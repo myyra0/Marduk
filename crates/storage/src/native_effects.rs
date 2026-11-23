@@ -244,10 +244,35 @@ impl NativeEffects {
         self.binding.verify()?;
         let resolved =
             marduk_platform::resolve_existing_parent(&self.binding, &target.target.relative)?;
-        if resolved.parent_identity() != &target.parent || resolved.leaf() != target.leaf {
+        if resolved.parent_identity() != &target.parent {
             return Err(RootError::OutsideBoundary);
         }
+        if resolved.leaf() != target.leaf {
+            // A detached leaf has no entry to spell, so the platform reports
+            // the planned spelling instead of the sealed native one. That
+            // absent name is the recorded object, so it is inside the
+            // boundary. An object that still exists under another casing is a
+            // substituted target and stays refused.
+            match marduk_platform::observe_target(&resolved) {
+                Ok(TargetObservation::Absent) => {}
+                Ok(_) => return Err(RootError::OutsideBoundary),
+                Err(error) => return Err(error),
+            }
+        }
         Ok(resolved)
+    }
+
+    /// The target pathname a public effect or resume must name.
+    ///
+    /// The resolved path spells the leaf from the live entry, or the planned
+    /// spelling when the leaf is absent. The bound target holds the native
+    /// spelling the object was detached under, so naming the recorded spelling
+    /// moves the same object instead of creating a second casing beside it.
+    fn effect_path(
+        resolved: &marduk_platform::ResolvedTarget<'_>,
+        target: &BoundTarget,
+    ) -> PathBuf {
+        resolved.public_path().with_file_name(&target.leaf)
     }
 
     /// Open the pinned catalog read-only and re-prove the leaf after SQLite
@@ -474,9 +499,9 @@ impl NativeEffects {
                         Ok(directory) => directory,
                         Err(error) => return EffectOutcome::Unavailable(error),
                     },
-                    resolved.leaf().to_owned(),
+                    target.leaf.clone(),
                     resolved.parent_identity().clone(),
-                    resolved.public_path(),
+                    Self::effect_path(&resolved, target),
                 ),
                 Err(error) => return EffectOutcome::Unavailable(error),
             };
@@ -624,9 +649,9 @@ impl NativeEffects {
                         Ok(directory) => directory,
                         Err(error) => return EffectOutcome::Unavailable(error),
                     },
-                    resolved.leaf().to_owned(),
+                    target.leaf.clone(),
                     resolved.parent_identity().clone(),
-                    resolved.public_path(),
+                    Self::effect_path(&resolved, target),
                 ),
                 Err(error) => return EffectOutcome::Unavailable(error),
             };
@@ -772,9 +797,9 @@ impl NativeEffects {
                         Ok(directory) => directory,
                         Err(error) => return EffectOutcome::Unavailable(error),
                     },
-                    resolved.leaf().to_owned(),
+                    target.leaf.clone(),
                     resolved.parent_identity().clone(),
-                    resolved.public_path(),
+                    Self::effect_path(&resolved, target),
                 ),
                 Err(error) => return EffectOutcome::Unavailable(error),
             };
@@ -1069,7 +1094,7 @@ impl CopyEffects for NativeEffects {
     ) -> EffectOutcome {
         let bound = (|| {
             let resolved = self.resolved(&step.spec.target)?;
-            let target = resolved.public_path();
+            let target = Self::effect_path(&resolved, &step.spec.target);
             let private = self.op_dir(step.op.get(), step.ordinal, step.direction);
             if !same_rename_domain(
                 &effects::directory_identity(&private)?,
