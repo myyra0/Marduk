@@ -666,3 +666,4 @@ derivation; `not run` is never a pass.
 | `cargo test -p marduk-workspace --test native_deployment -- --ignored` regression | NTFS after the lease and tunneling fixes | as above | 4 compiled Windows witnesses pass, including `windows_exchange_process_cut` | `196a477` |
 
 Not run at this point: the hosted CI step that asserts `/dev/shm` is tmpfs. Power-cut durability, the Windows namespace-barrier experiment, a real Skyrim SE install, ext4 and Btrfs cross-subvolume remain as recorded in `docs/known-issues.md`.
+| `a_live_plan_claim_survives_restore_and_recover`, `a_crashed_recovery_claim_is_cleared_when_the_journal_is_idle` | tmpfs and Btrfs | `TMPDIR=/tmp` and `/var/tmp cargo test -p marduk-workspace --test installation_lease -- --ignored --test-threads=1` | 7 passed each; a `plan:` claim survives an idle-journal restore and recover, and only a `recovery:` claim is cleared | `dfcbb09` |
