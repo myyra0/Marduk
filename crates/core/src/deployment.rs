@@ -709,7 +709,9 @@ pub(crate) fn effect_evidence<J: Journal, P: CopyEffects>(
     | EffectOutcome::Conflict(evidence)
     | EffectOutcome::Ambiguous(evidence) = &outcome
     {
-        if crate::recovery::preserve_canonical_displacement(journal, step, evidence)? {
+        let canonical = crate::recovery::preserve_canonical_displacement(journal, step, evidence)?;
+        let stage = crate::recovery::preserve_stage_displacement(journal, port, step, evidence)?;
+        if canonical || stage {
             return Err(DeployError::RecoveryConflict);
         }
     }

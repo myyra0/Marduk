@@ -25,11 +25,12 @@ use marduk_core::deployment::{
 use marduk_core::ids::{InstalledRevisionId, ProfileId, ProfileRevision};
 use marduk_core::recovery::{
     Artifact, BackupRef, BackupSlot, BarrierOutcome, CopyEffects, EffectOutcome, Evidence,
-    InterruptedExchange, Observation, PreImage, PreparedStep, StageRef, StepDirection, StepOutput,
-    StepSpec,
+    Observation, PreImage, PreparedStep, StageRef, StepDirection, StepOutput, StepSpec,
 };
 #[cfg(windows)]
-use marduk_core::recovery::{matches_interrupted_exchange, matches_post, matches_pre};
+use marduk_core::recovery::{
+    InterruptedExchange, matches_interrupted_exchange, matches_post, matches_pre,
+};
 use marduk_core::root_identity::{
     FileMetadata, Fingerprint, GameLayout, NativeIdentity, RootError, RootIdentity,
     TargetObservation, UnsupportedReason,
@@ -216,6 +217,7 @@ impl NativeEffects {
             BackupSlot::Step => directory.join("step"),
             BackupSlot::Displaced => directory.join("displaced"),
             BackupSlot::AlternateDisplaced => directory.join("alternate"),
+            BackupSlot::StageDisplaced => directory.join("stage"),
         }
     }
 
@@ -1149,6 +1151,34 @@ impl CopyEffects for NativeEffects {
 
     fn inspect_alternate_displacement(&mut self, step: &PreparedStep) -> Artifact {
         artifact(&self.backup_path(step.alternate_displacement()))
+    }
+
+    fn inspect_stage_displacement(
+        &mut self,
+        step: &PreparedStep,
+        evidence: &Evidence,
+    ) -> Option<Artifact> {
+        let (at, sealed) = step.staged.as_ref()?;
+        let unknown = |artifact: &Artifact| match artifact {
+            Artifact::Regular(actual) => {
+                actual != sealed
+                    && !(cfg!(target_os = "linux")
+                        && matches!(&step.spec.pre, PreState::Regular(pre) if pre == actual))
+            }
+            Artifact::Unsupported(_) => true,
+            Artifact::Absent | Artifact::Unavailable => false,
+        };
+        if !unknown(&evidence.stage) {
+            return None;
+        }
+        // Normalization can duplicate a canonical obstruction into the stage
+        // field. Attribute it to the stage only if that slot actually holds it.
+        let stage = if evidence.stage == evidence.retained {
+            artifact(&self.stage_path(*at))
+        } else {
+            evidence.stage.clone()
+        };
+        unknown(&stage).then_some(stage)
     }
 
     fn durability_barrier(&mut self, step: &PreparedStep, observed: &Evidence) -> BarrierOutcome {

@@ -23,6 +23,7 @@ pub enum BackupSlot {
     Step,
     Displaced,
     AlternateDisplaced,
+    StageDisplaced,
 }
 
 /// Opaque operation-owned backup reference. It never resolves a caller string.
@@ -140,6 +141,18 @@ impl PreparedStep {
             BackupSlot::AlternateDisplaced,
         )
     }
+
+    pub fn stage_displacement(&self) -> Option<BackupRef> {
+        let (stage, _) = self.staged.as_ref()?;
+        matches!(self.spec.pre, PreState::Regular(_)).then(|| {
+            BackupRef::from_record(
+                stage.operation(),
+                stage.ordinal(),
+                stage.direction(),
+                BackupSlot::StageDisplaced,
+            )
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -232,6 +245,15 @@ pub trait CopyEffects {
     /// never write to an alternate slot.
     fn inspect_alternate_displacement(&mut self, _step: &PreparedStep) -> Artifact {
         Artifact::Absent
+    }
+    /// Inspect a physical exchange stage separately from normalized evidence,
+    /// which may carry a valid retention alias or a canonical-slot obstruction.
+    fn inspect_stage_displacement(
+        &mut self,
+        _step: &PreparedStep,
+        _evidence: &Evidence,
+    ) -> Option<Artifact> {
+        None
     }
     fn durability_barrier(&mut self, step: &PreparedStep, observed: &Evidence) -> BarrierOutcome;
     /// Verify a durable pre-image without creating a stage or touching a target.
@@ -479,9 +501,10 @@ fn preserve_displacements<J: Journal, P: CopyEffects>(
     step: &PreparedStep,
     evidence: &Evidence,
 ) -> Result<SlotScan, DeployError> {
-    // Both private slots are independent of the public target, so a failed
+    // Private slots are independent of the public target, so a failed
     // target read must never suppress their inspection.
     let mut found = preserve_canonical_displacement(journal, step, evidence)?;
+    found |= preserve_stage_displacement(journal, port, step, evidence)?;
     match port.inspect_alternate_displacement(step) {
         Artifact::Absent => {
             let mut readable = evidence.clone();
@@ -523,6 +546,24 @@ fn preserve_displacements<J: Journal, P: CopyEffects>(
     } else {
         SlotScan::Clean
     })
+}
+
+pub(crate) fn preserve_stage_displacement<J: Journal, P: CopyEffects>(
+    journal: &mut J,
+    port: &mut P,
+    step: &PreparedStep,
+    evidence: &Evidence,
+) -> Result<bool, DeployError> {
+    let Some(at) = step.stage_displacement() else {
+        return Ok(false);
+    };
+    let Some(retained) = port.inspect_stage_displacement(step, evidence) else {
+        return Ok(false);
+    };
+    let mut evidence = evidence.clone();
+    evidence.retained = retained;
+    journal.block_displacement(step.op, step, at, &evidence)?;
+    Ok(true)
 }
 
 pub(crate) fn preserve_canonical_displacement<J: Journal>(

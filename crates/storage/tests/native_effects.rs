@@ -15,8 +15,8 @@ use marduk_core::deployment::{
 use marduk_core::ids::{InstalledRevisionId, MemberId, ProfileId, ProfileRevision};
 use marduk_core::profiles::{ProfileMember, ProfileSnapshot};
 use marduk_core::recovery::{
-    Artifact, BarrierOutcome, Claim, CopyEffects, EffectOutcome, Evidence, Journal, PreImage,
-    PreparedStep, StepDirection, StepOutput, StepPhase, StepSpec,
+    Artifact, BackupSlot, BarrierOutcome, Claim, CopyEffects, EffectOutcome, Evidence, Journal,
+    PreImage, PreparedStep, StepDirection, StepOutput, StepPhase, StepSpec,
 };
 use marduk_core::resolve::ResolvedInputs;
 use marduk_core::root_identity::{Fingerprint, GameLayout, RootError, RootIdentity};
@@ -333,10 +333,7 @@ fn payload_changed_after_import_is_refused_at_preview_and_apply() {
     assert!(!ops.exists(), "apply created an operation directory");
 }
 
-#[test]
-#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
-fn restart_after_apply_before_ack_rolls_back_and_never_reapplies() {
-    let fixture = Fixture::new();
+fn publish_winner_before_ack(fixture: &Fixture) -> PreparedStep {
     let mut journal = fixture.journal();
     let mut port = fixture.adapter();
     let plan = marduk_core::deployment::preview_deployment(
@@ -410,10 +407,14 @@ fn restart_after_apply_before_ack_rolls_back_and_never_reapplies() {
     ));
     assert_eq!(fs::read(fixture.target(WINNER)).unwrap(), POST);
 
-    // Crash after the durable effect but before the step records `Applied`.
-    drop(port);
-    drop(journal);
+    step.clone()
+}
 
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn restart_after_apply_before_ack_rolls_back_and_never_reapplies() {
+    let fixture = Fixture::new();
+    let op = publish_winner_before_ack(&fixture).op;
     let mut journal = OperationJournal::open(&fixture.app).unwrap();
     let mut port = fixture.adapter();
     let status = marduk_core::recovery::recover_pending(
@@ -442,6 +443,63 @@ fn restart_after_apply_before_ack_rolls_back_and_never_reapplies() {
     );
     assert_eq!(fs::read(fixture.target(WINNER)).unwrap(), BASE);
     assert!(!fixture.target(ONLY_A).exists());
+}
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn foreign_stage_displacement_is_reported_and_stays_latched_after_reopen() {
+    let fixture = Fixture::new();
+    let step = publish_winner_before_ack(&fixture);
+    let directory = fixture.effect_dir(step.op, step.ordinal);
+    let stage = directory.join("stage");
+    let displaced = directory.join("displaced");
+    fs::rename(&stage, &displaced).unwrap();
+    fs::write(&stage, EDIT).unwrap();
+    let foreign = marduk_platform::effects::fingerprint_path(&stage).unwrap();
+    let recover = |journal: &mut OperationJournal| {
+        let mut port = fixture.adapter();
+        marduk_core::recovery::recover_pending(
+            journal,
+            &mut port,
+            &fixture.installation,
+            &fixture.data,
+        )
+        .unwrap()
+        .unwrap()
+    };
+
+    let mut journal = OperationJournal::open(&fixture.app).unwrap();
+    let status = recover(&mut journal);
+    assert_eq!(status.blocker, Some(DeployError::RecoveryConflict));
+    assert!(journal.has_unresolved_displacement(step.op).unwrap());
+    let reports = journal.unexpected_displacements(step.op).unwrap();
+    let [(at, evidence)] = reports.as_slice() else {
+        panic!("expected exactly one stage report: {reports:?}");
+    };
+    assert_eq!(at.slot(), BackupSlot::StageDisplaced);
+    assert_eq!(evidence.retained, Artifact::Regular(foreign));
+    assert!(status.retained.contains(at));
+    assert_eq!(fs::read(&stage).unwrap(), EDIT);
+    assert_eq!(fs::read(&displaced).unwrap(), BASE);
+    drop(journal);
+
+    // Restore a clean exchange shape without discarding either object. A
+    // readable scan cannot clear the operator-review latch.
+    let held = directory.join("operator-copy");
+    fs::rename(&stage, &held).unwrap();
+    fs::rename(&displaced, &stage).unwrap();
+    let mut journal = OperationJournal::open(&fixture.app).unwrap();
+    assert!(journal.has_unresolved_displacement(step.op).unwrap());
+    let status = recover(&mut journal);
+    assert_eq!(status.blocker, Some(DeployError::RecoveryConflict));
+    assert!(status.retained.contains(at));
+    assert_eq!(journal.unexpected_displacements(step.op).unwrap(), reports);
+    assert_eq!(fs::read(&held).unwrap(), EDIT);
+    assert_eq!(fs::read(&stage).unwrap(), BASE);
+    assert_eq!(fs::read(fixture.target(WINNER)).unwrap(), POST);
+    println!(
+        "stage displacement: RecoveryConflict, slot=stage, latch survives reopen, all bytes preserved"
+    );
 }
 
 fn inputs_three() -> ResolvedInputs {

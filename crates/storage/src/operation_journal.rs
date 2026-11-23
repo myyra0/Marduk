@@ -1850,13 +1850,13 @@ fn owned_displacements(
             1 => row.undo.as_ref().ok_or(DeployError::Io)?,
             _ => return Err(DeployError::Io),
         };
-        // Only the sealed canonical retain and its deterministic alternate are
-        // displacement locations. Any other reported ref stays a blocker (the
-        // evidence row still prevents finalization) but is never advertised.
+        // A forged reference remains a blocker but is not an owned location.
         if latest.at.operation() == op
             && latest.at.ordinal() == latest.ordinal
             && latest.at.direction() == step.direction
-            && (latest.at == step.retain || latest.at == step.alternate_displacement())
+            && (latest.at == step.retain
+                || latest.at == step.alternate_displacement()
+                || Some(latest.at) == step.stage_displacement())
         {
             owned.push((latest.at, latest.evidence));
         }
@@ -2522,6 +2522,7 @@ fn encode_backup(at: BackupRef) -> Vec<u8> {
         BackupSlot::Step => 1,
         BackupSlot::Displaced => 2,
         BackupSlot::AlternateDisplaced => 3,
+        BackupSlot::StageDisplaced => 4,
     });
     out
 }
@@ -2540,6 +2541,7 @@ fn decode_backup(blob: &[u8]) -> Result<BackupRef, DeployError> {
         1 => BackupSlot::Step,
         2 => BackupSlot::Displaced,
         3 => BackupSlot::AlternateDisplaced,
+        4 => BackupSlot::StageDisplaced,
         _ => return Err(DeployError::Io),
     };
     reader.finish()?;

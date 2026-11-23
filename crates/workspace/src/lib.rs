@@ -323,6 +323,7 @@ pub enum Slot {
     /// Detection-only location positively observed during recovery. It is a
     /// report location, never a publication destination.
     Alternate,
+    Stage,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -1155,6 +1156,7 @@ fn retained(retained: BackupRef) -> Option<Retained> {
         BackupSlot::Step => Slot::Step,
         BackupSlot::Displaced => Slot::Displaced,
         BackupSlot::AlternateDisplaced => Slot::Alternate,
+        BackupSlot::StageDisplaced => Slot::Stage,
     };
     Some(Retained {
         operation_id: decimal(retained.operation().get()),
@@ -1469,6 +1471,12 @@ mod tests {
                 serde_json::to_value(expected).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn stage_displacement_is_reported_as_stage() {
+        let dto = retained(backup(BackupSlot::StageDisplaced)).unwrap();
+        assert_eq!(serde_json::to_value(dto).unwrap()["slot"], "stage");
     }
 
     #[test]

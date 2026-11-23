@@ -69,6 +69,14 @@ describe('Rust-generated wire fixtures', () => {
     });
   });
 
+  it('parses a reported stage displacement without relabeling the slot', () => {
+    const reported = draft(statusFixture, (value) => {
+      value.result.pending.retained[0].slot = 'stage';
+    });
+    const envelope = parseEnvelope(reported, parseWorkspaceStatus);
+    expect(envelope.ok && envelope.result.pending?.retained[0].slot).toBe('stage');
+  });
+
   it('parses the bare progress channel payload', () => {
     expect(progressFixture).toEqual({
       operationId: '9223372036854775801',

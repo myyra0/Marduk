@@ -139,6 +139,7 @@ impl ProofSession {
             BackupSlot::Original => directory.join("original"),
             BackupSlot::Step => directory.join("step"),
             BackupSlot::AlternateDisplaced => directory.join("alternate"),
+            BackupSlot::StageDisplaced => directory.join("stage"),
             BackupSlot::Displaced => {
                 let exchange = self
                     .records

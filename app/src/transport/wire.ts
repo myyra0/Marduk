@@ -115,7 +115,7 @@ export type Retained = {
   operationId: Id;
   ordinal: number;
   direction: 'forward' | 'undo';
-  slot: 'original' | 'step' | 'displaced' | 'alternate';
+  slot: 'original' | 'step' | 'displaced' | 'alternate' | 'stage';
 };
 
 export type Operation = {
@@ -400,7 +400,7 @@ export function parseOperation(value: unknown, field = 'operation'): Operation {
         ),
         slot: oneOf(
           retained.slot,
-          ['original', 'step', 'displaced', 'alternate'] as const,
+          ['original', 'step', 'displaced', 'alternate', 'stage'] as const,
           `${retainedField}.slot`,
         ),
       };
