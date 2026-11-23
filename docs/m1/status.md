@@ -1,7 +1,7 @@
 # M1 status
 
-Every M1 task is delivered. What remains is evidence that was deferred by decision, and the
-independent acceptance review.
+Every M1 task is delivered, and M1 is accepted at `9418548` with the gaps in [limitations](limitations.md).
+What remains is evidence deferred by decision, not acceptance.
 
 ## Task list
 
@@ -14,7 +14,7 @@ independent acceptance review.
 | 5 | Native effect outcomes and durable library staging | done; Linux tmpfs/Btrfs and Windows NTFS |
 | 6 | Operation journal, copy adapter, fault tests | done |
 | 7 | CLI and desktop shell over one typed API | done |
-| 8 | Final SHA, evidence, remaining gates, independent review | **open: review** |
+| 8 | Final SHA, evidence, remaining gates, independent review | accepted by a Sol pass |
 
 Nothing in the task list is left to implement.
 
@@ -22,9 +22,8 @@ Nothing in the task list is left to implement.
 
 | Item | Kind | Blocks "M1 done"? |
 |---|---|---|
-| Independent Sol whole-packet review | acceptance | yes — it is the acceptance step |
-| Crash and power-cut recovery | deferred evidence | yes — M1's acceptance names recovery |
-| Real Skyrim SE install | deferred evidence | only if M1 is claimed as real-world verified |
+| Crash and power-cut recovery | deferred evidence | no — accepted without it; not claimed |
+| Real Skyrim SE install | deferred evidence | no — not claimed |
 | Windows namespace barrier experiment | deferred evidence | no — the narrowed guarantee stands |
 | ext4 | excluded | no, if declared out of scope |
 | Btrfs cross-subvolume | not run | no, if declared out of scope |

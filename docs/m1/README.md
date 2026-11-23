@@ -3,9 +3,9 @@
 M1 is the first usable slice of Marduk: one Skyrim SE installation, ZIP import, load order,
 conflict preview, journaled deploy and restore, a CLI and a desktop shell.
 
-**Status: implemented and running, but not gate-accepted.** The last independent review was a
-DeepSeek pass; it blocked, and every finding it raised has been fixed with a witness or a native
-run. The required independent **Sol** review has **not** run, so M1 has not been accepted.
+**Status: accepted.** A Sol whole-packet pass accepted the code at `9418548`, with the gaps listed in
+[limitations](limitations.md) named rather than hidden. That acceptance covers the M1 workflow on
+Linux tmpfs/Btrfs and Windows NTFS, not the deferred evidence below.
 
 ## What works
 
@@ -44,10 +44,10 @@ end-to-end desktop write run.
 |---|---|
 | Sol whole-packet review at `15e885b` | blocked; findings fixed |
 | DeepSeek whole-packet review at `7edccc8` | blocked; finding fixed |
-| Sol whole-packet review at `6df9342` | blocked; findings resolved by the single-client simplification; re-review pending |
-
-The project's rule is that the final whole-packet review is a Sol pass. That pass is running against
-the current commit; until it returns a verdict, no document or reply may call M1 accepted.
+| Sol whole-packet review at `6df9342` | blocked; findings resolved by the single-client simplification |
+| Sol focused review of the cleanup at `59915e3` | blocked; lock/marker/recovery redesign implemented |
+| DeepSeek whole-packet review at `e3a924d` | accepted with two documentation minors, fixed at `9418548` |
+| Sol whole-packet review at `9418548` | **accepted** |
 
 ## The documents
 

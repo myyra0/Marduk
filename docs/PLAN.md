@@ -282,6 +282,11 @@ private-view support follows without changing the parity target:
 If an intermediate release excludes a retained feature, record that scope explicitly and keep the missing capability tracked.
 Completion of an intermediate stage is not permission to silently discard deferred functionality.
 
+M1 is accepted at `9418548` by a Sol whole-packet pass. The acceptance covers the M1 workflow on
+Linux tmpfs/Btrfs and Windows NTFS. It does not claim power-cut durability, a real Skyrim SE write,
+ext4, Btrfs cross-subvolume, an installed-shell write path or the Windows launched shell; those gaps
+are recorded in `docs/m1/limitations.md` and stay tracked for the stages that own them.
+
 ## 15. Naming and branding
 
 The application is **Marduk**. Use a placeholder icon until the final icon is supplied; the visual identity is handled separately.
