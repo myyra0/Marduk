@@ -94,6 +94,17 @@ rolled back or resumed after a crash or interruption. Restore must always work.
 
 Windows and Linux are both first-class from day one. OS-specific behaviour lives only in the platform adapter. Platform code is unverified until the Windows and Linux CI matrix is green.
 
+### Windows test VM
+
+A local, disposable Windows VM provides native NTFS evidence. It is isolated from the host and holds no real data; do not reuse its password anywhere else.
+
+- Libvirt: `virsh -c qemu:///system list --all`; domain `win10-ltsc`; `start` and `destroy` control it.
+- SSH: `admin@192.168.122.50`, password `0000`. For non-interactive use, put the password in an askpass script and run
+  `SSH_ASKPASS=<script> SSH_ASKPASS_REQUIRE=force setsid -w ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password -o PubkeyAuthentication=no admin@192.168.122.50 <command>`.
+- Checkout: `C:\marduk`. Sync one commit with `git archive HEAD | gzip`, copy it over, then `rmdir /s /q C:\marduk\crates` and `tar -xmzf` in `C:\marduk`. Git archive preserves mtimes; without the rmdir, Cargo silently reuses stale rlibs.
+- Run tests through a scheduled task as `admin` (`schtasks /ru admin /rp 0000`), redirect to a log on the VM, then read the log. `cargo clean` once if crate metadata is corrupted (`E0786`/`LNK1207`).
+- Treat any Windows result as evidence only when the log names the test and its `test result:` line; an advisory CI job is not a substitute.
+
 ## Mod ordering
 
 As in MO2: lower-priority mods at the top, higher-priority mods (which overwrite them) at the bottom.

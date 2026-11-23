@@ -41,6 +41,10 @@ refuses to retry automatically. It does not claim prevention.
 - **Real game smoke.** No real Skyrim SE install has been exercised; every fixture is synthetic.
 - **ext4.** Excluded by decision; Linux deployment is qualified on Btrfs and tmpfs only.
 - **Btrfs cross-subvolume.** The two-subvolume layout could not be torn down in the test environment.
+- **Desktop write path end to end.** The installed shell is proven to launch and answer `status`.
+  Import, deploy and restore use the same shared workspace and are checked statically and by the
+  frontend tests against a fake transport, but no installed-shell run has driven them. A golden
+  desktop-and-CLI workflow closes it.
 - **Windows launched shell.** The smoke job exists and runs; on a headless hosted runner the webview
   exposes no debugging port (`DevToolsActivePort`). The job is advisory and proves nothing there.
 

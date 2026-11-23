@@ -35,17 +35,19 @@ run. The required independent **Sol** review has **not** run, so M1 has not been
 ## What is not proven
 
 See [limitations](limitations.md). In short: a real power cut, the stricter Windows namespace
-barrier, a real Skyrim SE install, ext4, Btrfs cross-subvolume, and the Windows launched shell.
+barrier, a real Skyrim SE install, ext4, Btrfs cross-subvolume, the Windows launched shell, and an
+end-to-end desktop write run.
 
 ## Review status
 
 | Review | Result |
 |---|---|
-| Final independent review (DeepSeek) | blocked; findings fixed |
-| Independent Sol whole-packet review | **not run** |
+| Sol whole-packet review at `15e885b` | blocked; findings fixed |
+| DeepSeek whole-packet review at `7edccc8` | blocked; finding fixed |
+| Sol whole-packet review at `6df9342` | blocked; fixes in progress, desktop workflow recorded as a gap |
 
-The project's rule is that the final whole-packet review is a Sol pass. It has not happened, so no
-document or reply may call M1 accepted.
+The project's rule is that the final whole-packet review is a Sol pass. That pass is running against
+the current commit; until it returns a verdict, no document or reply may call M1 accepted.
 
 ## The documents
 
