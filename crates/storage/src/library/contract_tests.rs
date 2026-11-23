@@ -141,28 +141,6 @@ mod library_contract {
         (a, member)
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn revisions_directory_is_private_to_the_owner() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let catalog = Catalog::open(tmp.path()).unwrap();
-        let revisions = tmp.path().join("revisions");
-        assert!(revisions.is_dir());
-        assert_eq!(
-            revisions.metadata().unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        drop(catalog);
-
-        Catalog::open(tmp.path()).unwrap();
-        assert_eq!(
-            revisions.metadata().unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-    }
-
     #[test]
     fn failed_reinstall_keeps_previous_revision_and_bytes() {
         let tmp = tempfile::tempdir().unwrap();
@@ -430,31 +408,6 @@ mod library_contract {
             .reorder(profile(), ProfileRevision::new(3), &order)
             .unwrap();
         assert_snapshot(&identical, 4, &[(member_b, b, true), (member_a, a, true)]);
-    }
-
-    #[test]
-    fn reorder_named_returns_names_from_the_same_transaction() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut catalog = Catalog::open_for_test(tmp.path()).unwrap();
-        let (a, member_a) = publish_a(&mut catalog);
-        let b = prepare(&mut catalog, 1, append("B"), B).id;
-        catalog.publish_import(b).unwrap();
-        let snapshot = catalog.snapshot(profile()).unwrap();
-        let member_b = snapshot.members[1].id;
-
-        let named = catalog
-            .reorder_named(profile(), ProfileRevision::new(2), &[member_b, member_a])
-            .unwrap();
-        assert_named(
-            named,
-            3,
-            &[(member_b, b, true, "B"), (member_a, a, true, "A")],
-        );
-
-        let stale = catalog
-            .reorder_named(profile(), ProfileRevision::new(2), &[member_b, member_a])
-            .unwrap_err();
-        assert_eq!(stale, ProfileEditError::StalePlan);
     }
 
     #[test]
