@@ -281,20 +281,7 @@ pub fn replace(
             if !resume {
                 return Err(RootError::Io);
             }
-            // Bind the timestamp authority while both objects still have the
-            // names they were observed under. A denied attribute write must
-            // fail here, before any public name moves.
-            let displaced_file = timestamp_authority(&displaced)?;
-            let staged_file = timestamp_authority(stage_path)?;
-            let staged_creation = creation_time(&staged_file)?;
-            let displaced_creation = creation_time(&displaced_file)?;
-            move_path_noreplace(stage_path, target_path).map_err(|_| RootError::Io)?;
-            if displaced.as_path() != retain_path {
-                move_path_noreplace(&displaced, retain_path).map_err(|_| RootError::Io)?;
-            }
-            restore_creation_time(&staged_file, staged_creation)?;
-            restore_creation_time(&displaced_file, displaced_creation)?;
-            return Ok(());
+            return complete_interrupted_replace(stage_path, target_path, &displaced, retain_path);
         }
         // NTFS tunneling re-applies the creation time of a name removed within
         // the last ~15 s to the next object added under it, including a rename.
@@ -318,6 +305,38 @@ pub fn replace(
         restore_creation_time(&displaced_file, displaced_creation)?;
         Ok(())
     }
+}
+
+/// Complete a checked Windows exchange without ever moving an occupied target.
+#[cfg(windows)]
+pub fn complete_interrupted_replace(
+    stage: &std::path::Path,
+    target: &std::path::Path,
+    displaced: &std::path::Path,
+    retain: &std::path::Path,
+) -> Result<(), RootError> {
+    let displaced_file = timestamp_authority(displaced)?;
+    let staged_file = timestamp_authority(stage)?;
+    let staged_creation = creation_time(&staged_file)?;
+    let displaced_creation = creation_time(&displaced_file)?;
+    move_path_noreplace(stage, target).map_err(|_| RootError::Io)?;
+    if displaced != retain {
+        move_path_noreplace(displaced, retain).map_err(|_| RootError::Io)?;
+    }
+    restore_creation_time(&staged_file, staged_creation)?;
+    restore_creation_time(&displaced_file, displaced_creation)
+}
+
+/// Revert a checked Windows exchange's first rename, leaving the stage alone.
+#[cfg(windows)]
+pub fn revert_interrupted_replace(
+    displaced: &std::path::Path,
+    target: &std::path::Path,
+) -> Result<(), RootError> {
+    let file = timestamp_authority(displaced)?;
+    let creation = creation_time(&file)?;
+    move_path_noreplace(displaced, target).map_err(|_| RootError::Io)?;
+    restore_creation_time(&file, creation)
 }
 
 /// Move the existing target at `target_dir/leaf` into `displaced_dir` without

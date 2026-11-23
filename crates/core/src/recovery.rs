@@ -189,6 +189,12 @@ pub enum BarrierOutcome {
     Ambiguous(Evidence),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterruptedExchange {
+    Complete,
+    Revert,
+}
+
 /// Checked native effect seam. Handles stay in the adapter's lease-scoped
 /// session; core supplies only prepared intents and owns no native path.
 pub trait CopyEffects {
@@ -208,6 +214,13 @@ pub trait CopyEffects {
         staged: StageRef,
         retain: BackupRef,
     ) -> EffectOutcome;
+    fn resume_interrupted_exchange(
+        &mut self,
+        step: &PreparedStep,
+        _action: InterruptedExchange,
+    ) -> EffectOutcome {
+        EffectOutcome::Conflict(self.inspect_step(step))
+    }
     fn detach_existing_retain(
         &mut self,
         target: &BoundTarget,
@@ -609,9 +622,26 @@ fn recover_deploy<J: Journal, P: CopyEffects>(
                 Ok(evidence) => evidence,
                 Err(error) => return blocked(journal, op, error),
             };
-            if evidence.target == as_observation(&forward.spec.pre) {
-                let result = check_pre(port, forward, &evidence);
-                result.and_then(|()| {
+            let interrupted = row.phase == StepPhase::Attempting
+                && matches_interrupted_exchange(forward, &evidence);
+            if interrupted || evidence.target == as_observation(&forward.spec.pre) {
+                (|| {
+                    let evidence = if interrupted {
+                        check_recoverable_pre(port, forward, &evidence, true)?;
+                        let outcome =
+                            port.resume_interrupted_exchange(forward, InterruptedExchange::Revert);
+                        let evidence = inspect_checked(journal, port, forward)?;
+                        match outcome {
+                            EffectOutcome::Observed(receipt) if receipt == evidence => evidence,
+                            EffectOutcome::Unavailable(error) => {
+                                return Err(crate::deployment::map_root_error(error));
+                            }
+                            _ => return Err(observation_error(&evidence.target)),
+                        }
+                    } else {
+                        evidence
+                    };
+                    check_pre(port, forward, &evidence)?;
                     if row.phase == StepPhase::Undone {
                         return Ok(());
                     }
@@ -627,7 +657,7 @@ fn recover_deploy<J: Journal, P: CopyEffects>(
                         StepPhase::Undone,
                         Some(durable),
                     )
-                })
+                })()
             } else {
                 (|| {
                     if !matches!(row.phase, StepPhase::Attempting | StepPhase::Applied) {
@@ -701,7 +731,9 @@ fn resume_undo<J: Journal, P: CopyEffects>(
     ) {
         return Err(observation_error(&evidence.target));
     }
-    check_pre(port, undo, &evidence)?;
+    let interrupted =
+        row.phase == StepPhase::UndoAttempting && matches_interrupted_exchange(undo, &evidence);
+    check_recoverable_pre(port, undo, &evidence, interrupted)?;
     if row.phase != StepPhase::UndoAttempting {
         journal.record_step(
             undo.op,
@@ -711,7 +743,13 @@ fn resume_undo<J: Journal, P: CopyEffects>(
             None,
         )?;
     }
-    let outcome = crate::deployment::execute_undo(port, undo)?;
+    // For an undo already in flight, completing its exchange restores the
+    // forward step's pre-image; reverting it would restore the deployed file.
+    let outcome = if interrupted {
+        port.resume_interrupted_exchange(undo, InterruptedExchange::Complete)
+    } else {
+        crate::deployment::execute_undo(port, undo)?
+    };
     let evidence = crate::deployment::effect_evidence(journal, port, undo.op, undo, outcome)?;
     check_post(port, undo, &evidence)?;
     let durable = barrier(journal, port, undo, &evidence)?;
@@ -781,7 +819,9 @@ fn recover_restore<J: Journal, P: CopyEffects>(
                     )?;
                 }
             } else {
-                check_pre(port, step, &evidence)?;
+                let interrupted =
+                    from == StepPhase::Attempting && matches_interrupted_exchange(step, &evidence);
+                check_recoverable_pre(port, step, &evidence, interrupted)?;
                 if from != StepPhase::Attempting {
                     journal.record_step(
                         op,
@@ -791,7 +831,11 @@ fn recover_restore<J: Journal, P: CopyEffects>(
                         (from == StepPhase::Applied).then_some(evidence),
                     )?;
                 }
-                let outcome = crate::deployment::execute(port, step)?;
+                let outcome = if interrupted {
+                    port.resume_interrupted_exchange(step, InterruptedExchange::Complete)
+                } else {
+                    crate::deployment::execute(port, step)?
+                };
                 crate::deployment::settle_forward(journal, port, op, step, outcome)?;
             }
             Ok(())
@@ -834,7 +878,9 @@ fn classify_deploy<P: CopyEffects>(port: &mut P, scans: &[ScannedRow]) -> Result
             classify_undo(port, row.phase, undo, evidence)?;
             continue;
         }
-        if evidence.target == as_observation(&forward.spec.pre) {
+        if row.phase == StepPhase::Attempting && matches_interrupted_exchange(forward, evidence) {
+            check_recoverable_pre(port, forward, evidence, true)?;
+        } else if evidence.target == as_observation(&forward.spec.pre) {
             if !matches!(
                 row.phase,
                 StepPhase::Ready | StepPhase::Attempting | StepPhase::Undone
@@ -886,7 +932,7 @@ fn classify_undo<P: CopyEffects>(
     ) {
         return Err(observation_error(&evidence.target));
     }
-    check_pre(port, undo, evidence)
+    check_recoverable_pre(port, undo, evidence, phase == StepPhase::UndoAttempting)
 }
 
 /// Read-only, phase-aware continuation check for every Restore row.
@@ -910,7 +956,7 @@ fn classify_restore<P: CopyEffects>(port: &mut P, scans: &[ScannedRow]) -> Resul
             }
             check_post(port, step, evidence)?;
         } else {
-            check_pre(port, step, evidence)?;
+            check_recoverable_pre(port, step, evidence, row.phase == StepPhase::Attempting)?;
         }
     }
     Ok(())
@@ -960,11 +1006,29 @@ pub(crate) fn check_pre<P: CopyEffects>(
     step: &PreparedStep,
     evidence: &Evidence,
 ) -> Result<(), DeployError> {
-    if !matches_pre(step, evidence) {
+    check_recoverable_pre(port, step, evidence, false)
+}
+
+fn check_recoverable_pre<P: CopyEffects>(
+    port: &mut P,
+    step: &PreparedStep,
+    evidence: &Evidence,
+    allow_interrupted: bool,
+) -> Result<(), DeployError> {
+    if !(matches_pre(step, evidence)
+        || allow_interrupted && matches_interrupted_exchange(step, evidence))
+    {
         return Err(observation_error(&evidence.target));
     }
     check_backup(port, &step.spec.original)?;
     check_backup(port, &step.step_pre)
+}
+
+pub fn matches_interrupted_exchange(step: &PreparedStep, evidence: &Evidence) -> bool {
+    matches!((&step.spec.pre, &step.staged), (PreState::Regular(pre), Some((_, staged)))
+        if evidence.target == Observation::Absent
+            && matches!(&evidence.stage, Artifact::Regular(actual) if actual == staged)
+            && matches!(&evidence.retained, Artifact::Regular(actual) if actual == pre))
 }
 
 /// Compare recorded evidence against the complete pre-effect namespace.

@@ -521,6 +521,28 @@ impl CopyEffects for Effects {
         self.mutate(Mutation::Detach, target, Some(expected), None, Some(retain))
     }
 
+    fn resume_interrupted_exchange(
+        &mut self,
+        step: &PreparedStep,
+        action: InterruptedExchange,
+    ) -> EffectOutcome {
+        let evidence = self.inspect_step(step);
+        if !matches_interrupted_exchange(step, &evidence) {
+            return EffectOutcome::Conflict(evidence);
+        }
+        let file = match action {
+            InterruptedExchange::Complete => {
+                take(&mut self.visible.staged, step.staged.as_ref().unwrap().0)
+            }
+            InterruptedExchange::Revert => take(&mut self.visible.backups, step.retain),
+        };
+        self.visible.public.insert(
+            step.spec.target.target.relative.as_str().into(),
+            file.unwrap(),
+        );
+        EffectOutcome::Observed(self.inspect_step(step))
+    }
+
     fn inspect_step(&mut self, step: &PreparedStep) -> Evidence {
         // A reopened fake recognizes the persisted receipt when a later
         // recovery must execute a still-ready step; it does not re-prepare it.
@@ -1260,6 +1282,56 @@ fn cut_after_publish_before_ack() {
     );
     f.root_state(None, None);
     assert_eq!(f.effects.mutations.len(), 4);
+}
+
+#[test]
+fn interrupted_exchange_rolls_back_deploy_and_continues_restore() {
+    for restoring in [false, true] {
+        let mut f = Fixture::new(WINNER);
+        let (op, kind, phase, pre, post) = if restoring {
+            f.deploy();
+            (
+                f.cut_restore(),
+                OperationKind::Restore,
+                Phase::Completed,
+                B,
+                BASE,
+            )
+        } else {
+            let plan = f.plan();
+            (
+                f.cut_apply(plan, Cut::BeforeWinnerAck),
+                OperationKind::Deploy,
+                Phase::RolledBack,
+                BASE,
+                B,
+            )
+        };
+        let step = &f.journal.durable.steps[&op]
+            .iter()
+            .find(|row| row.prepared.spec.target.target.relative.as_str() == WINNER)
+            .unwrap()
+            .prepared;
+        let stage = step.staged.as_ref().unwrap().0;
+        let retain = step.retain;
+        let cut = &mut f.effects.durable;
+        let staged = cut.public.remove(WINNER).unwrap();
+        assert_eq!(staged.bytes, post);
+        cut.staged.push((stage, staged));
+        assert_eq!(lookup(&cut.backups, retain).unwrap().bytes, pre);
+
+        f.boot();
+        f.assert_resolved(op, kind, phase, None);
+        assert_eq!(f.effects.visible.public[WINNER].bytes, BASE, "{kind:?}");
+        assert_eq!(
+            lookup(&f.effects.visible.staged, stage).map(|file| file.bytes),
+            (!restoring).then_some(post)
+        );
+        assert_eq!(
+            lookup(&f.effects.visible.backups, retain).map(|file| file.bytes),
+            restoring.then_some(pre)
+        );
+    }
 }
 
 #[test]

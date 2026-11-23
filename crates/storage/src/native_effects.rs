@@ -25,8 +25,11 @@ use marduk_core::deployment::{
 use marduk_core::ids::{InstalledRevisionId, ProfileId, ProfileRevision};
 use marduk_core::recovery::{
     Artifact, BackupRef, BackupSlot, BarrierOutcome, CopyEffects, EffectOutcome, Evidence,
-    Observation, PreImage, PreparedStep, StageRef, StepDirection, StepOutput, StepSpec,
+    InterruptedExchange, Observation, PreImage, PreparedStep, StageRef, StepDirection, StepOutput,
+    StepSpec,
 };
+#[cfg(windows)]
+use marduk_core::recovery::{matches_interrupted_exchange, matches_post, matches_pre};
 use marduk_core::root_identity::{
     FileMetadata, Fingerprint, GameLayout, NativeIdentity, RootError, RootIdentity,
     TargetObservation, UnsupportedReason,
@@ -1054,6 +1057,66 @@ impl CopyEffects for NativeEffects {
         retain: BackupRef,
     ) -> EffectOutcome {
         self.exchange_target(target, expected, staged, retain)
+    }
+
+    #[cfg(windows)]
+    fn resume_interrupted_exchange(
+        &mut self,
+        step: &PreparedStep,
+        action: InterruptedExchange,
+    ) -> EffectOutcome {
+        let bound = (|| {
+            let resolved = self.resolved(&step.spec.target)?;
+            let target = resolved.public_path();
+            let private = self.op_dir(step.op.get(), step.ordinal, step.direction);
+            if !same_rename_domain(
+                &effects::directory_identity(&private)?,
+                resolved.parent_identity(),
+            ) {
+                return Err(RootError::OutsideBoundary);
+            }
+            let directory = Self::effect_directory(
+                resolved.parent_dir()?,
+                &target,
+                resolved.parent_identity(),
+            )?;
+            Ok((directory, effects::open_directory(&private)?, target))
+        })();
+        let (_directory, _private, target) = match bound {
+            Ok(bound) => bound,
+            Err(error) => return EffectOutcome::Unavailable(error),
+        };
+        let evidence = self.evidence_for_step(step);
+        if let Observation::Unavailable(error) = evidence.target {
+            return EffectOutcome::Unavailable(error);
+        }
+        if !matches_interrupted_exchange(step, &evidence)
+            || self.inspect_alternate_displacement(step) != Artifact::Absent
+        {
+            return EffectOutcome::Conflict(evidence);
+        }
+        let stage = self.stage_path(step.staged.as_ref().unwrap().0);
+        let displaced = self.backup_path(step.retain);
+        self.trace(ProofEvent::PublicEffect);
+        let result = match action {
+            InterruptedExchange::Complete => {
+                effects::complete_interrupted_replace(&stage, &target, &displaced, &displaced)
+            }
+            InterruptedExchange::Revert => effects::revert_interrupted_replace(&displaced, &target),
+        };
+        let evidence = self.evidence_for_step(step);
+        if let Observation::Unavailable(error) = evidence.target {
+            return EffectOutcome::Unavailable(error);
+        }
+        let settled = match action {
+            InterruptedExchange::Complete => matches_post(step, &evidence),
+            InterruptedExchange::Revert => matches_pre(step, &evidence),
+        };
+        match result {
+            Ok(()) if settled => EffectOutcome::Observed(evidence),
+            Err(_) if settled => EffectOutcome::Ambiguous(evidence),
+            _ => EffectOutcome::Conflict(evidence),
+        }
     }
 
     fn detach_existing_retain(

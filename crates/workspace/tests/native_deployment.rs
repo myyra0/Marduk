@@ -304,6 +304,226 @@ impl Fixture {
     }
 }
 
+#[cfg(windows)]
+#[test]
+#[ignore = "requires native NTFS; spawns separate cut and recovery processes"]
+fn windows_exchange_process_cut() {
+    use marduk_core::deployment::{OperationId, Phase};
+    use marduk_core::recovery::{CopyEffects, EffectOutcome, PreImage, StepDirection, StepOutput};
+    use marduk_core::recovery::{StepPhase, StepSpec};
+    use marduk_games::skyrim_se::LAYOUT;
+    use marduk_storage::native_effects::NativeEffects;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::process::{Command, exit};
+
+    const ROOT: &str = "MARDUK_EXCHANGE_WITNESS_ROOT";
+    const MODE: &str = "MARDUK_EXCHANGE_WITNESS_MODE";
+    const CUT: i32 = 73;
+    let slots = |app: &Path, op: OperationId, ordinal: u32| {
+        app.join(format!("effects/ops/{}/{ordinal}/forward", op.get()))
+    };
+    if let Some(root) = std::env::var_os(ROOT) {
+        let app = PathBuf::from(root);
+        let mut journal = OperationJournal::open(&app).unwrap();
+        let selected = journal.selected_installation().unwrap().unwrap();
+        let op = journal.root_state(&selected.data).unwrap().pending.unwrap();
+        if std::env::var(MODE).unwrap() == "cut" {
+            let step = journal
+                .steps(op)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.phase == StepPhase::Attempting)
+                .unwrap()
+                .prepared;
+            let marduk_core::deployment::PreState::Regular(expected) = &step.spec.pre else {
+                panic!("expected a replace");
+            };
+            // Deny delete sharing on the stage: the real first rename succeeds,
+            // the second refuses. Exit without unwinding or an acknowledgement.
+            let _held = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(3) // FILE_SHARE_READ | FILE_SHARE_WRITE
+                .open(slots(&app, op, step.ordinal).join("stage"))
+                .unwrap();
+            let mut port = NativeEffects::open(&app, &selected.locator, LAYOUT).unwrap();
+            port.inspect_step(&step);
+            assert!(matches!(
+                port.replace_existing_retain_displaced(
+                    &step.spec.target,
+                    expected,
+                    step.staged.as_ref().unwrap().0,
+                    step.retain,
+                ),
+                EffectOutcome::Ambiguous(_)
+            ));
+            exit(CUT);
+        }
+        let mut workspace = Workspace::open(&app).unwrap();
+        let status = workspace.proof_recover_pending().unwrap().unwrap();
+        assert_eq!(status.id, op.get().to_string());
+        assert!(status.blocker.is_none(), "{status:?}");
+        assert!(workspace.proof_recover_pending().unwrap().is_none());
+        println!("NTFS recovery: {:?} {}", status.kind, status.phase);
+        return;
+    }
+
+    for restoring in [false, true] {
+        let mut fixture = Fixture::new();
+        let plan_id = if restoring {
+            fixture.apply_one();
+            None
+        } else {
+            fixture.setup();
+            let (revision, _) = fixture.import_and_order();
+            let preview = fixture
+                .workspace
+                .proof_preview_deployment(ProfileRevision::new(revision))
+                .unwrap();
+            Some(PlanId::try_from_u64(preview.id.unwrap().parse().unwrap()).unwrap())
+        };
+        let mut journal = OperationJournal::open(&fixture.app).unwrap();
+        let selected = journal.selected_installation().unwrap().unwrap();
+        let mut port = NativeEffects::open(&fixture.app, &selected.locator, LAYOUT).unwrap();
+        let (op, phase, specs, pre_bytes, stage_bytes) = if restoring {
+            let generation = journal.root_state(&selected.data).unwrap().active.unwrap();
+            let record = journal.generation(generation).unwrap();
+            let op = journal
+                .claim(Claim::Restore {
+                    installation: selected.installation,
+                    data: selected.data,
+                    generation,
+                })
+                .unwrap();
+            let specs = record
+                .steps
+                .into_iter()
+                .map(|row| {
+                    let step = row.prepared;
+                    let output = step
+                        .spec
+                        .original
+                        .backup
+                        .map_or(StepOutput::Absent, StepOutput::Original);
+                    (
+                        step.ordinal,
+                        StepSpec {
+                            target: step.spec.target,
+                            original: step.spec.original,
+                            pre: marduk_core::deployment::PreState::Regular(step.staged.unwrap().1),
+                            output,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            (op, Phase::Restoring, specs, POST, BASE)
+        } else {
+            let plan = journal.plan(plan_id.unwrap()).unwrap().unwrap();
+            let op = journal.claim(Claim::Deploy(plan.clone())).unwrap();
+            let specs = plan
+                .intents
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, intent)| {
+                    (
+                        ordinal as u32,
+                        StepSpec {
+                            target: intent.target,
+                            original: PreImage {
+                                observation: intent.original.clone(),
+                                backup: None,
+                            },
+                            pre: intent.original,
+                            output: StepOutput::Source(intent.source),
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            (op, Phase::Applying, specs, BASE, POST)
+        };
+        let steps: Vec<_> = specs
+            .iter()
+            .map(|(ordinal, spec)| {
+                port.prepare(op, *ordinal, StepDirection::Forward, spec)
+                    .unwrap()
+            })
+            .collect();
+        let winner = steps
+            .iter()
+            .find(|step| step.staged.is_some() && step.spec.target.leaf == "winner.dds")
+            .unwrap();
+        let ordinal = winner.ordinal;
+        let directory = slots(&fixture.app, op, ordinal);
+        journal.seal(op, steps).unwrap();
+        journal.set_phase(op, Phase::Prepared, phase).unwrap();
+        journal
+            .record_step(op, ordinal, StepPhase::Ready, StepPhase::Attempting, None)
+            .unwrap();
+        drop(port);
+        drop(journal);
+
+        let child = |mode| {
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "windows_exchange_process_cut",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(ROOT, &fixture.app)
+                .env(MODE, mode)
+                .status()
+                .unwrap()
+        };
+        let target = fixture.game.join("Data/textures/winner.dds");
+        let expected_pre = marduk_platform::effects::fingerprint_path(&target).unwrap();
+        let expected_stage =
+            marduk_platform::effects::fingerprint_path(&directory.join("stage")).unwrap();
+        assert_eq!(child("cut").code(), Some(CUT));
+        assert!(!target.exists());
+        assert_eq!(fs::read(directory.join("stage")).unwrap(), stage_bytes);
+        assert_eq!(fs::read(directory.join("displaced")).unwrap(), pre_bytes);
+        assert!(!directory.join("alternate").exists());
+        println!(
+            "NTFS cut {phase:?}: target=absent stage={stage_bytes:?} displaced={pre_bytes:?} alternate=absent"
+        );
+        assert!(child("recover").success());
+        let mut journal = OperationJournal::open(&fixture.app).unwrap();
+        let final_status = journal.status(op).unwrap().unwrap();
+        assert_eq!(
+            final_status.phase,
+            if restoring {
+                Phase::Completed
+            } else {
+                Phase::RolledBack
+            }
+        );
+        assert_eq!(fs::read(&target).unwrap(), BASE);
+        assert!(!fixture.game.join("Data/textures/a-only.dds").exists());
+        if restoring {
+            assert_eq!(
+                marduk_platform::effects::fingerprint_path(&target).unwrap(),
+                expected_stage
+            );
+            assert_eq!(
+                marduk_platform::effects::fingerprint_path(&directory.join("displaced")).unwrap(),
+                expected_pre
+            );
+            assert!(!directory.join("stage").exists());
+        } else {
+            assert_eq!(
+                marduk_platform::effects::fingerprint_path(&target).unwrap(),
+                expected_pre
+            );
+            assert_eq!(
+                marduk_platform::effects::fingerprint_path(&directory.join("stage")).unwrap(),
+                expected_stage
+            );
+            assert!(!directory.join("displaced").exists());
+        }
+        assert!(!directory.join("alternate").exists());
+    }
+}
+
 #[test]
 #[ignore = "requires TMPDIR on tmpfs or Btrfs"]
 fn qualified_native_round_trip_retains_backups_and_restores_the_original_tree() {
