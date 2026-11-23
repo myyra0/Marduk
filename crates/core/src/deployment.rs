@@ -290,6 +290,51 @@ pub fn preview_deployment<J: Journal, P: DeploymentInputs>(
     )
 }
 
+/// One transition the engine actually reaches during an apply or restore.
+///
+/// `completed`/`total` count durable steps only; they are 0 for a replayed
+/// claim, which prepared no steps. A client treats this as a hint, never as
+/// authoritative state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StepEvent {
+    pub operation: OperationId,
+    pub phase: Phase,
+    pub completed: u64,
+    pub total: u64,
+}
+
+impl StepEvent {
+    fn at(operation: OperationId, phase: Phase, completed: u64, total: u64) -> Self {
+        Self {
+            operation,
+            phase,
+            completed,
+            total,
+        }
+    }
+
+    /// The terminal answer of a claim this call did not execute, when that
+    /// answer has a client-visible phase.
+    ///
+    /// Counts are 0: no step ran in this call. A cancelled claim has no wire
+    /// phase and yields `None`.
+    pub fn terminal(status: &OperationStatus) -> Option<Self> {
+        matches!(status.phase, Phase::Completed | Phase::RolledBack).then(|| Self {
+            operation: status.id,
+            phase: status.phase,
+            completed: 0,
+            total: 0,
+        })
+    }
+}
+
+/// Report the recorded terminal answer of a claim this call did not execute.
+fn replay_terminal(status: &OperationStatus, progress: &mut impl FnMut(StepEvent)) {
+    if let Some(event) = StepEvent::terminal(status) {
+        progress(event);
+    }
+}
+
 /// Claim and execute a reviewed deployment plan in canonical target order.
 ///
 /// A recorded claim is returned before gates, revisions or effects are touched.
@@ -299,9 +344,21 @@ pub fn commit_deployment<J: Journal, P: DeploymentInputs>(
     journal: &mut J,
     port: &mut P,
     id: PlanId,
+    cancelled: impl FnMut() -> bool,
+) -> Result<OperationStatus, DeployError> {
+    commit_deployment_with_progress(journal, port, id, cancelled, |_| {})
+}
+
+/// [`commit_deployment`] that reports each transition the engine reaches.
+pub fn commit_deployment_with_progress<J: Journal, P: DeploymentInputs>(
+    journal: &mut J,
+    port: &mut P,
+    id: PlanId,
     mut cancelled: impl FnMut() -> bool,
+    mut progress: impl FnMut(StepEvent),
 ) -> Result<OperationStatus, DeployError> {
     if let Some(status) = journal.claimed(id)? {
+        replay_terminal(&status, &mut progress);
         return Ok(status);
     }
 
@@ -310,6 +367,7 @@ pub fn commit_deployment<J: Journal, P: DeploymentInputs>(
 
     // Recheck under the exclusive lease; another client may have claimed it.
     if let Some(status) = journal.claimed(id)? {
+        replay_terminal(&status, &mut progress);
         return Ok(status);
     }
 
@@ -383,10 +441,11 @@ pub fn commit_deployment<J: Journal, P: DeploymentInputs>(
     }
 
     validate_prepared(journal, port, op, &steps)?;
+    progress(StepEvent::at(op, Phase::Preparing, 0, steps.len() as u64));
     journal.set_phase(op, Phase::Prepared, Phase::Applying)?;
     drop(_library);
 
-    for step in &steps {
+    for (completed, step) in steps.iter().enumerate() {
         journal.record_step(
             op,
             step.ordinal,
@@ -397,6 +456,12 @@ pub fn commit_deployment<J: Journal, P: DeploymentInputs>(
         inspect_effect_ready(journal, port, op, step)?;
         let outcome = execute(port, step)?;
         settle_forward(journal, port, op, step, outcome)?;
+        progress(StepEvent::at(
+            op,
+            Phase::Applying,
+            completed as u64 + 1,
+            steps.len() as u64,
+        ));
     }
 
     // Recheck every visible target, consumed stage and retained pre-image
@@ -409,7 +474,14 @@ pub fn commit_deployment<J: Journal, P: DeploymentInputs>(
         }
     }
 
-    finish(journal, op, Finalize::DeployCommitted)
+    let status = finish(journal, op, Finalize::DeployCommitted)?;
+    progress(StepEvent::at(
+        op,
+        status.phase,
+        steps.len() as u64,
+        steps.len() as u64,
+    ));
+    Ok(status)
 }
 
 /// Restore the committed generation in reverse canonical order.
@@ -423,6 +495,17 @@ pub fn restore<J: Journal, P: DeploymentInputs>(
     installation: &RootIdentity,
     data: &RootIdentity,
 ) -> Result<OperationStatus, DeployError> {
+    restore_with_progress(journal, port, installation, data, |_| {})
+}
+
+/// [`restore`] that reports each transition the engine reaches.
+pub fn restore_with_progress<J: Journal, P: DeploymentInputs>(
+    journal: &mut J,
+    port: &mut P,
+    installation: &RootIdentity,
+    data: &RootIdentity,
+    mut progress: impl FnMut(StepEvent),
+) -> Result<OperationStatus, DeployError> {
     let _root = port.try_root_gate()?;
     port.verify_root(installation, data)?;
 
@@ -431,6 +514,7 @@ pub fn restore<J: Journal, P: DeploymentInputs>(
         journal.verify_pending_pair(op, installation, data)?;
         let status = journal.status(op)?.ok_or(DeployError::UnknownOperation)?;
         if status.kind == OperationKind::Restore {
+            replay_terminal(&status, &mut progress);
             return Ok(status);
         }
         return Err(DeployError::Busy);
@@ -503,10 +587,11 @@ pub fn restore<J: Journal, P: DeploymentInputs>(
         return Err(error);
     }
     validate_prepared(journal, port, op, &steps)?;
+    progress(StepEvent::at(op, Phase::Preparing, 0, steps.len() as u64));
     journal.set_phase(op, Phase::Prepared, Phase::Restoring)?;
     drop(_library);
 
-    for step in &steps {
+    for (completed, step) in steps.iter().enumerate() {
         journal.record_step(
             op,
             step.ordinal,
@@ -517,6 +602,12 @@ pub fn restore<J: Journal, P: DeploymentInputs>(
         inspect_effect_ready(journal, port, op, step)?;
         let outcome = execute(port, step)?;
         settle_forward(journal, port, op, step, outcome)?;
+        progress(StepEvent::at(
+            op,
+            Phase::Restoring,
+            completed as u64 + 1,
+            steps.len() as u64,
+        ));
     }
 
     for step in &steps {
@@ -527,7 +618,14 @@ pub fn restore<J: Journal, P: DeploymentInputs>(
         }
     }
 
-    finish(journal, op, Finalize::RestoreCompleted)
+    let status = finish(journal, op, Finalize::RestoreCompleted)?;
+    progress(StepEvent::at(
+        op,
+        status.phase,
+        steps.len() as u64,
+        steps.len() as u64,
+    ));
+    Ok(status)
 }
 
 /// Inspect a step at the per-step apply boundary. An unreadable target is a

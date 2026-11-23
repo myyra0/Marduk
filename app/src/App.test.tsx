@@ -698,6 +698,7 @@ describe('workspace shell', () => {
   it('reloads authoritative status and operation on a progress gap without retrying', async () => {
     const user = userEvent.setup();
     const status = statusWithEffects();
+    const statusCalls = vi.fn(async () => ({ ok: true as const, result: status }));
     const applying: Operation = { ...fixtureOperation(), phase: 'applying', blocker: null };
     const deployApply = vi.fn(
       async (
@@ -710,7 +711,7 @@ describe('workspace shell', () => {
       },
     );
     const { calls } = await renderReady({
-      status: async () => ({ ok: true, result: status }),
+      status: statusCalls,
       deployPreview: async () => ({ ok: true, result: reviewFor(status) }),
       deployApply,
     });
@@ -726,6 +727,12 @@ describe('workspace shell', () => {
     expect(deployApply).toHaveBeenCalledTimes(1);
     expect(screen.getByText(/Authoritative operation/)).toBeInTheDocument();
     expect(screen.getAllByText(/no write was retried/i).length).toBeGreaterThanOrEqual(1);
+    // The dropped sequence caused exactly one extra authoritative load (the
+    // initial mount, the gap refresh, the post-write refresh) and no repeated
+    // write. A fourth load, a second apply or a restore would be a retry.
+    await waitFor(() => expect(statusCalls).toHaveBeenCalledTimes(3));
+    expect(deployApply).toHaveBeenCalledTimes(1);
+    expect(calls.filter((call) => call.command === 'restore')).toHaveLength(0);
   });
 
   it('reloads authoritative state on duplicate progress without a second apply', async () => {

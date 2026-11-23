@@ -19,7 +19,7 @@ pub use selection::{Purpose, Selection, SelectionId};
 use selection::{SelectionStore, Source};
 
 use marduk_core::deployment::{
-    DeployError, OperationKind, OperationStatus, Phase, PlanId, PreState,
+    DeployError, OperationId, OperationKind, OperationStatus, Phase, PlanId, PreState, StepEvent,
 };
 use marduk_core::ids::{MemberId, ProfileId, ProfileRevision};
 use marduk_core::import::NamedProfile;
@@ -475,6 +475,56 @@ pub struct Progress {
     pub phase: String,
 }
 
+/// The one wire token for a core phase, or nothing when the phase has no
+/// ordered-hint meaning on the client.
+fn phase_token(phase: Phase) -> Option<&'static str> {
+    match phase {
+        Phase::Preparing => Some("preparing"),
+        Phase::Applying => Some("applying"),
+        Phase::Restoring => Some("restoring"),
+        Phase::Completed => Some("completed"),
+        Phase::RolledBack => Some("rolled_back"),
+        Phase::Prepared | Phase::RollingBack | Phase::Cancelled => None,
+    }
+}
+
+/// Number the engine's transitions for one write.
+///
+/// The first operation the engine reports is this call's operation; an event
+/// for any other operation is not part of this channel and is dropped. The
+/// sink cannot influence the operation: [`Self::emit`] returns nothing.
+struct ProgressFeed<S: FnMut(Progress)> {
+    operation: Option<OperationId>,
+    sequence: u64,
+    sink: S,
+}
+
+impl<S: FnMut(Progress)> ProgressFeed<S> {
+    fn new(sink: S) -> Self {
+        Self {
+            operation: None,
+            sequence: 0,
+            sink,
+        }
+    }
+
+    fn emit(&mut self, event: StepEvent) {
+        let operation = *self.operation.get_or_insert(event.operation);
+        if operation != event.operation {
+            return;
+        }
+        let Some(phase) = phase_token(event.phase) else {
+            return;
+        };
+        self.sequence += 1;
+        (self.sink)(Progress {
+            operation_id: decimal(operation.get()),
+            sequence: decimal(self.sequence),
+            phase: phase.to_owned(),
+        });
+    }
+}
+
 /// One shared client service over the authoritative catalog and journal.
 pub struct Workspace {
     /// Absolute catalog root. Also the owner named in the cross-catalog
@@ -551,6 +601,31 @@ impl Workspace {
     /// Dispatch one request. One result per invocation.
     pub fn dispatch(&mut self, request: Request) -> Envelope<Value> {
         match self.handle(request) {
+            Ok(result) => Envelope::ok(result),
+            Err(error) => Envelope::error(error),
+        }
+    }
+
+    /// Dispatch one write request with an ordered progress sink.
+    ///
+    /// Only apply and restore stream, and only they reach this entry; any other
+    /// request is refused so a client cannot wait for hints that never arrive.
+    pub fn dispatch_streaming(
+        &mut self,
+        request: Request,
+        progress: impl FnMut(Progress),
+    ) -> Envelope<Value> {
+        let result = match request.op {
+            Op::DeployApply => decode::<DeployApplyArgs>(request.args).and_then(|args| {
+                let plan = PlanId::try_from_u64(parse_id(&args.plan_id)?)
+                    .map_err(|_| WireError::new(Code::InvalidRequest))?;
+                json(self.deploy_apply_with_progress(plan, progress)?)
+            }),
+            Op::Restore => decode::<NoArgs>(request.args)
+                .and_then(|_| json(self.restore_with_progress(progress)?)),
+            _ => Err(WireError::new(Code::InvalidRequest)),
+        };
+        match result {
             Ok(result) => Envelope::ok(result),
             Err(error) => Envelope::error(error),
         }
@@ -870,10 +945,22 @@ impl Workspace {
     }
 
     fn deploy_apply(&mut self, plan: PlanId) -> Result<Operation, WireError> {
+        self.deploy_apply_with_progress(plan, |_| {})
+    }
+
+    fn deploy_apply_with_progress(
+        &mut self,
+        plan: PlanId,
+        progress: impl FnMut(Progress),
+    ) -> Result<Operation, WireError> {
+        let mut feed = ProgressFeed::new(progress);
         // A recorded claim is a durable answer. Serve it before opening a
         // native port, so a replay on a clean or unsupported root still reports
         // the recorded terminal status instead of `UnsupportedTarget`.
         if let Some(status) = self.journal.claimed(plan).map_err(deploy_error)? {
+            if let Some(event) = StepEvent::terminal(&status) {
+                feed.emit(event);
+            }
             return Ok(operation(status));
         }
         let selected = self.selected_pair()?;
@@ -884,10 +971,13 @@ impl Workspace {
         // while it changes. A record naming another catalog root is refused
         // here, whatever this journal says.
         self.claim_installation(&selected, format!("plan:{}", plan.get()))?;
-        let committed =
-            marduk_core::deployment::commit_deployment(&mut self.journal, &mut port, plan, || {
-                false
-            });
+        let committed = marduk_core::deployment::commit_deployment_with_progress(
+            &mut self.journal,
+            &mut port,
+            plan,
+            || false,
+            |event| feed.emit(event),
+        );
         let status = match committed {
             Ok(status) => status,
             Err(error) => {
@@ -905,6 +995,14 @@ impl Workspace {
     }
 
     fn restore_generation(&mut self) -> Result<RestoreResult, WireError> {
+        self.restore_with_progress(|_| {})
+    }
+
+    fn restore_with_progress(
+        &mut self,
+        progress: impl FnMut(Progress),
+    ) -> Result<RestoreResult, WireError> {
+        let mut feed = ProgressFeed::new(progress);
         let selected = self.selected_pair()?;
         // Only the recorded owner may restore. A foreign record refuses even a
         // restore this catalog would answer as a no-op: the installation is
@@ -929,6 +1027,9 @@ impl Workspace {
                 .map_err(deploy_error)?
                 .ok_or_else(|| deploy_error(DeployError::UnknownOperation))?;
             if status.kind == OperationKind::Restore {
+                if let Some(event) = StepEvent::terminal(&status) {
+                    feed.emit(event);
+                }
                 return Ok(RestoreResult::Operation {
                     operation: operation(status),
                 });
@@ -948,11 +1049,12 @@ impl Workspace {
         // Claim before the first restore effect; the record is held only while
         // it changes, and only the recorded owner may perform this restore.
         self.claim_installation(&selected, "restore".to_owned())?;
-        match marduk_core::deployment::restore(
+        match marduk_core::deployment::restore_with_progress(
             &mut self.journal,
             &mut port,
             &selected.installation,
             &selected.data,
+            |event| feed.emit(event),
         ) {
             Ok(status) => {
                 // The restore is the journal's answer; a release that fails
@@ -1653,6 +1755,89 @@ mod tests {
             StepDirection::Undo,
             slot,
         )
+    }
+
+    fn event(operation: OperationId, phase: Phase, completed: u64, total: u64) -> StepEvent {
+        StepEvent {
+            operation,
+            phase,
+            completed,
+            total,
+        }
+    }
+
+    #[test]
+    fn progress_feed_numbers_one_operation_and_drops_foreign_events() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let operation = OperationId::try_from_u64(9).unwrap();
+        let foreign = OperationId::try_from_u64(10).unwrap();
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&seen);
+        let mut feed = ProgressFeed::new(move |progress| sink.borrow_mut().push(progress));
+
+        for event in [
+            event(operation, Phase::Preparing, 0, 2),
+            event(foreign, Phase::Applying, 1, 2),
+            event(operation, Phase::Applying, 1, 2),
+            event(operation, Phase::Applying, 2, 2),
+            event(operation, Phase::Completed, 2, 2),
+        ] {
+            feed.emit(event);
+        }
+
+        let seen = seen.borrow();
+        assert_eq!(
+            seen.iter()
+                .map(|progress| progress.operation_id.as_str())
+                .collect::<Vec<_>>(),
+            ["9", "9", "9", "9"],
+            "every hint names this call's operation"
+        );
+        assert_eq!(
+            seen.iter()
+                .map(|progress| progress.sequence.as_str())
+                .collect::<Vec<_>>(),
+            ["1", "2", "3", "4"],
+            "sequence is monotonic from 1 and a foreign event consumes none"
+        );
+        assert_eq!(
+            seen.iter()
+                .map(|progress| progress.phase.as_str())
+                .collect::<Vec<_>>(),
+            ["preparing", "applying", "applying", "completed"]
+        );
+    }
+
+    #[test]
+    fn a_sink_that_stops_accepting_cannot_change_what_the_feed_reports() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        // A client whose channel is gone stops accepting after the first hint.
+        let calls = Rc::new(Cell::new(0usize));
+        let recorded = Rc::new(Cell::new(0usize));
+        let sink_calls = Rc::clone(&calls);
+        let sink_recorded = Rc::clone(&recorded);
+        let mut feed = ProgressFeed::new(move |_| {
+            sink_calls.set(sink_calls.get() + 1);
+            if sink_calls.get() == 1 {
+                sink_recorded.set(1);
+            }
+            // Later sends fail in the desktop adapter; the feed has nothing to
+            // propagate and must keep reporting the operation's transitions.
+        });
+        let operation = OperationId::try_from_u64(11).unwrap();
+
+        feed.emit(event(operation, Phase::Preparing, 0, 2));
+        feed.emit(event(operation, Phase::Applying, 1, 2));
+        feed.emit(event(operation, Phase::Completed, 2, 2));
+
+        // Every transition still reached the sink; the sink's own refusal to
+        // record one is not an operation failure and is never retried.
+        assert_eq!(calls.get(), 3);
+        assert_eq!(recorded.get(), 1);
     }
 
     #[test]

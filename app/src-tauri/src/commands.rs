@@ -53,6 +53,30 @@ impl DesktopState {
     /// serialization mismatch becomes `Storage`; it never reaches the UI as a
     /// success with invented fields.
     fn dispatch<T: DeserializeOwned>(&self, request: Request) -> Envelope<T> {
+        self.with_workspace(|workspace| workspace.dispatch(request))
+    }
+
+    /// Dispatch one write request and forward its ordered progress hints.
+    ///
+    /// A failed send means the window is gone. The write keeps running; a lost
+    /// hint never fails or retries it, and the result is still the journal's
+    /// authoritative answer.
+    fn dispatch_streaming<T: DeserializeOwned>(
+        &self,
+        request: Request,
+        on_progress: &Channel<Progress>,
+    ) -> Envelope<T> {
+        self.with_workspace(|workspace| {
+            workspace.dispatch_streaming(request, |progress| {
+                let _ = on_progress.send(progress);
+            })
+        })
+    }
+
+    fn with_workspace<T: DeserializeOwned>(
+        &self,
+        run: impl FnOnce(&mut Workspace) -> Envelope<Value>,
+    ) -> Envelope<T> {
         let mut guard = match self.open_workspace() {
             Ok(guard) => guard,
             Err(error) => return Envelope::error(error),
@@ -60,7 +84,7 @@ impl DesktopState {
         let Some(workspace) = guard.as_mut() else {
             return Envelope::error(WireError::new(Code::Storage));
         };
-        match workspace.dispatch(request) {
+        match run(workspace) {
             Envelope::Ok { result } => match serde_json::from_value::<T>(result) {
                 Ok(dto) => Envelope::ok(dto),
                 Err(_) => Envelope::error(WireError::new(Code::Storage)),
@@ -146,16 +170,19 @@ pub fn deploy_preview(at_revision: String, state: State<'_, DesktopState>) -> En
     ))
 }
 
-// Progress channels exist on writes only. Until the effect port emits, they
-// stay unused; clients reload authoritative state on gaps or reconnect.
+// Progress channels exist on writes only: apply and restore stream the
+// engine's real transitions, and a client reloads authoritative state on a
+// gap or reconnect.
 #[tauri::command(async)]
 pub fn deploy_apply(
     plan_id: String,
     on_progress: Channel<Progress>,
     state: State<'_, DesktopState>,
 ) -> Envelope<Operation> {
-    let _ = on_progress;
-    state.dispatch(Request::new(Op::DeployApply, json!({ "planId": plan_id })))
+    state.dispatch_streaming(
+        Request::new(Op::DeployApply, json!({ "planId": plan_id })),
+        &on_progress,
+    )
 }
 
 #[tauri::command(async)]
@@ -163,8 +190,7 @@ pub fn restore(
     on_progress: Channel<Progress>,
     state: State<'_, DesktopState>,
 ) -> Envelope<RestoreResult> {
-    let _ = on_progress;
-    state.dispatch(Request::new(Op::Restore, json!({})))
+    state.dispatch_streaming(Request::new(Op::Restore, json!({})), &on_progress)
 }
 
 /// Reconcile work recorded before an interrupted apply or restore. Returns the
