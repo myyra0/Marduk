@@ -734,3 +734,24 @@ pass is claimed. One parallel invocation of the two ignored workspace suites pro
 `dispatch_deploy_and_restore_through_the_whole_composition` failure; three subsequent sequential and
 parallel runs passed 22/22 on both volumes, so it is not recorded as a pass or as a defect.
 
+### Unversioned evidence encoding
+
+Supersedes the codec row above. At `61ac551` the identity blob starts directly with the
+Linux/Windows identity tag. The version byte, `DeployError::UnsupportedEvidenceVersion`,
+its wire mapping and the v1-refusal test were removed. There is no installed base and no
+migration; a stale developer-local blob is rejected by the existing structural checks
+(short read, unknown tag or trailing bytes). The platform identity code is unchanged
+from `d50850f`, so its rows above still apply.
+
+| Witness | Configuration | Command | Result | Commit |
+|---|---|---|---|---|
+| `identity_codec_round_trips_both_domains`, malformed and trailing-byte refusals | Linux | `cargo test --locked -p marduk-storage --lib identity_codec` | 3 passed, 0 failed | `61ac551` |
+| `cargo test --workspace --locked` | Linux tmpfs and Btrfs | as written, once per `TMPDIR` | 371 passed, 0 failed on each | `61ac551` |
+| ignored storage suites | both volumes | `cargo test --locked -p marduk-storage --tests -- --ignored` | 25 passed, 0 failed on each | `61ac551` |
+| ignored workspace suites | both volumes | `cargo test --locked -p marduk-workspace --tests -- --ignored` | `deployment_marker` 9, `native_deployment` 11 and `recovery_route` 1 passed on each; 0 failed | `61ac551` |
+| workspace default suite | NTFS, native VM | `cargo test --workspace --locked` | exit 0; no failed suite | `61ac551` |
+| `native_deployment` ignored, including `windows_exchange_process_cut` | NTFS, native VM | `cargo test -p marduk-workspace --test native_deployment -- --ignored --test-threads=1 --nocapture` | `test result: ok. 5 passed; 0 failed`; four phase/case variants passed, both case-mismatched cuts logged `Ambiguous` with no alternate object | `61ac551` |
+| `deployment_marker_cross_platform` | NTFS, native VM | `cargo test -p marduk-storage --test deployment_marker_cross_platform -- --ignored --test-threads=1` | `test result: ok. 4 passed; 0 failed` | `61ac551` |
+| CLI, desktop frontend, fmt and build | Linux | `cargo test --locked -p marduk-cli`; `npm --prefix app test`; `npm --prefix app run build`; `cargo fmt --all -- --check`; `cargo build --workspace --locked` | 2 unit and 10 workflow tests; 82 vitest tests; Vite, fmt and locked build passed | `61ac551` |
+| Tauri app test/build | Linux | `cargo test --manifest-path app/src-tauri/Cargo.toml --locked`; `cargo build --manifest-path app/src-tauri/Cargo.toml --locked` | not run: `javascriptcoregtk-4.1` and `webkit2gtk-4.1` are absent on this host | — |
+
