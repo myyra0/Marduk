@@ -16,7 +16,8 @@ use marduk_core::deployment::PlanId;
 use marduk_core::ids::ProfileRevision;
 use marduk_core::recovery::Journal;
 use marduk_games::skyrim_se::LAYOUT;
-use marduk_platform::DEPLOYMENT_MARKER;
+use marduk_platform::{DEPLOYMENT_MARKER, DeploymentOwner};
+use marduk_storage::Catalog;
 use marduk_workspace::{Code, Envelope, Op, Request, RestoreResult, WireError, Workspace};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -129,9 +130,9 @@ impl Fixture {
     }
 
     fn marker_owner(&self) -> Option<String> {
-        use marduk_platform::DeploymentOwner;
         let binding = marduk_platform::bind_installation(&self.game, &LAYOUT).unwrap();
-        match binding.deployment_owner(&self.app_a).unwrap() {
+        let id = Catalog::open(&self.app_a).unwrap().id();
+        match binding.deployment_owner(id).unwrap() {
             DeploymentOwner::Vacant => None,
             DeploymentOwner::Owned(path) | DeploymentOwner::Foreign(path) => {
                 Some(path.to_string_lossy().into_owned())
@@ -142,7 +143,7 @@ impl Fixture {
     fn claim_marker(&self, owner: &Path) {
         marduk_platform::bind_installation(&self.game, &LAYOUT)
             .unwrap()
-            .claim_deployment(owner)
+            .claim_deployment(Catalog::open(owner).unwrap().id(), owner)
             .unwrap();
     }
 
@@ -289,6 +290,108 @@ fn a_completed_restore_removes_the_marker_and_the_other_catalog_then_deploys() {
 
 #[test]
 #[ignore = "requires a qualified effect volume"]
+fn a_new_catalog_at_the_same_path_cannot_clear_or_deploy_over_the_claim() {
+    let mut fixture = Fixture::new();
+    setup(&mut fixture.workspace_a, &fixture.game);
+    let plan = review_plan(&mut fixture.workspace_a, &fixture.zip);
+    assert_eq!(
+        fixture
+            .workspace_a
+            .proof_apply_deployment(plan)
+            .unwrap()
+            .phase,
+        "completed"
+    );
+    let marker = fs::read(fixture.marker()).unwrap();
+
+    drop(fixture.workspace_a);
+    let moved = fixture.temp.path().join("app-a-moved");
+    fs::rename(&fixture.app_a, &moved).unwrap();
+    let mut replacement = Workspace::open(&fixture.app_a).unwrap();
+    setup(&mut replacement, &fixture.game);
+    let replacement_id = Catalog::open(&fixture.app_a).unwrap().id();
+    let binding = marduk_platform::bind_installation(&fixture.game, &LAYOUT).unwrap();
+    assert_eq!(
+        binding
+            .claim_deployment(replacement_id, &fixture.app_a)
+            .unwrap(),
+        DeploymentOwner::Foreign(fixture.app_a.clone())
+    );
+    assert_eq!(
+        binding.clear_deployment(replacement_id),
+        Err(marduk_core::deployment::DeployError::ActiveDeployment)
+    );
+    drop(binding);
+    let refused = replacement.proof_recover_pending().unwrap_err();
+    assert_eq!(refused.code, Code::ActiveDeployment);
+    assert_owner_named(&refused, &fixture.app_a);
+    assert_eq!(
+        replacement.proof_apply_deployment(plan).unwrap_err().code,
+        Code::ActiveDeployment
+    );
+    assert_eq!(
+        fs::read(fixture.game.join(DEPLOYMENT_MARKER)).unwrap(),
+        marker
+    );
+    assert_eq!(
+        fs::read(fixture.game.join("Data/textures/winner.dds")).unwrap(),
+        POST
+    );
+
+    let mut original = Workspace::open(&moved).unwrap();
+    assert!(matches!(
+        original.proof_restore().unwrap(),
+        RestoreResult::Operation { operation } if operation.phase == "completed"
+    ));
+    assert!(!fixture.game.join(DEPLOYMENT_MARKER).exists());
+    assert_eq!(
+        fs::read(fixture.game.join("Data/textures/winner.dds")).unwrap(),
+        BASE
+    );
+}
+
+#[test]
+#[ignore = "requires a qualified effect volume"]
+fn a_claimed_plan_replays_after_restore_and_a_foreign_deploy() {
+    let mut fixture = Fixture::new();
+    setup(&mut fixture.workspace_a, &fixture.game);
+    let plan_a = review_plan(&mut fixture.workspace_a, &fixture.zip);
+    let original = fixture.workspace_a.proof_apply_deployment(plan_a).unwrap();
+    assert_eq!(original.phase, "completed");
+    assert!(matches!(
+        fixture.workspace_a.proof_restore().unwrap(),
+        RestoreResult::Operation { operation } if operation.phase == "completed"
+    ));
+
+    setup(&mut fixture.workspace_b, &fixture.game);
+    let plan_b = review_plan(&mut fixture.workspace_b, &fixture.zip);
+    assert_eq!(
+        fixture
+            .workspace_b
+            .proof_apply_deployment(plan_b)
+            .unwrap()
+            .phase,
+        "completed"
+    );
+    let marker = fs::read(fixture.marker()).unwrap();
+    drop(fixture.workspace_a);
+    let mut reopened = Workspace::open(&fixture.app_a).unwrap();
+    assert_eq!(
+        serde_json::to_value(reopened.proof_apply_deployment(plan_a).unwrap()).unwrap(),
+        serde_json::to_value(original).unwrap()
+    );
+    assert_eq!(
+        fs::read(fixture.game.join(DEPLOYMENT_MARKER)).unwrap(),
+        marker
+    );
+    assert_eq!(
+        fs::read(fixture.game.join("Data/textures/winner.dds")).unwrap(),
+        POST
+    );
+}
+
+#[test]
+#[ignore = "requires a qualified effect volume"]
 fn failed_marker_clear_after_restore_blocks_until_cleanup_can_retry() {
     let mut fixture = Fixture::new();
     setup(&mut fixture.workspace_a, &fixture.game);
@@ -327,6 +430,18 @@ fn failed_marker_clear_after_restore_blocks_until_cleanup_can_retry() {
     assert!(!progress.iter().any(|phase| phase == "completed"));
     assert_eq!(fixture.deployed(), BASE);
     assert!(fixture.marker().exists());
+    assert_eq!(
+        fixture
+            .workspace_a
+            .proof_apply_deployment(plan)
+            .unwrap()
+            .phase,
+        "completed"
+    );
+    assert!(
+        fixture.marker().exists(),
+        "replay does not clear the marker"
+    );
     assert_eq!(
         fixture
             .workspace_a

@@ -127,7 +127,7 @@ impl Fixture {
     fn claim_marker(&self, owner: &Path) {
         marduk_platform::bind_installation(&self.game, &skyrim_se::LAYOUT)
             .unwrap()
-            .claim_deployment(owner)
+            .claim_deployment(marduk_storage::Catalog::open(owner).unwrap().id(), owner)
             .unwrap();
     }
 }

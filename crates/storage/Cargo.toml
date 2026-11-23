@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+getrandom = "=0.4.3"
 marduk-core = { path = "../core" }
 marduk-platform = { path = "../platform" }
 rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled"] }

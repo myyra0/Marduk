@@ -8,6 +8,8 @@ use marduk_core::deployment::DeployError;
 use crate::{InstallationBinding, effects};
 
 pub const DEPLOYMENT_MARKER: &str = ".marduk-deployment";
+// The leading NUL cannot start an old path-only record on either platform.
+const MARKER_HEADER: &[u8] = b"\0\0MARDUK\x01";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeploymentOwner {
@@ -17,17 +19,21 @@ pub enum DeploymentOwner {
 }
 
 impl InstallationBinding {
-    pub fn deployment_owner(&self, catalog: &Path) -> Result<DeploymentOwner, DeployError> {
+    pub fn deployment_owner(&self, catalog_id: [u8; 16]) -> Result<DeploymentOwner, DeployError> {
         self.verify().map_err(marker_root_error)?;
         let (_, root) = self.inner.installation_directory();
-        read_owner(&root, catalog)
+        read_owner(&root, catalog_id)
     }
 
     /// Publish a complete claim or report the owner that already holds it.
-    pub fn claim_deployment(&self, catalog: &Path) -> Result<DeploymentOwner, DeployError> {
+    pub fn claim_deployment(
+        &self,
+        catalog_id: [u8; 16],
+        catalog_path: &Path,
+    ) -> Result<DeploymentOwner, DeployError> {
         self.verify().map_err(marker_root_error)?;
         let (directory, root) = self.inner.installation_directory();
-        match read_owner(&root, catalog)? {
+        match read_owner(&root, catalog_id)? {
             DeploymentOwner::Vacant => {}
             owner @ DeploymentOwner::Owned(_) => {
                 effects::sync_bound_directory(directory, &root).map_err(|_| DeployError::Io)?;
@@ -36,7 +42,9 @@ impl InstallationBinding {
             owner => return Ok(owner),
         }
 
-        let record = encode_owner(catalog)?;
+        let mut record = MARKER_HEADER.to_vec();
+        record.extend(catalog_id);
+        record.extend(encode_owner_path(catalog_path)?);
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let (name, mut file) = loop {
             let name = format!(
@@ -62,13 +70,13 @@ impl InstallationBinding {
         match publish {
             Ok(()) => {
                 effects::sync_bound_directory(directory, &root).map_err(|_| DeployError::Io)?;
-                Ok(DeploymentOwner::Owned(catalog.to_path_buf()))
+                Ok(DeploymentOwner::Owned(catalog_path.to_path_buf()))
             }
             Err(error) => {
                 // This process exclusively created the temporary name.
                 fs::remove_file(root.join(name)).map_err(|_| DeployError::Io)?;
                 if error.kind() == io::ErrorKind::AlreadyExists {
-                    return match read_owner(&root, catalog)? {
+                    return match read_owner(&root, catalog_id)? {
                         DeploymentOwner::Vacant => Err(DeployError::ActiveDeployment),
                         owner => Ok(owner),
                     };
@@ -79,10 +87,10 @@ impl InstallationBinding {
     }
 
     /// Clear this catalog's marker. A foreign or unreadable marker is left intact.
-    pub fn clear_deployment(&self, catalog: &Path) -> Result<(), DeployError> {
+    pub fn clear_deployment(&self, catalog_id: [u8; 16]) -> Result<(), DeployError> {
         self.verify().map_err(marker_root_error)?;
         let (directory, root) = self.inner.installation_directory();
-        match read_owner(&root, catalog)? {
+        match read_owner(&root, catalog_id)? {
             DeploymentOwner::Vacant => Ok(()),
             DeploymentOwner::Foreign(_) => Err(DeployError::ActiveDeployment),
             DeploymentOwner::Owned(_) => {
@@ -102,7 +110,7 @@ fn marker_root_error(error: marduk_core::root_identity::RootError) -> DeployErro
     }
 }
 
-fn read_owner(root: &Path, catalog: &Path) -> Result<DeploymentOwner, DeployError> {
+fn read_owner(root: &Path, catalog_id: [u8; 16]) -> Result<DeploymentOwner, DeployError> {
     let path = root.join(DEPLOYMENT_MARKER);
     let metadata = match fs::symlink_metadata(&path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -127,10 +135,14 @@ fn read_owner(root: &Path, catalog: &Path) -> Result<DeploymentOwner, DeployErro
     fs::File::open(path)
         .and_then(|file| file.take(MAX_RECORD as u64 + 1).read_to_end(&mut bytes))
         .map_err(|_| DeployError::RecoveryConflict)?;
-    let recorded = decode_owner(&bytes)
+    let (id, display_path) = bytes
+        .strip_prefix(MARKER_HEADER)
+        .and_then(|body| body.split_first_chunk::<16>())
+        .ok_or(DeployError::RecoveryConflict)?;
+    let recorded = decode_owner_path(display_path)
         .filter(|path| bytes.len() <= MAX_RECORD && path.is_absolute())
         .ok_or(DeployError::RecoveryConflict)?;
-    Ok(if recorded == catalog {
+    Ok(if *id == catalog_id {
         DeploymentOwner::Owned(recorded)
     } else {
         DeploymentOwner::Foreign(recorded)
@@ -138,7 +150,7 @@ fn read_owner(root: &Path, catalog: &Path) -> Result<DeploymentOwner, DeployErro
 }
 
 #[cfg(unix)]
-fn encode_owner(path: &Path) -> Result<Vec<u8>, DeployError> {
+fn encode_owner_path(path: &Path) -> Result<Vec<u8>, DeployError> {
     use std::os::unix::ffi::OsStrExt;
     let bytes = path.as_os_str().as_bytes();
     if !path.is_absolute() || bytes.contains(&0) {
@@ -150,14 +162,14 @@ fn encode_owner(path: &Path) -> Result<Vec<u8>, DeployError> {
 }
 
 #[cfg(unix)]
-fn decode_owner(record: &[u8]) -> Option<PathBuf> {
+fn decode_owner_path(record: &[u8]) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
     let path = record.strip_suffix(&[0])?;
     (!path.contains(&0)).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(path)))
 }
 
 #[cfg(windows)]
-fn encode_owner(path: &Path) -> Result<Vec<u8>, DeployError> {
+fn encode_owner_path(path: &Path) -> Result<Vec<u8>, DeployError> {
     use std::os::windows::ffi::OsStrExt;
     if !path.is_absolute() {
         return Err(DeployError::Io);
@@ -174,7 +186,7 @@ fn encode_owner(path: &Path) -> Result<Vec<u8>, DeployError> {
 }
 
 #[cfg(windows)]
-fn decode_owner(record: &[u8]) -> Option<PathBuf> {
+fn decode_owner_path(record: &[u8]) -> Option<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     let (units, tail) = record.strip_suffix(&[0, 0])?.as_chunks::<2>();
     let units: Vec<_> = units.iter().copied().map(u16::from_le_bytes).collect();

@@ -1958,6 +1958,7 @@ dependencies = [
 name = "marduk-storage"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.4.3",
  "marduk-core",
  "marduk-platform",
  "rusqlite",

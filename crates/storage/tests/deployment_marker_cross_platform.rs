@@ -14,6 +14,7 @@ use marduk_games::skyrim_se::LAYOUT;
 use marduk_platform::{
     DEPLOYMENT_MARKER, DeploymentOwner, InstallationBinding, reopen_installation,
 };
+use marduk_storage::Catalog;
 use marduk_storage::native_effects::NativeEffects;
 use marduk_storage::operation_journal::OperationJournal;
 use rusqlite::{Connection, params};
@@ -146,14 +147,39 @@ fn incomplete_marker_is_a_conflict_and_is_not_replaced() {
     let fixture = Fixture::new();
     let marker = fixture.game.join(DEPLOYMENT_MARKER);
     let binding = fixture.binding();
-    for incomplete in [b"".as_slice(), fixture.app.to_str().unwrap().as_bytes()] {
+    let id = Catalog::open(&fixture.app).unwrap().id();
+    #[cfg(unix)]
+    let path_only = {
+        use std::os::unix::ffi::OsStrExt;
+        [fixture.app.as_os_str().as_bytes(), &[0]].concat()
+    };
+    #[cfg(windows)]
+    let path_only: Vec<u8> = {
+        use std::os::windows::ffi::OsStrExt;
+        fixture
+            .app
+            .as_os_str()
+            .encode_wide()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    };
+    for incomplete in [
+        b"".as_slice(),
+        fixture.app.to_str().unwrap().as_bytes(),
+        &path_only,
+    ] {
         fs::write(&marker, incomplete).unwrap();
         assert_eq!(
-            binding.deployment_owner(&fixture.app),
+            binding.deployment_owner(id),
             Err(DeployError::RecoveryConflict)
         );
         assert_eq!(
-            binding.claim_deployment(&fixture.app),
+            binding.claim_deployment(id, &fixture.app),
+            Err(DeployError::RecoveryConflict)
+        );
+        assert_eq!(
+            binding.clear_deployment(id),
             Err(DeployError::RecoveryConflict)
         );
         assert_eq!(fs::read(&marker).unwrap(), incomplete);
@@ -164,8 +190,12 @@ fn incomplete_marker_is_a_conflict_and_is_not_replaced() {
 #[ignore = "requires TMPDIR on tmpfs or Btrfs"]
 fn deployment_marker_reads_back_through_a_fresh_binding() {
     let fixture = Fixture::new();
+    let id = Catalog::open(&fixture.app).unwrap().id();
     assert_eq!(
-        fixture.binding().claim_deployment(&fixture.app).unwrap(),
+        fixture
+            .binding()
+            .claim_deployment(id, &fixture.app)
+            .unwrap(),
         DeploymentOwner::Owned(fixture.app.clone())
     );
     let marker = fixture.game.join(DEPLOYMENT_MARKER);
@@ -173,15 +203,17 @@ fn deployment_marker_reads_back_through_a_fresh_binding() {
 
     let binding = fixture.binding();
     assert_eq!(
-        binding.deployment_owner(&fixture.app).unwrap(),
+        binding
+            .deployment_owner(Catalog::open(&fixture.app).unwrap().id())
+            .unwrap(),
         DeploymentOwner::Owned(fixture.app.clone()),
         "a fresh binding reads the published marker"
     );
 
     let other = fixture.temp_path().join("app-other");
-    fs::create_dir(&other).unwrap();
+    let other_id = Catalog::open(&other).unwrap().id();
     assert_eq!(
-        binding.claim_deployment(&other).unwrap(),
+        binding.claim_deployment(other_id, &other).unwrap(),
         DeploymentOwner::Foreign(fixture.app.clone())
     );
     assert_eq!(
@@ -190,7 +222,7 @@ fn deployment_marker_reads_back_through_a_fresh_binding() {
         "the foreign claim left A's marker intact"
     );
     assert_eq!(
-        binding.clear_deployment(&other),
+        binding.clear_deployment(other_id),
         Err(DeployError::ActiveDeployment)
     );
 
@@ -200,20 +232,20 @@ fn deployment_marker_reads_back_through_a_fresh_binding() {
 
         fs::set_permissions(&marker, fs::Permissions::from_mode(0o000)).unwrap();
         assert_eq!(
-            binding.deployment_owner(&fixture.app),
+            binding.deployment_owner(id),
             Err(DeployError::RecoveryConflict),
             "an unreadable marker is a conflict, never vacant"
         );
         assert_eq!(
-            binding.claim_deployment(&other),
+            binding.claim_deployment(other_id, &other),
             Err(DeployError::RecoveryConflict)
         );
         fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
-    binding.clear_deployment(&fixture.app).unwrap();
+    binding.clear_deployment(id).unwrap();
     assert_eq!(
-        binding.deployment_owner(&fixture.app).unwrap(),
+        binding.deployment_owner(id).unwrap(),
         DeploymentOwner::Vacant
     );
     assert!(!marker.exists());
@@ -224,15 +256,18 @@ fn deployment_marker_reads_back_through_a_fresh_binding() {
 fn simultaneous_catalog_claims_publish_one_complete_owner() {
     let fixture = Fixture::new();
     let other = fixture.temp_path().join("app-other");
+    let a_id = Catalog::open(&fixture.app).unwrap().id();
+    let b_id = Catalog::open(&other).unwrap().id();
     let barrier = std::sync::Barrier::new(2);
-    let claim = |catalog: &Path| {
-        let binding = fixture.binding();
+    let a_binding = fixture.binding();
+    let b_binding = fixture.binding();
+    let claim = |binding: &InstallationBinding, catalog: &Path, id| {
         barrier.wait();
-        binding.claim_deployment(catalog).unwrap()
+        binding.claim_deployment(id, catalog).unwrap()
     };
     let (a, b) = std::thread::scope(|scope| {
-        let a = scope.spawn(|| claim(&fixture.app));
-        let b = scope.spawn(|| claim(&other));
+        let a = scope.spawn(|| claim(&a_binding, &fixture.app, a_id));
+        let b = scope.spawn(|| claim(&b_binding, &other, b_id));
         (a.join().unwrap(), b.join().unwrap())
     });
     let (DeploymentOwner::Owned(winner), DeploymentOwner::Foreign(loser_saw)) =
@@ -246,7 +281,10 @@ fn simultaneous_catalog_claims_publish_one_complete_owner() {
     };
     assert_eq!(winner, loser_saw);
     assert_eq!(
-        fixture.binding().deployment_owner(&winner).unwrap(),
+        fixture
+            .binding()
+            .deployment_owner(Catalog::open(&winner).unwrap().id())
+            .unwrap(),
         DeploymentOwner::Owned(winner)
     );
     assert_eq!(

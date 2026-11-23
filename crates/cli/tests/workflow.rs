@@ -298,6 +298,80 @@ fn import_availability_matches_the_stage_route() {
 }
 
 #[test]
+fn replay_of_a_failed_apply_exits_nonzero_but_the_operation_query_succeeds() {
+    let fixture = Fixture::new();
+    let setup = fixture.run(&["setup", "--game-dir", fixture.game_dir(), "--json"]);
+    assert_eq!(setup.status.code(), Some(0));
+    if envelope(&setup)["result"]["availability"]["deploy"]["available"] != true {
+        return;
+    }
+
+    let target = fixture.game.join("Data/winner.dds");
+    fs::write(&target, b"base\n").unwrap();
+    let zip = fixture.temp.path().join("mod.zip");
+    fs::write(
+        &zip,
+        ClassicZip::new(&[Record::file(b"winner.dds", b"mod\n")]).bytes,
+    )
+    .unwrap();
+    let preview = fixture.run(&[
+        "import",
+        "preview",
+        zip.to_str().unwrap(),
+        "--name",
+        "Example",
+        "--at-revision",
+        "0",
+        "--json",
+    ]);
+    assert_eq!(preview.status.code(), Some(0), "{preview:?}");
+    let preview = envelope(&preview);
+    let imported = fixture.run(&[
+        "import",
+        "apply",
+        preview["result"]["id"].as_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(imported.status.code(), Some(0), "{imported:?}");
+    let imported = envelope(&imported);
+    let preview = fixture.run(&[
+        "deploy",
+        "preview",
+        "--at-revision",
+        imported["result"]["revision"].as_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(preview.status.code(), Some(0), "{preview:?}");
+    let preview = envelope(&preview);
+    let plan = preview["result"]["id"].as_str().unwrap();
+    assert_eq!(
+        preview["result"]["files"][0]["target"]["path"],
+        "winner.dds"
+    );
+
+    // Block private preparation, after Apply has recorded the claim.
+    fs::write(fixture.app_root().join("effects/ops"), b"unusable scratch").unwrap();
+    let failed = fixture.run(&["deploy", "apply", plan, "--json"]);
+    assert_eq!(failed.status.code(), Some(1));
+    assert_eq!(envelope(&failed)["ok"], false);
+
+    let replay = fixture.run(&["deploy", "apply", plan, "--json"]);
+    let recorded = envelope(&replay);
+    assert_eq!(recorded["ok"], true);
+    assert_eq!(recorded["result"]["phase"], "cancelled");
+    assert!(recorded["result"]["blocker"].is_null());
+    assert_eq!(replay.status.code(), Some(1), "{replay:?}");
+    let query = fixture.run(&[
+        "operation",
+        recorded["result"]["id"].as_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(query.status.code(), Some(0));
+    assert_eq!(envelope(&query), recorded);
+    assert_eq!(fs::read(target).unwrap(), b"base\n");
+}
+
+#[test]
 fn blocked_routes_are_typed_unavailable() {
     let fixture = Fixture::new();
     let zip = fixture.temp.path().join("import.zip");

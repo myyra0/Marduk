@@ -122,32 +122,33 @@ fn resolved_app_data() -> Result<std::path::PathBuf, WireError> {
 fn run(cli: Cli) -> i32 {
     let app_data = match resolved_app_data() {
         Ok(path) => path,
-        Err(error) => return report(Envelope::error(error), cli.json),
+        Err(error) => return report(Envelope::error(error), cli.json, None),
     };
     let _instance = match marduk_platform::acquire_instance_guard(&app_data) {
         Ok(guard) => guard,
         Err(marduk_platform::GateError::Busy) => {
             let error =
                 WireError::with_message(Code::Busy, "another Marduk client is using this catalog");
-            return report(Envelope::error(error), cli.json);
+            return report(Envelope::error(error), cli.json, None);
         }
         Err(error) => {
             let error = WireError::with_message(
                 Code::Storage,
                 format!("could not take the Marduk instance gate: {error}"),
             );
-            return report(Envelope::error(error), cli.json);
+            return report(Envelope::error(error), cli.json, None);
         }
     };
     let request = match request(cli.command) {
         Ok(request) => request,
-        Err(error) => return report(Envelope::error(error), cli.json),
+        Err(error) => return report(Envelope::error(error), cli.json, None),
     };
     let mut workspace = match Workspace::open(&app_data) {
         Ok(workspace) => workspace,
-        Err(error) => return report(Envelope::error(error), cli.json),
+        Err(error) => return report(Envelope::error(error), cli.json, None),
     };
-    report(workspace.dispatch(request), cli.json)
+    let op = request.op;
+    report(workspace.dispatch(request), cli.json, Some(op))
 }
 
 fn request(command: Command) -> Result<Request, WireError> {
@@ -199,7 +200,7 @@ fn path(path: &PathBuf) -> Result<&str, WireError> {
         .ok_or_else(|| WireError::new(Code::InvalidRequest))
 }
 
-fn report(envelope: Envelope<Value>, wants_json: bool) -> i32 {
+fn report(envelope: Envelope<Value>, wants_json: bool, op: Option<Op>) -> i32 {
     if wants_json {
         emit(&envelope);
     } else {
@@ -211,7 +212,7 @@ fn report(envelope: Envelope<Value>, wants_json: bool) -> i32 {
             Envelope::Error { error } => eprintln!("{}", human_error(error)),
         }
     }
-    exit_code(&envelope)
+    exit_code(&envelope, op)
 }
 
 /// Human mode keeps the stable code and the same serialized detail the wire
@@ -240,12 +241,14 @@ fn emit(envelope: &Envelope<Value>) {
 
 /// A blocked operation is an `Ok` envelope whose recorded operation carries a
 /// non-null `blocker`; it exits 1 like a typed refusal because the work did not
-/// settle. `DeployApply` returns the operation directly; `Restore` nests it
-/// under `operation`. `null` and a blocker-free operation exit 0.
-fn exit_code(envelope: &Envelope<Value>) -> i32 {
+/// settle. Apply also fails when the recorded deployment ended unsuccessfully.
+fn exit_code(envelope: &Envelope<Value>, op: Option<Op>) -> i32 {
     match envelope {
         Envelope::Ok { result, .. } => {
-            if is_blocked(result) {
+            if is_blocked(result)
+                || (op == Some(Op::DeployApply)
+                    && matches!(result["phase"].as_str(), Some("cancelled" | "rolled_back")))
+            {
                 1
             } else {
                 0
@@ -294,7 +297,7 @@ mod tests {
                 "blocker": { "code": "RecoveryConflict" },
             }),
         };
-        assert_eq!(exit_code(&blocked), 1);
+        assert_eq!(exit_code(&blocked, Some(Op::Recover)), 1);
 
         let resolved: Envelope<Value> = Envelope::Ok {
             result: json!({
@@ -304,12 +307,14 @@ mod tests {
                 "blocker": null,
             }),
         };
-        assert_eq!(exit_code(&resolved), 0);
+        assert_eq!(exit_code(&resolved, Some(Op::Recover)), 0);
+        assert_eq!(exit_code(&resolved, Some(Op::DeployApply)), 1);
+        assert_eq!(exit_code(&resolved, Some(Op::Operation)), 0);
 
         let nothing: Envelope<Value> = Envelope::Ok {
             result: Value::Null,
         };
-        assert_eq!(exit_code(&nothing), 0);
+        assert_eq!(exit_code(&nothing, Some(Op::Recover)), 0);
 
         let blocked_restore: Envelope<Value> = Envelope::Ok {
             result: json!({
@@ -322,7 +327,7 @@ mod tests {
                 },
             }),
         };
-        assert_eq!(exit_code(&blocked_restore), 1);
+        assert_eq!(exit_code(&blocked_restore, Some(Op::Restore)), 1);
 
         let settled_restore: Envelope<Value> = Envelope::Ok {
             result: json!({
@@ -335,6 +340,6 @@ mod tests {
                 },
             }),
         };
-        assert_eq!(exit_code(&settled_restore), 0);
+        assert_eq!(exit_code(&settled_restore, Some(Op::Restore)), 0);
     }
 }

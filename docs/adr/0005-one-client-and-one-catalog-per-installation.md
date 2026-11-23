@@ -1,6 +1,6 @@
 # ADR 0005: one client and one catalog per installation
 
-**Status:** Accepted; scope revised 2026-11-23.
+**Status:** Accepted; scope and catalog identity revised 2026-11-23.
 
 ## Context
 
@@ -18,7 +18,9 @@ simultaneous writers.
   no-replace move before deployment can affect the installation. Catalogs can run concurrently;
   the marker, not a cross-catalog lease or protocol, arbitrates ownership.
 - **The journal stays authoritative** for what is deployed. The marker records only ownership; it
-  stores no generation. See the [client contract](../contracts/m1-clients.md) for refusals and cleanup.
+  stores the catalog's ID, a display-only catalog path, and no generation. The catalog creates its
+  random ID in the existing SQLite initialization transaction and verifies the ID on open. See the
+  [client contract](../contracts/m1-clients.md) for refusals and cleanup.
 
 ## Rejected alternatives
 
@@ -33,10 +35,12 @@ simultaneous writers.
 
 - The CLI is refused while the desktop is using the same catalog. Clients on distinct catalogs
   can still use separate installations.
-- If the owning catalog is deleted while a deployment exists, the marker blocks other catalogs until it
-  is removed by hand at `<installation>/.marduk-deployment`. Status names the owner, not the path.
+- Moving a catalog can leave its old path in the marker. Copying a catalog keeps its ID; a backup
+  is not an independent catalog and must not be used alongside its source. If the catalog is lost
+  while deployed, recover it from backup or restore a known-clean installation before removing the
+  orphaned marker. Removing the marker does not restore deployed files.
 - A process cut before publication can leave a uniquely named temporary in the installation root;
   it does not claim the installation. Windows standard flushing does not prove power-cut durability
   ([ADR 0004](0004-windows-writes-use-standard-flush.md)).
-- Pre-redesign unframed records are not distinguishable from truncated writes. They fail closed;
-  restore with the previous build before upgrading a still-deployed development installation.
+- Before upgrading a still-deployed installation whose marker predates catalog IDs, restore with
+  the previous build. The new build does not adopt path-only markers.

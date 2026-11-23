@@ -404,6 +404,7 @@ dependencies = [
 name = "marduk-storage"
 version = "0.1.0"
 dependencies = [
+ "getrandom",
  "marduk-archive",
  "marduk-core",
  "marduk-games",

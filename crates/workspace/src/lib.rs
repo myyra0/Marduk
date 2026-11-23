@@ -938,20 +938,8 @@ impl Workspace {
         progress: impl FnMut(Progress),
     ) -> Result<Operation, WireError> {
         let mut feed = ProgressFeed::new(progress);
-        // A recorded claim is a durable answer. Serve it before opening a
-        // native port, so a replay on a clean or unsupported root still reports
-        // the recorded terminal status instead of `UnsupportedTarget`.
+        // A recorded claim is a durable answer, independent of the live root.
         if let Some(status) = self.journal.claimed(plan).map_err(deploy_error)? {
-            if let Some(selected) = self.journal.selected_installation().map_err(deploy_error)?
-                && let Some(stored) = self.journal.plan(plan).map_err(deploy_error)?
-                && stored.installation == selected.installation
-                && stored.data == selected.data
-                && let Ok(binding) = self.reopen(&selected)
-            {
-                if matches!(self.marker_owner(&binding)?, DeploymentOwner::Owned(_)) {
-                    self.clear_marker_if_idle(&binding, &selected)?;
-                }
-            }
             if let Some(event) = StepEvent::terminal(&status) {
                 feed.emit(event);
             }
@@ -973,7 +961,7 @@ impl Workspace {
             return Err(WireError::new(Code::TargetUnavailable));
         }
         if let DeploymentOwner::Foreign(owner) = binding
-            .claim_deployment(&self.app_data)
+            .claim_deployment(self.catalog.id(), &self.app_data)
             .map_err(deploy_error)?
         {
             return Err(foreign_deployment(&owner));
@@ -1089,7 +1077,7 @@ impl Workspace {
         binding: &InstallationBinding,
     ) -> (Availability, Option<DeploymentInfo>) {
         match binding
-            .deployment_owner(&self.app_data)
+            .deployment_owner(self.catalog.id())
             .map_err(deploy_error)
         {
             Ok(DeploymentOwner::Foreign(owner)) => (
@@ -1121,7 +1109,7 @@ impl Workspace {
 
     fn marker_owner(&self, binding: &InstallationBinding) -> Result<DeploymentOwner, WireError> {
         match binding
-            .deployment_owner(&self.app_data)
+            .deployment_owner(self.catalog.id())
             .map_err(deploy_error)?
         {
             DeploymentOwner::Foreign(owner) => Err(foreign_deployment(&owner)),
@@ -1130,12 +1118,14 @@ impl Workspace {
     }
 
     fn clear_marker(&self, binding: &InstallationBinding) -> Result<(), WireError> {
-        binding.clear_deployment(&self.app_data).map_err(|error| {
-            WireError::with_message(
-                deploy_error(error).code,
-                "could not clear the deployment marker; retry recovery",
-            )
-        })
+        binding
+            .clear_deployment(self.catalog.id())
+            .map_err(|error| {
+                WireError::with_message(
+                    deploy_error(error).code,
+                    "could not clear the deployment marker; retry recovery",
+                )
+            })
     }
 
     fn clear_marker_if_idle(

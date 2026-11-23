@@ -117,6 +117,7 @@ impl<const N: usize> PartialEq<[ImportId; N]> for ReconcileReport {
 
 pub struct Catalog {
     root: PathBuf,
+    id: [u8; 16],
     /// Pins the verified app-owned directory for this catalog's lifetime.
     _root_handle: File,
     /// Pins the catalog leaf so a later reopen cannot substitute it.
@@ -162,7 +163,7 @@ impl Catalog {
         // The SQLite pathname cannot consume the descriptor, so re-prove that
         // it still names the pinned directory after the open.
         verify_root_path(root, &root_handle).map_err(|_| ImportError::Storage)?;
-        crate::schema::prepare(&mut connection).map_err(|_| ImportError::Storage)?;
+        let id = crate::schema::prepare(&mut connection).map_err(|_| ImportError::Storage)?;
         catalog
             .verify(&root_handle)
             .map_err(|_| ImportError::Storage)?;
@@ -170,6 +171,7 @@ impl Catalog {
 
         Ok(Self {
             root: root.to_path_buf(),
+            id,
             _root_handle: root_handle,
             _catalog: catalog,
             connection,
@@ -194,6 +196,10 @@ impl Catalog {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn id(&self) -> [u8; 16] {
+        self.id
     }
 
     /// Whether this catalog can write a private staged payload at all.

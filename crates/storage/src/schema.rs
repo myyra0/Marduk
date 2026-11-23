@@ -33,7 +33,7 @@ impl From<rusqlite::Error> for SchemaError {
 
 /// Configure, migrate to the current schema, seed the profile row and read the
 /// PRAGMAs back from the live connection.
-pub(crate) fn prepare(connection: &mut Connection) -> Result<(), SchemaError> {
+pub(crate) fn prepare(connection: &mut Connection) -> Result<[u8; 16], SchemaError> {
     configure(connection)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     migrate(&transaction)?;
@@ -42,8 +42,38 @@ pub(crate) fn prepare(connection: &mut Connection) -> Result<(), SchemaError> {
         "INSERT INTO profiles (id, revision) VALUES (1, 0) ON CONFLICT (id) DO NOTHING",
         [],
     )?;
+    let id = catalog_id(&transaction)?;
     transaction.commit()?;
-    verify_pragmas(connection)
+    verify_pragmas(connection)?;
+    Ok(id)
+}
+
+fn catalog_id(transaction: &Connection) -> Result<[u8; 16], SchemaError> {
+    let initialized = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'catalog_identity')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !initialized {
+        let mut id = [0; 16];
+        getrandom::fill(&mut id).map_err(|_| SchemaError)?;
+        transaction.execute_batch(
+            "CREATE TABLE catalog_identity (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                id BLOB NOT NULL CHECK (length(id) = 16)
+            ) STRICT;",
+        )?;
+        transaction.execute(
+            "INSERT INTO catalog_identity VALUES (1, ?1)",
+            [id.as_slice()],
+        )?;
+    }
+    // An initialized catalog with missing or invalid identity is not a new catalog.
+    Ok(transaction.query_row(
+        "SELECT id FROM catalog_identity WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?)
 }
 
 /// Reconfigure an existing connection and re-verify the required PRAGMAs
