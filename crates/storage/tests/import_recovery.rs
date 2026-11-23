@@ -40,6 +40,17 @@ fn revision_dir(root: &Path, id: ImportId) -> PathBuf {
     root.join("revisions").join(id.get().to_string())
 }
 
+/// Create a revision directory the adapter will accept as a binding target:
+/// `open_revision` proves the private 0700 mode before it trusts the name.
+fn private_dir(path: &Path) {
+    fs::create_dir_all(path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
 fn database(root: &Path) -> Connection {
     Connection::open(root.join("catalog.sqlite3")).unwrap()
 }
@@ -84,6 +95,7 @@ fn writing_rows(root: &Path) -> i64 {
 /// complete receipt would hold.
 fn seed_unprovable_writing(root: &Path, id: ImportId, bytes: &[u8]) {
     let directory = revision_dir(root, id);
+    private_dir(&directory);
     fs::create_dir_all(directory.join("payload")).unwrap();
     fs::write(directory.join("archive.zip"), bytes).unwrap();
     fs::write(directory.join("payload").join("partial.bin"), bytes).unwrap();
@@ -92,6 +104,20 @@ fn seed_unprovable_writing(root: &Path, id: ImportId, bytes: &[u8]) {
             "INSERT INTO imports \
              (id, profile_id, expected_revision, target, display_name, state) \
              VALUES (?1, 1, 0, 'append', 'Orphan', 'writing')",
+            [sql_id(id)],
+        )
+        .unwrap();
+}
+
+/// Seed a `writing` row with no ownership receipt. The caller decides whether
+/// `revisions/<id>` exists and what it holds, so each witness can pin the shape
+/// the adapter is asked to reclaim.
+fn seed_unowned_writing(root: &Path, id: ImportId) {
+    database(root)
+        .execute(
+            "INSERT INTO imports \
+             (id, profile_id, expected_revision, target, display_name, state) \
+             VALUES (?1, 1, 0, 'append', 'Unowned', 'writing')",
             [sql_id(id)],
         )
         .unwrap();
@@ -387,4 +413,139 @@ fn pre_fix_writing_row_is_handled_deterministically() {
         assert!(revision_dir(root, id).exists());
         assert_eq!(state_of(root, id), "writing");
     }
+}
+
+#[test]
+fn unowned_empty_reservation_is_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let mut catalog = Catalog::open(root).unwrap();
+    let available = catalog.stage_available();
+
+    let id = ImportId::try_from_u64(101).unwrap();
+    private_dir(&revision_dir(root, id));
+    seed_unowned_writing(root, id);
+
+    let report = catalog.reconcile().unwrap();
+    if available {
+        assert_eq!(report.reclaimed, vec![id], "{report:?}");
+        assert!(report.quarantined.is_empty(), "{report:?}");
+        assert!(
+            !revision_dir(root, id).exists(),
+            "an empty name may be removed"
+        );
+        assert_eq!(state_of(root, id), "discarded");
+        assert_eq!(writing_rows(root), 0);
+    } else {
+        assert!(report.reclaimed.is_empty());
+        assert_eq!(
+            report.quarantined,
+            vec![QuarantinedImport {
+                id,
+                reason: QuarantineReason::StageUnavailable,
+            }]
+        );
+        assert!(revision_dir(root, id).exists());
+        assert_eq!(state_of(root, id), "writing");
+    }
+}
+
+#[test]
+fn unowned_reservation_that_gains_bytes_before_reconcile_is_quarantined_intact() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let mut catalog = Catalog::open(root).unwrap();
+    let available = catalog.stage_available();
+
+    let id = ImportId::try_from_u64(102).unwrap();
+    private_dir(&revision_dir(root, id));
+    seed_unowned_writing(root, id);
+
+    // The name is empty when the row is written, then gains bytes immediately
+    // before reconcile. An unowned reclaim may remove at most the empty
+    // directory name; it must never enumerate or delete what it finds, so no
+    // sequence here can recurse.
+    let nested = revision_dir(root, id).join("payload").join("late");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("incoming.bin"), b"arrived after the row").unwrap();
+
+    let reason = if available {
+        QuarantineReason::OwnershipMissing
+    } else {
+        QuarantineReason::StageUnavailable
+    };
+    let report = catalog.reconcile().unwrap();
+    assert!(report.reclaimed.is_empty(), "{report:?}");
+    assert_eq!(
+        report.quarantined,
+        vec![QuarantinedImport { id, reason }],
+        "{report:?}"
+    );
+    assert_eq!(
+        fs::read(nested.join("incoming.bin")).unwrap(),
+        b"arrived after the row"
+    );
+    assert_eq!(state_of(root, id), "writing");
+
+    // The quarantine is stable and the bytes are still all there afterwards.
+    let second = catalog.reconcile().unwrap();
+    assert!(second.reclaimed.is_empty(), "{second:?}");
+    assert_eq!(second.quarantined, vec![QuarantinedImport { id, reason }]);
+    assert_eq!(
+        fs::read(nested.join("incoming.bin")).unwrap(),
+        b"arrived after the row"
+    );
+}
+
+#[test]
+fn owned_reservation_reclaims_its_whole_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let mut catalog = Catalog::open(root).unwrap();
+
+    if !catalog.stage_available() {
+        // No receipt can exist without a qualified adapter, so there is no
+        // owned reservation to reclaim; the refusal path is asserted instead.
+        assert_eq!(
+            catalog
+                .prepare_import(zip(b"owned tree bytes").as_slice(), plan())
+                .unwrap_err(),
+            ImportError::StageUnavailable
+        );
+        return;
+    }
+
+    // A reservation whose receipt never completed: the recorded native
+    // directory identity is the only proof, and it is enough to remove the
+    // entire tree below that name.
+    let id = catalog
+        .prepare_import(zip(b"owned tree bytes").as_slice(), plan())
+        .unwrap()
+        .id;
+    database(root)
+        .execute(
+            "DELETE FROM staged_files WHERE import_id = ?1",
+            [sql_id(id)],
+        )
+        .unwrap();
+    database(root)
+        .execute(
+            "UPDATE imports SET state = 'writing', archive_sha = NULL WHERE id = ?1",
+            [sql_id(id)],
+        )
+        .unwrap();
+
+    // Entries the receipt never named, at a depth the archive never used.
+    let nested = revision_dir(root, id).join("scratch").join("deep");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("orphan.bin"), b"proved ours").unwrap();
+
+    let report = catalog.reconcile().unwrap();
+    assert_eq!(report.reclaimed, vec![id], "{report:?}");
+    assert!(report.quarantined.is_empty(), "{report:?}");
+    assert!(
+        !revision_dir(root, id).exists(),
+        "a proved owner reclaims the whole tree"
+    );
+    assert_eq!(state_of(root, id), "discarded");
 }

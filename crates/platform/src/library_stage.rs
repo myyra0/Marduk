@@ -187,9 +187,11 @@ impl NativeStage {
     ///
     /// The reservation owns `revisions/<id>` from the committed catalog row.
     /// A recorded owner proves the bound directory is the one this import
-    /// created; without one, only an empty directory may be removed, because
-    /// an unowned non-empty stage cannot be proven ours. Contents of a proved
-    /// directory are removed wholesale; there is no receipt to re-observe.
+    /// created, and only that proof allows the tree below the name to be
+    /// removed wholesale; there is no receipt to re-observe. Without one, no
+    /// entry below the name is ever opened, enumerated or removed: the name
+    /// goes only when a single non-recursive directory remove succeeds, so a
+    /// directory that is not empty stays quarantined with every byte intact.
     /// Returns whether a directory was actually removed.
     pub fn reclaim_reservation(
         &mut self,
@@ -202,29 +204,21 @@ impl NativeStage {
             Some(revision) => revision,
             None => return Ok(false),
         };
-        match owner {
-            Some(expected) => {
-                if revision.identity() != expected {
-                    return Err(ImportError::StageChanged);
-                }
-                self.tree
-                    .reverify_revision(&name, &revision)
-                    .map_err(fsops::stage_error)?;
+        if let Some(expected) = owner {
+            if revision.identity() != expected {
+                return Err(ImportError::StageChanged);
             }
-            None => {
-                let empty = revision
-                    .list_relative(&[])
-                    .map_err(|_| ImportError::StageUnavailable)?
-                    .is_empty();
-                if !empty {
-                    return Err(ImportError::StageChanged);
-                }
-            }
+            self.tree
+                .reverify_revision(&name, &revision)
+                .map_err(fsops::stage_error)?;
+            remove_staged_tree(&revision, &mut Vec::new())?;
         }
 
-        remove_staged_tree(&revision, &mut Vec::new())?;
         // Windows removes the name only after the pinned revision handle, which
-        // denies delete sharing, is dropped.
+        // denies delete sharing, is dropped. For an unowned revision this is
+        // the only removal: the name, and only while it is empty. A file that
+        // arrives before the remove makes it refuse, and the directory is
+        // quarantined untouched.
         drop(revision);
         match self.tree.remove_revision_dir(&name) {
             Ok(true) => {}
