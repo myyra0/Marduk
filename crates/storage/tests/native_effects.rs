@@ -21,7 +21,9 @@ use marduk_core::recovery::{
 use marduk_core::resolve::ResolvedInputs;
 use marduk_core::root_identity::{Fingerprint, GameLayout, RootError, RootIdentity};
 use marduk_core::targets::{RelativePath, RootRole, TargetFile};
-use marduk_storage::native_effects::{NativeEffects, ProofEvent};
+use marduk_storage::native_effects::{
+    DEPLOYMENT_MARKER, DeploymentOwner, NativeEffects, ProofEvent,
+};
 use marduk_storage::operation_journal::OperationJournal;
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -1294,4 +1296,162 @@ fn a_normal_exchange_still_settles_cleanly() {
     assert_eq!(fs::read(directory.join("stage")).unwrap(), BASE);
     assert!(!directory.join("displaced").exists());
     assert_eq!(fs::read(fixture.target(WINNER)).unwrap(), POST);
+}
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn deployment_marker_names_one_catalog_and_any_catalog_can_clear_it() {
+    let fixture = Fixture::new();
+    let port = fixture.adapter();
+    let marker = fixture.game.join(DEPLOYMENT_MARKER);
+
+    assert_eq!(port.deployment_owner().unwrap(), DeploymentOwner::Vacant);
+    assert!(!marker.exists());
+
+    port.claim_deployment(&fixture.app).unwrap();
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap(),
+        fixture.app.to_string_lossy()
+    );
+    assert_eq!(
+        port.deployment_owner().unwrap(),
+        DeploymentOwner::Owned(fixture.app.clone())
+    );
+
+    // The same catalog claiming again is a stale or in-progress claim.
+    port.claim_deployment(&fixture.app).unwrap();
+
+    let other = fixture.temp_path().join("app-other");
+    fs::create_dir(&other).unwrap();
+    let foreign = NativeEffects::open(&other, &fixture.game, LAYOUT).unwrap();
+    assert_eq!(
+        foreign.deployment_owner().unwrap(),
+        DeploymentOwner::Foreign(fixture.app.clone())
+    );
+    assert_eq!(
+        foreign.claim_deployment(&other),
+        Err(DeployError::ActiveDeployment)
+    );
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap(),
+        fixture.app.to_string_lossy(),
+        "the foreign claim left A's marker intact"
+    );
+
+    // Removal is not ownership-checked here; the workspace owns that policy.
+    foreign.clear_deployment().unwrap();
+    assert_eq!(port.deployment_owner().unwrap(), DeploymentOwner::Vacant);
+    assert!(!marker.exists());
+}
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn deployment_marker_survives_a_fresh_adapter_and_unreadable_is_a_conflict() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    fixture.adapter().claim_deployment(&fixture.app).unwrap();
+    let marker = fixture.game.join(DEPLOYMENT_MARKER);
+
+    let port = fixture.adapter();
+    assert_eq!(
+        port.deployment_owner().unwrap(),
+        DeploymentOwner::Owned(fixture.app.clone()),
+        "a fresh adapter reads the marker left by the previous process"
+    );
+
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o000)).unwrap();
+    assert_eq!(
+        port.deployment_owner(),
+        Err(DeployError::RecoveryConflict),
+        "an unreadable marker is a conflict, never vacant"
+    );
+    let other = fixture.temp_path().join("app-other");
+    fs::create_dir(&other).unwrap();
+    let foreign = NativeEffects::open(&other, &fixture.game, LAYOUT).unwrap();
+    assert_eq!(
+        foreign.claim_deployment(&other),
+        Err(DeployError::RecoveryConflict)
+    );
+
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+    port.clear_deployment().unwrap();
+    assert_eq!(port.deployment_owner().unwrap(), DeploymentOwner::Vacant);
+}
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn a_second_prepare_cannot_adopt_a_matching_stage_or_backup() {
+    let fixture = Fixture::new();
+    drop(fixture.journal());
+    let mut port = fixture.adapter();
+    let op = OperationId::try_from_u64(1).unwrap();
+
+    // A stage this adapter already wrote is refused, not adopted, by the next
+    // prepare for the same step.
+    let only = RelativePath::parse(ONLY_A).unwrap();
+    let bound = port
+        .resolve_target(&TargetFile {
+            root: RootRole::Data,
+            relative: only.clone(),
+        })
+        .unwrap();
+    let spec = StepSpec {
+        target: bound,
+        original: PreImage {
+            observation: PreState::Absent,
+            backup: None,
+        },
+        pre: PreState::Absent,
+        output: StepOutput::Source(port.source(InstalledRevisionId::new(7), &only).unwrap()),
+    };
+    port.prepare(op, 0, StepDirection::Forward, &spec).unwrap();
+    let stage = fixture.effect_dir(op, 0).join("stage");
+    assert_eq!(fs::read(&stage).unwrap(), ONLY);
+    assert_eq!(
+        port.prepare(op, 0, StepDirection::Forward, &spec)
+            .unwrap_err(),
+        DeployError::RecoveryConflict
+    );
+    assert_eq!(
+        fs::read(&stage).unwrap(),
+        ONLY,
+        "the refused stage is intact"
+    );
+
+    // A matching pre-existing backup is likewise refused.
+    let winner = RelativePath::parse(WINNER).unwrap();
+    let bound = port
+        .resolve_target(&TargetFile {
+            root: RootRole::Data,
+            relative: winner.clone(),
+        })
+        .unwrap();
+    let expected = match port.observe(&bound) {
+        marduk_core::recovery::Observation::Regular(fingerprint) => fingerprint,
+        other => panic!("expected a regular original: {other:?}"),
+    };
+    let spec = StepSpec {
+        target: bound,
+        original: PreImage {
+            observation: PreState::Regular(expected.clone()),
+            backup: None,
+        },
+        pre: PreState::Regular(expected),
+        output: StepOutput::Source(port.source(InstalledRevisionId::new(7), &winner).unwrap()),
+    };
+    let op = OperationId::try_from_u64(2).unwrap();
+    let directory = fixture.effect_dir(op, 0);
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("original"), BASE).unwrap();
+    assert_eq!(
+        port.prepare(op, 0, StepDirection::Forward, &spec)
+            .unwrap_err(),
+        DeployError::RecoveryConflict
+    );
+    assert_eq!(
+        fs::read(directory.join("original")).unwrap(),
+        BASE,
+        "the refused backup is intact"
+    );
 }

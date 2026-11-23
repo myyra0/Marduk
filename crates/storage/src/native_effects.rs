@@ -14,8 +14,8 @@
 //! mismatch is refused; the adapter never silently re-binds another installation.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File};
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -39,6 +39,27 @@ use marduk_core::targets::{RelativePath, TargetFile};
 use marduk_platform::effects;
 use marduk_platform::{GateError, InstallationBinding, WriterGate, WriterGuard};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+
+/// Name of the marker in the verified installation root that records which
+/// catalog currently owns a deployment there.
+///
+/// The marker is create-once and delete: its content is the owning catalog root
+/// as a UTF-8 lossy spelling, written before the first public effect and removed
+/// on a completed restore or a fully rolled-back deploy. It is never updated in
+/// place. A non-UTF-8 catalog spelling is recorded and compared through that
+/// lossy form.
+pub const DEPLOYMENT_MARKER: &str = ".marduk-deployment";
+
+/// What the installation's deployment marker says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeploymentOwner {
+    /// No marker is present.
+    Vacant,
+    /// The marker names this adapter's catalog root.
+    Owned(PathBuf),
+    /// The marker names a different catalog root.
+    Foreign(PathBuf),
+}
 
 /// A test seam for observing the order of private durability work relative to
 /// public effects. Recording is off unless a test asks for it.
@@ -68,6 +89,10 @@ pub struct NativeEffects {
     /// the caller supplied. Directory fsyncs stop here.
     resolved_root: PathBuf,
     library: PathBuf,
+    /// The catalog root this adapter was opened for. Unlike `library`, this
+    /// spelling is never replaced by the proof seam, so deployment-marker
+    /// ownership stays stable.
+    catalog_root: PathBuf,
     root_gate: WriterGate,
     library_gate: WriterGate,
     /// The staged fingerprint for each inspected step. Effects need it to
@@ -128,6 +153,7 @@ impl NativeEffects {
             catalog,
             resolved_root,
             library: app_data.to_path_buf(),
+            catalog_root: app_data.to_path_buf(),
             root_gate,
             library_gate,
             staged: BTreeMap::new(),
@@ -158,6 +184,98 @@ impl NativeEffects {
     ) -> Result<(), RootError> {
         self.library = library_spelling.to_path_buf();
         self.sync_directory_chain(directory)
+    }
+
+    /// The installation root of the already-verified binding.
+    ///
+    /// The path spelling is the locator the binding was opened with; its native
+    /// identity is re-proved against the binding before any marker access, so a
+    /// substituted root is refused instead of being adopted.
+    fn installation_root(&self) -> Result<PathBuf, DeployError> {
+        self.binding.verify().map_err(map_root)?;
+        let identity = effects::directory_identity(&self.locator).map_err(map_root)?;
+        if &identity != self.binding.identities().0 {
+            return Err(DeployError::TargetUnavailable);
+        }
+        Ok(self.locator.clone())
+    }
+
+    fn read_deployment_marker(&self, path: &Path) -> Result<Option<String>, DeployError> {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            // A marker that exists but is not an ordinary file, or cannot be
+            // read, is never reported as vacant.
+            Ok(metadata) if !metadata.file_type().is_file() => Err(DeployError::RecoveryConflict),
+            Ok(_) => match fs::read(path) {
+                Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
+                Err(_) => Err(DeployError::RecoveryConflict),
+            },
+            Err(_) => Err(DeployError::RecoveryConflict),
+        }
+    }
+
+    /// Read the deployment marker in the verified installation root.
+    ///
+    /// `Owned` means the marker names this adapter's catalog root; `Foreign`
+    /// carries the recorded spelling otherwise. An unreadable marker is
+    /// `RecoveryConflict`, never [`DeploymentOwner::Vacant`].
+    pub fn deployment_owner(&self) -> Result<DeploymentOwner, DeployError> {
+        let root = self.installation_root()?;
+        match self.read_deployment_marker(&root.join(DEPLOYMENT_MARKER))? {
+            None => Ok(DeploymentOwner::Vacant),
+            Some(recorded) if recorded == self.catalog_root.to_string_lossy() => {
+                Ok(DeploymentOwner::Owned(PathBuf::from(recorded)))
+            }
+            Some(recorded) => Ok(DeploymentOwner::Foreign(PathBuf::from(recorded))),
+        }
+    }
+
+    /// Claim the installation for `catalog` by creating the marker once.
+    ///
+    /// The marker is created exclusively, written, flushed and its directory
+    /// entry synced. When it already exists, the same catalog is a stale or
+    /// in-progress claim and stays `Ok`; a different catalog is
+    /// [`DeployError::ActiveDeployment`]; an unreadable marker is
+    /// [`DeployError::RecoveryConflict`].
+    pub fn claim_deployment(&self, catalog: &Path) -> Result<(), DeployError> {
+        let root = self.installation_root()?;
+        let path = root.join(DEPLOYMENT_MARKER);
+        let content = catalog.to_string_lossy();
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return match self.read_deployment_marker(&path)? {
+                    Some(recorded) if recorded == content => Ok(()),
+                    Some(_) => Err(DeployError::ActiveDeployment),
+                    None => Err(DeployError::Io),
+                };
+            }
+            Err(_) => return Err(DeployError::Io),
+        };
+        if file
+            .write_all(content.as_bytes())
+            .and_then(|()| file.sync_all())
+            .is_err()
+        {
+            drop(file);
+            let _ = fs::remove_file(&path);
+            return Err(DeployError::Io);
+        }
+        drop(file);
+        effects::sync_directory(&root).map_err(|_| DeployError::Io)
+    }
+
+    /// Remove the deployment marker. An absent marker is already clear.
+    ///
+    /// Ownership policy lives in the workspace; this layer removes whichever
+    /// marker is present and syncs the installation root.
+    pub fn clear_deployment(&self) -> Result<(), DeployError> {
+        let root = self.installation_root()?;
+        match fs::remove_file(root.join(DEPLOYMENT_MARKER)) {
+            Ok(()) => effects::sync_directory(&root).map_err(|_| DeployError::Io),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(DeployError::Io),
+        }
     }
 
     fn trace(&mut self, event: ProofEvent) {
@@ -430,9 +548,12 @@ impl NativeEffects {
         }
     }
 
-    /// Copy `source` to `destination` once, then prove the durable artifact's
-    /// shape. An existing operation-owned artifact is reused only when it
-    /// already matches; it is never overwritten.
+    /// Copy `source` to a new artifact at `destination`, then prove its shape.
+    ///
+    /// The artifact is always created fresh: `copy_file` opens the destination
+    /// with `CREATE_NEW` and flushes the file before returning, so a slot that
+    /// already holds anything — including matching bytes — is
+    /// [`DeployError::RecoveryConflict`], never adopted as this operation's work.
     fn ensure_copy(
         &self,
         source: &Path,
@@ -441,14 +562,8 @@ impl NativeEffects {
         sha256: [u8; 32],
         metadata: Option<&FileMetadata>,
     ) -> Result<Fingerprint, DeployError> {
-        let existing = match artifact(destination) {
-            Artifact::Absent => {
-                effects::copy_file(source, destination).map_err(copy_error)?;
-                artifact(destination)
-            }
-            other => other,
-        };
-        match existing {
+        effects::copy_file(source, destination).map_err(copy_error)?;
+        match artifact(destination) {
             Artifact::Regular(fingerprint)
                 if fingerprint.len == len
                     && fingerprint.sha256 == sha256
