@@ -23,8 +23,10 @@ to retry automatically. It does not claim prevention. See the contract's "Known 
 
 **Cross-catalog installation ownership.** Deployments made before the installation lease existed carry no record, so
 another catalog root can deploy over them until their owning catalog claims once. The lease record is published
-atomically and a crash between the claim and the journal claim is cleared by that catalog's next recovery when the
-journal is idle. The lease directory entry is not fsynced; on Windows the directory inherits `%LOCALAPPDATA%`'s ACL.
+atomically. A crash between a lease claim and the journal claim leaves a record that is cleared automatically only
+for the `recovery:` family; a `plan:` record from a crashed deploy stays until it is removed by hand at the path
+`status` reports, because an idle journal cannot distinguish it from a deploy still between its claim and its journal
+entry. The lease directory entry is not fsynced; on Windows the directory inherits `%LOCALAPPDATA%`'s ACL.
 Arbitration is per OS user, and the state directory is resolved from the process environment, so two clients of the
 same account launched with deliberately different `HOME`/`XDG_STATE_HOME`/`LOCALAPPDATA` may not share a record — the
 guarantee covers clients that resolve the same directory. A release checks journal idleness before clearing, and that

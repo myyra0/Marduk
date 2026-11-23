@@ -387,3 +387,67 @@ fn recover_keeps_the_record_while_a_generation_is_active() {
     );
     assert_eq!(lease.read().unwrap(), Some(record));
 }
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn a_live_plan_claim_survives_restore_and_recover() {
+    let mut fixture = Fixture::new();
+    setup(&mut fixture.workspace_a, &fixture.game);
+    let lease = fixture.lease();
+    // A deploy between its lease claim and its journal claim leaves exactly
+    // this: a `plan:` record and an idle journal.
+    lease
+        .claim(&LeaseRecord {
+            app_data: fixture.app_a.clone(),
+            reference: Some("plan:999".to_owned()),
+        })
+        .unwrap();
+
+    let restored = fixture.workspace_a.proof_restore().unwrap();
+    assert!(matches!(restored, RestoreResult::NoActiveDeployment { .. }));
+    assert_eq!(
+        lease.read().unwrap().and_then(|record| record.reference),
+        Some("plan:999".to_owned()),
+        "a restore with an idle journal must not clear a deploy's live claim"
+    );
+
+    assert!(
+        fixture
+            .workspace_a
+            .proof_recover_pending()
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        lease.read().unwrap().and_then(|record| record.reference),
+        Some("plan:999".to_owned()),
+        "recovery must leave a plan claim it did not write"
+    );
+}
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn a_crashed_recovery_claim_is_cleared_when_the_journal_is_idle() {
+    let mut fixture = Fixture::new();
+    setup(&mut fixture.workspace_a, &fixture.game);
+    let lease = fixture.lease();
+    lease
+        .claim(&LeaseRecord {
+            app_data: fixture.app_a.clone(),
+            reference: Some("recovery:123-1-1".to_owned()),
+        })
+        .unwrap();
+
+    assert!(
+        fixture
+            .workspace_a
+            .proof_recover_pending()
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        lease.read().unwrap(),
+        None,
+        "an idle recovery claim this family wrote is the crash leftover and is cleared"
+    );
+}

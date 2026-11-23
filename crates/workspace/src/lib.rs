@@ -1039,14 +1039,11 @@ impl Workspace {
             return Err(deploy_error(DeployError::Busy));
         }
         if state.active.is_none() {
-            // A claim left by an interrupted attempt that rolled back is this
-            // catalog's stale record and nothing is deployed; clear it, but
-            // only the exact reference that is on disk now.
-            if let Some(record) = self.lease_record(&selected.installation)?
-                && record.app_data == self.app_data
-            {
-                self.release_if_idle(&selected, record.reference.as_deref());
-            }
+            // Do not clear the record here. A deploy in this same catalog can
+            // sit between its lease claim and its journal claim with the same
+            // idle journal, and clearing "the reference on disk" would delete
+            // that live claim. A stale record stays and is reported; it only
+            // blocks other catalogs, never this one's own next claim.
             return Ok(RestoreResult::NoActiveDeployment {
                 code: Code::NoActiveDeployment,
             });
@@ -1266,11 +1263,18 @@ impl Workspace {
             return Err(foreign_deployment(&record.app_data));
         }
         if state.pending.is_none() {
-            // No native work. An owned record with nothing active is exactly
-            // the claim-without-journal crash: clear only the reference this
-            // call read. An active generation keeps its record.
+            // No native work. Only a reference this command family writes can
+            // be attributed to a dead claim: a `recovery:` record with an idle
+            // journal is a recovery that exited before claiming journal work.
+            // A `plan:` or `generation:` record is left alone — a deploy can
+            // sit between its lease claim and its journal claim with an idle
+            // journal, and clearing it would delete a live claim.
             if state.active.is_none()
                 && let Some(record) = record
+                && record
+                    .reference
+                    .as_deref()
+                    .is_some_and(|reference| reference.starts_with("recovery:"))
                 && let Ok(lease) = self.lease(&selected.installation)
             {
                 let _ = lease.clear_if(&self.app_data, record.reference.as_deref());

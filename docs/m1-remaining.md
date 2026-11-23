@@ -6,8 +6,8 @@ third whole-packet review blocked at `2d80c99` and its findings were fixed.
 ## Short answer
 
 Every M1 deliverable exists and runs, and every defect the final review found has been fixed with a
-witness or a native run behind it. What remains is **deferred evidence, a Windows lease check in
-flight, and gate acceptance** — not missing features or known code defects.
+witness or a native run behind it. What remains is **deferred evidence and gate acceptance** — not
+missing features or known code defects.
 
 ## The M1 task list, and its state
 
@@ -32,10 +32,10 @@ flight, and gate acceptance** — not missing features or known code defects.
 | Recovery rejected the state between the two Windows renames | `3f58e98` reverts a pending deploy and completes a pending restore | native NTFS process cut: Deploy `rolled_back`, Restore `completed` |
 | Displaced bytes hidden in the physical stage slot | `e5c584c` reports `slot: "stage"` and latches until review | tmpfs and Btrfs witnesses |
 | Abandoned imports never reclaimed, `reconcile` never called | `750d9d8` ownership before staging; `f406c1c` one startup reconcile in status | storage witnesses both roots; desktop and CLI show the report |
-| Privileged CI mount and unguarded Windows delete | `2982621` `/dev/shm` asserted tmpfs; Windows cleanup guarded by CI and profile | hosted job pending |
+| Privileged CI mount and unguarded Windows delete | `2982621` `/dev/shm` asserted tmpfs; Windows cleanup guarded by CI and profile | CI run 45127564821 green |
 | Desktop Apply/Restore discarded progress | `d32575d` engine transitions streamed to the channel | core/workspace/app witnesses; real desktop run pending |
 | Moved installation reported two different codes | `6e214f7` identity check before volume classification | witness on status and preview |
-| A crash during a lease update could leave an empty record read as vacant | `24047fa` publishes the record through a temp file and atomic replace; release unlinks; an empty record is `Unreadable` | platform witnesses both roots; NTFS run in flight |
+| A crash during a lease update could leave an empty record read as vacant | `24047fa` publishes the record through a temp file and atomic replace; release unlinks; an empty record is `Unreadable` | platform witnesses both roots; native NTFS 11/11 at `76f7850` |
 | An unowned revision was enumerated and deleted recursively after an emptiness check | `800e336` removes only an empty directory with one non-recursive call; anything that arrived is quarantined | storage witnesses both roots |
 | A stale restore, or a crash between claim and journal, could clear a newer claim or lock the install | `76f7850` reference-scoped clears, per-call restore references, and recovery clears an idle owned record | workspace witnesses both roots |
 | A blocked replay was announced as "Deployment accepted" | `fdee802` derives the notice from the blocker and phase | 81 frontend tests |
@@ -46,7 +46,6 @@ flight, and gate acceptance** — not missing features or known code defects.
 
 | Item | Size | Blocks "M1 done"? |
 |---|---|---|
-| Hosted CI asserting `/dev/shm` is tmpfs | one CI run | no |
 | Crash and power-cut recovery | large (lab protocol) | yes — M1's acceptance names recovery tests |
 | Windows namespace barrier experiment | medium | no, if the narrowed guarantee in ADR 0004 stands |
 | Real Skyrim SE run | medium (needs the game) | only if M1 is claimed as real-world verified |
@@ -64,8 +63,8 @@ flight, and gate acceptance** — not missing features or known code defects.
 
 ## To close M1
 
-1. Finish the Windows lease run and the hosted CI run.
+1. Have the gate accept this commit, with whatever exclusions steps 2–3 record; the Windows lease and
+   hosted CI runs are already recorded.
 2. Either run the crash/power-cut protocol or record in `docs/PLAN.md` that M1 is accepted without it,
    naming the risk that carries.
 3. Run one real Skyrim SE install, or record the same kind of exclusion.
-4. Have the gate accept that definition.

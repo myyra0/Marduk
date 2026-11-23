@@ -47,10 +47,13 @@ The rule and its wire surface live in `docs/contracts/m1-clients.md`.
 
 A stale or torn record refuses every catalog for that installation until the owner restores or the
 operator removes the lease file by hand. Residuals carried knowingly: deployments made before this
-change have no record and are invisible until their catalog claims once; a crash between the lease
-claim and the journal claim left a record that only the owner's recovery could clear, and recovery
-now does clear it when the journal is idle; the lease directory entry is not fsynced, and the Windows
-directory inherits `%LOCALAPPDATA%`'s ACL; arbitration is per OS user, so two users share nothing.
+change have no record and are invisible until their catalog claims once; a crash between a lease claim
+and the journal claim leaves a record that is only cleared automatically when it belongs to the
+`recovery:` family — a `plan:` record from a crashed deploy stays and must be removed by hand at the
+path `status` reports, because with an idle journal it cannot be distinguished from a deploy that is
+still between its lease claim and its journal claim; the lease directory entry is not fsynced, and the
+Windows directory inherits `%LOCALAPPDATA%`'s ACL; arbitration is per OS user, so two users share
+nothing.
 
 The lease directory is resolved from the process environment (`LOCALAPPDATA`; `XDG_STATE_HOME` else
 `HOME`), so two clients of the same account launched with deliberately different settings can resolve
