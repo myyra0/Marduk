@@ -15,9 +15,9 @@ use std::path::{Path, PathBuf};
 
 use marduk_core::ids::{ProfileId, ProfileRevision};
 use marduk_core::import::{BeginImport, ImportError, ImportId, ImportTarget};
-use marduk_storage::Catalog;
 use marduk_storage::library::{QuarantineReason, QuarantinedImport};
-use rusqlite::{Connection, OptionalExtension, params};
+use marduk_storage::Catalog;
+use rusqlite::{params, Connection, OptionalExtension};
 use zip_fixture::{ClassicZip, Record};
 
 const FILE: &str = "textures/synthetic.dds";
@@ -109,9 +109,41 @@ fn seed_unprovable_writing(root: &Path, id: ImportId, bytes: &[u8]) {
         .unwrap();
 }
 
+/// Build an empty reservation through the production adapter, then turn it into
+/// the shape a crash leaves before any archive byte: the row lost its ownership
+/// receipt and the directory lost its contents, while the directory keeps the
+/// identity the adapter created and verified. The unowned reclaim only removes
+/// a name it can prove is a private revision, so a hand-made directory is not
+/// that shape.
+fn seed_staged_empty_reservation(catalog: &mut Catalog, root: &Path, bytes: &[u8]) -> ImportId {
+    let id = catalog
+        .prepare_import(zip(bytes).as_slice(), plan())
+        .unwrap()
+        .id;
+
+    let db = database(root);
+    db.execute(
+        "DELETE FROM staged_files WHERE import_id = ?1",
+        [sql_id(id)],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE imports SET state = 'writing', owner = NULL, archive_sha = NULL \
+         WHERE id = ?1",
+        [sql_id(id)],
+    )
+    .unwrap();
+
+    let directory = revision_dir(root, id);
+    fs::remove_dir_all(directory.join("payload")).unwrap();
+    fs::remove_file(directory.join("archive.zip")).unwrap();
+    id
+}
+
 /// Seed a `writing` row with no ownership receipt. The caller decides whether
 /// `revisions/<id>` exists and what it holds, so each witness can pin the shape
-/// the adapter is asked to reclaim.
+/// the adapter is asked to reclaim. Only usable where no adapter can qualify the
+/// directory, because an unverified name is never reclaimable.
 fn seed_unowned_writing(root: &Path, id: ImportId) {
     database(root)
         .execute(
@@ -173,13 +205,11 @@ fn refused_import_leaves_no_private_snapshot_after_reconcile() {
     }
 
     assert_eq!(writing_rows(root), 0);
-    assert!(
-        catalog
-            .snapshot(ProfileId::new(1))
-            .unwrap()
-            .members
-            .is_empty()
-    );
+    assert!(catalog
+        .snapshot(ProfileId::new(1))
+        .unwrap()
+        .members
+        .is_empty());
 }
 
 #[test]
@@ -422,9 +452,14 @@ fn unowned_empty_reservation_is_removed() {
     let mut catalog = Catalog::open(root).unwrap();
     let available = catalog.stage_available();
 
-    let id = ImportId::try_from_u64(101).unwrap();
-    private_dir(&revision_dir(root, id));
-    seed_unowned_writing(root, id);
+    let id = if available {
+        seed_staged_empty_reservation(&mut catalog, root, b"reserved bytes")
+    } else {
+        let id = ImportId::try_from_u64(101).unwrap();
+        private_dir(&revision_dir(root, id));
+        seed_unowned_writing(root, id);
+        id
+    };
 
     let report = catalog.reconcile().unwrap();
     if available {
