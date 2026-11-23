@@ -142,7 +142,6 @@ pub enum DeployError {
     Io,
     UnknownOperation,
     NoActiveDeployment,
-    UnsupportedEvidenceVersion,
 }
 
 impl DeployError {
@@ -158,7 +157,6 @@ impl DeployError {
             Self::Io => "io",
             Self::UnknownOperation => "unknown_operation",
             Self::NoActiveDeployment => "no_active_deployment",
-            Self::UnsupportedEvidenceVersion => "unsupported_evidence_version",
         }
     }
 }

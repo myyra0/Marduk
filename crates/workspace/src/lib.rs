@@ -1625,7 +1625,6 @@ fn deploy_error(error: DeployError) -> WireError {
         DeployError::RecoveryConflict => WireError::new(Code::RecoveryConflict),
         DeployError::UnknownOperation => WireError::new(Code::UnknownOperation),
         DeployError::NoActiveDeployment => WireError::new(Code::NoActiveDeployment),
-        DeployError::UnsupportedEvidenceVersion => WireError::new(Code::Storage),
         DeployError::Io => WireError::new(Code::Io),
     }
 }

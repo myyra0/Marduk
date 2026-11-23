@@ -2,7 +2,7 @@
 //!
 //! This store owns durable plans, the exclusive per-root lease, operation and
 //! step phases, and committed generations in the existing `catalog.sqlite3`.
-//! Evidence is a versioned portable encoding checked on every read; no caller
+//! Evidence is a portable encoding checked on every read; no caller
 //! path or native diagnostic is stored.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -2299,13 +2299,12 @@ pub(crate) fn decode_locator(location: &[u8]) -> Option<PathBuf> {
     }
 }
 
-// Portable evidence encoding v2. Every blob is length-prefixed and rejected on
-// a short read, unknown tag or trailing bytes. Version 1 encoded a Linux mount
-// view in the identity; it is refused rather than misread. There is no
+// Portable evidence encoding. Every blob is length-prefixed and rejected on a
+// short read, unknown tag or trailing bytes. The first tag is the identity
+// domain (Linux or Windows); there is no separate format version and no
 // installed base to migrate.
-
 pub(crate) fn encode_root(root: &RootIdentity) -> Vec<u8> {
-    let mut out = vec![2u8];
+    let mut out = Vec::new();
     encode_identity(&mut out, root.evidence());
     out
 }
@@ -2348,11 +2347,6 @@ fn encode_identity(out: &mut Vec<u8>, identity: &NativeIdentity) {
 
 pub(crate) fn decode_root(blob: &[u8]) -> Result<RootIdentity, DeployError> {
     let mut reader = Reader::new(blob);
-    match reader.u8()? {
-        2 => {}
-        1 => return Err(DeployError::UnsupportedEvidenceVersion),
-        _ => return Err(DeployError::Io),
-    }
     let identity = decode_identity(&mut reader)?;
     reader.finish()?;
     Ok(RootIdentity::from_adapter_evidence(identity))
@@ -2942,41 +2936,18 @@ mod identity_codec_tests {
         let valid = encode_root(&linux(Some(11)));
         asserts_io_err(&[]);
         asserts_io_err(&[0]);
+        asserts_io_err(&[1]);
         asserts_io_err(&[2]);
-        asserts_io_err(&[3]);
         asserts_io_err(&valid[..valid.len() - 1]);
         // Unknown tree marker.
         let mut unknown_tree = valid.clone();
-        let marker = 1 + 1 + 8 + 16;
+        let marker = 1 + 8 + 16;
         unknown_tree[marker] = 2;
         asserts_io_err(&unknown_tree);
         // Unknown identity tag.
         let mut unknown_tag = valid;
-        unknown_tag[1] = 2;
+        unknown_tag[0] = 2;
         asserts_io_err(&unknown_tag);
-    }
-
-    #[test]
-    fn identity_codec_refuses_the_v1_mount_view_layout() {
-        let mut v1_linux = vec![1u8, 0];
-        v1_linux.extend_from_slice(&0x9123_4567_89ab_cdef_u64.to_le_bytes());
-        v1_linux.extend_from_slice(&[7u8; 16]);
-        v1_linux.extend_from_slice(&42_u64.to_le_bytes());
-        v1_linux.push(0);
-        v1_linux.extend_from_slice(&9_000_000_001_u64.to_le_bytes());
-        v1_linux.extend_from_slice(&(-1234_i64).to_le_bytes());
-        v1_linux.extend_from_slice(&5678_u32.to_le_bytes());
-        let mut v1_windows = vec![1u8, 1];
-        v1_windows.extend_from_slice(&0xfeed_face_u64.to_le_bytes());
-        v1_windows.extend_from_slice(&[3u8; 16]);
-        v1_windows.extend_from_slice(&132_000_000_000_i64.to_le_bytes());
-        for blob in [v1_linux, v1_windows] {
-            assert_eq!(
-                decode_root(&blob),
-                Err(DeployError::UnsupportedEvidenceVersion),
-                "{blob:?}"
-            );
-        }
     }
 
     #[test]
