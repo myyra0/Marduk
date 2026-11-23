@@ -54,6 +54,41 @@ Which `(capability, operating system, volume class)` configurations may run is d
 - Setup cannot deselect a pair with a pending operation or active generation, nor move its locator. `Journal::verify_pending_pair` binds recovery to the recorded lease pair and locator before `DeploymentInputs::verify_recovery_root` runs. The default methods are for synthetic ports; a native port must reopen that recorded locator. `Journal::block_displacement` records the reported reference and observation, exposes only operation-owned references in status, and `has_unresolved_displacement` prevents automatic retries or terminal release until review. The default journal methods preserve compatibility with in-memory fakes; the SQLite journal implements the durable checks.
 - Copy effects may retain a displaced file only in the sealed retain slot (a physical exchange alias may make that the stage slot); the deterministic alternate slot is a detection slot, never a valid publication destination. Original and step backups are not displacement destinations. Both locations must be inspectable before an effect and after restart; `inspect_alternate_displacement` defaults to absent only for ports that never write there. A non-empty alternate or a canonical retain that does not match the expected displaced artifact is recorded even without an effect ACK and blocks a clean settle. Status lists its checked reference with the distinct `alternate` slot; `OperationJournal::unexpected_displacements` returns the corresponding observations. The `alternate` wire location reports evidence only and is never offered as a publication destination. A canonical retain reported as retained must have been positively observed; an unreadable slot is not advertised as known.
 
+### Interrupted exchange and displaced slots
+
+On Windows an exchange is two no-replace renames (target → `displaced`, stage → target), so a process
+can stop between them. The recoverable intermediate shape is exact: the target is absent, the stage
+holds the sealed post-image, and the canonical `displaced` slot (or the physical stage alias on Linux)
+holds the expected pre-image. Recovery treats that shape as a first-class state rather than a conflict:
+
+- A pending **deploy** step in `Attempting` is reverted: `displaced` moves back to the target with no
+  replace, the stage is left untouched, and `Undone` is recorded only after the target matches the
+  recorded pre-image.
+- A pending **restore** step in `Attempting` (forward or undo) is completed: the stage moves onto the
+  absent target, then the displaced object is retained, and `Applied`/`Undone` is recorded only after
+  the post-state fingerprint matches.
+- Timestamp authority is bound to both objects before any move and never reopened by path afterwards.
+  An occupied target is never overwritten; any other slot shape remains a typed refusal.
+
+`windows_exchange_process_cut` in `crates/workspace/tests/native_deployment.rs` produces that state
+through the production effect path in one process and recovers it in a separate process on NTFS; the
+recorded result is Deploy `rolled_back` and Restore `completed`. Linux does not have this state: its
+exchange is one `renameat2`.
+
+A foreign object that ends up in the physical stage slot (the accepted final-race window) is reported
+with `slot: "stage"`, latches `RecoveryConflict`, and keeps its bytes; status names the slot so the
+operator can find the displaced file. The latch survives reopen until an explicit review clears it.
+
+### Import reservations and startup reclaim
+
+A `writing` import row owns `revisions/<id>` from before the first archive byte, and the adapter records
+the native directory identity before staging begins. `Catalog::reconcile` therefore reclaims a killed or
+refused import only from proven ownership: a recorded owner removes the whole proved revision tree; an
+unowned empty directory is removed; unowned non-empty bytes, a changed or unavailable stage, and any
+published import are quarantined and left in place. Prepared and committed data is never reclaimed. The
+workspace calls this exactly once on open and reports the result as the status reconciliation described
+in [M1-U01](m1-clients.md); it is not called again per poll.
+
 ### Native seam that R03 must qualify
 
 The platform effect must support **observe**, **publish new into an absent path without clobber**, **exchange/replace existing while retaining the actually displaced file**, and **detach an expected existing file without destroying unknown bytes**. R03 must specify the exact Rust port signature and map the native return and reobserved state to outcomes for each qualified configuration. Do not replace it with check-then-overwrite or check-then-delete.

@@ -3,7 +3,7 @@
 Open defects and unproven claims at this checkpoint. Nothing here is silent: each entry says what can go
 wrong, who it affects, and what would close it. Anything fixed since the finding is not listed.
 
-Last reviewed: 2026-11-22, at the commit recorded in `docs/research/m1-native-results.md`.
+Last reviewed: 2026-11-23, at the commit recorded in `docs/research/m1-native-results.md`.
 
 ## Open defects
 
@@ -21,10 +21,18 @@ Pinning them needs a custom SQLite VFS, which is not justified for a same-privil
 last verification and the native syscall. Marduk detects it afterwards, retains actually displaced bytes, and refuses
 to retry automatically. It does not claim prevention. See the contract's "Known limitation" paragraph.
 
+**Cross-catalog installation ownership.** Deployments made before the installation lease existed carry no record, so
+another catalog root can deploy over them until their owning catalog claims once. A crash between the lease claim and
+the journal claim leaves a record only that owner's recovery clears; it is never adopted silently. The lease directory
+entry is not fsynced, and arbitration is per OS user — two users on one machine share nothing. See
+[ADR 0005](adr/0005-arbitrate-installation-ownership-outside-app-data.md).
+
 ## Unproven claims (no defect, no evidence)
 
-- **Crash and power-cut recovery.** Recovery is proven across process restarts, not across a crash or power cut. The
-  experiment specified in `docs/research/m1-native-results.md` has not been run to a conclusive result.
+- **Crash and power-cut recovery.** Recovery is proven across process restarts, and the interrupted-exchange shape is
+  proven across a deliberate process cut on NTFS. NTFS cache flushing, metadata journal replay, dirty-volume recovery
+  and a real power cut are not exercised, and a cut during recovery is not modelled. The experiment specified in
+  `docs/research/m1-native-results.md` has not been run to a conclusive result.
 - **Windows namespace barrier.** Windows deploy uses the narrowed guarantee in `docs/adr/0004-windows-writes-use-standard-flush.md`.
   The stricter barrier is "theoretically approved for testing, empirical proof deferred".
 - **Real game smoke.** No real Skyrim SE install has been exercised; all fixtures are synthetic.
