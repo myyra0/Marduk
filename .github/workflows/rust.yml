@@ -110,9 +110,14 @@ jobs:
           cache-dependency-path: app/package-lock.json
       - name: Install WebKitGTK build dependencies
         if: matrix.os != 'windows-2025'
+        # A stalled Ubuntu mirror must fail and retry, not hold the step until
+        # the job timeout: 30s without progress aborts one fetch, and the
+        # runner's slowest measured leg (10m) still leaves headroom at 20m.
+        timeout-minutes: 20
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          apt_opts=(-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=3)
+          sudo apt-get update "${apt_opts[@]}"
+          sudo apt-get install -y --no-install-recommends "${apt_opts[@]}" \
             libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
       - run: npm ci
         working-directory: app
@@ -165,9 +170,12 @@ jobs:
           cache-dependency-path: app/package-lock.json
       - name: Install WebKitGTK build and WebDriver dependencies
         if: matrix.os == 'ubuntu-24.04'
+        # Same bounded acquisition as the desktop build leg.
+        timeout-minutes: 20
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          apt_opts=(-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=3)
+          sudo apt-get update "${apt_opts[@]}"
+          sudo apt-get install -y --no-install-recommends "${apt_opts[@]}" \
             libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
             webkit2gtk-driver xvfb
       - run: npm ci
