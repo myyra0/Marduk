@@ -1030,12 +1030,16 @@ impl Workspace {
     /// volume, and the app and game roots must share a rename domain or the
     /// staged object cannot be renamed onto the target.
     fn require_native_effects(&self, selected: &SelectedInstallation) -> Result<(), WireError> {
+        // Identity first: a recorded installation that no longer reopens is a
+        // lost target (`TargetUnavailable`), not a verdict on its volume. A
+        // genuine volume or rename-domain refusal still answers
+        // `UnsupportedTarget`.
+        let binding = self.reopen(selected)?;
         if !marduk_platform::deploy_volume_qualified(&self.app_data)
             || !marduk_platform::deploy_volume_qualified(&selected.locator)
         {
             return Err(unsupported_effect());
         }
-        let binding = self.reopen(selected)?;
         let app =
             marduk_platform::effects::directory_identity(&self.app_data).map_err(root_error)?;
         if !same_rename_domain(&app, binding.identities().0) {

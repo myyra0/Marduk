@@ -302,16 +302,30 @@ fn import_preview_and_apply_round_trip_on_a_qualified_volume() {
 }
 
 #[test]
-fn unqualified_volume_keeps_deploy_preview_apply_and_restore_typed_unavailable() {
+fn moved_installation_reports_target_unavailable_on_status_and_deploy() {
     let mut fixture = Fixture::new();
     fixture.setup();
 
-    // The gate answers for the recorded installation root's volume class.
-    // Replace that root with an object the probe cannot classify, leaving the
-    // real tree intact behind it, so the same three routes stay refusals.
+    // Rename the recorded root and leave nothing at the recorded spelling. The
+    // identity no longer reopens, so the target is unavailable before any
+    // volume verdict can be mistaken for the cause.
     let real = fixture.temp.path().join("game-real");
     fs::rename(&fixture.game, &real).unwrap();
-    fs::write(&fixture.game, b"not a directory").unwrap();
+
+    let status = fixture.status();
+    assert_eq!(status["availability"]["target"]["available"], json!(false));
+    assert_eq!(
+        status["availability"]["target"]["blocker"]["code"],
+        json!("TargetUnavailable")
+    );
+    assert_eq!(
+        status["availability"]["deploy"]["blocker"]["code"],
+        json!("TargetUnavailable")
+    );
+    assert_eq!(
+        status["availability"]["restore"]["blocker"]["code"],
+        json!("TargetUnavailable")
+    );
 
     for envelope in [
         fixture.send(json!({
@@ -324,25 +338,50 @@ fn unqualified_volume_keeps_deploy_preview_apply_and_restore_typed_unavailable()
         })),
     ] {
         let error = expect_error(envelope);
-        assert_eq!(code(&error), "UnsupportedTarget");
-        assert_eq!(error["detail"]["reason"], json!("Configuration"));
+        assert_eq!(code(&error), "TargetUnavailable");
     }
+
     // No work is recorded, so Restore answers from the journal before the gate.
     let restore = expect_ok(fixture.send(json!({ "op": "restore", "args": {} })));
     assert_eq!(restore["outcome"], json!("noActiveDeployment"));
     assert_eq!(restore["code"], json!("NoActiveDeployment"));
 
-    // The same typed unavailability is visible before the user tries.
+    assert!(
+        !fixture.app.join("effects/ops").exists(),
+        "a refused route creates no operation-owned directory"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unqualified_app_volume_still_reports_unsupported_target_with_its_reason() {
+    let mut fixture = Fixture::new();
+    fixture.setup();
+
+    // Keep the recorded installation intact and point only the app root at a
+    // volume the probe cannot qualify. Open handles keep the catalog and
+    // journal usable, so this is a volume refusal, not a lost target.
+    let real = fixture.temp.path().join("app-real");
+    fs::rename(&fixture.app, &real).unwrap();
+    std::os::unix::fs::symlink("/sys/kernel", &fixture.app).unwrap();
+
     let status = fixture.status();
-    assert_eq!(status["availability"]["deploy"]["available"], json!(false));
+    assert_eq!(status["availability"]["target"]["available"], json!(true));
     assert_eq!(
-        status["availability"]["restore"]["blocker"]["code"],
+        status["availability"]["deploy"]["blocker"]["code"],
         json!("UnsupportedTarget")
     );
     assert_eq!(
-        status["availability"]["restore"]["blocker"]["detail"]["reason"],
+        status["availability"]["deploy"]["blocker"]["detail"]["reason"],
         json!("Configuration")
     );
+
+    let error = expect_error(fixture.send(json!({
+        "op": "deploy_preview",
+        "args": { "atRevision": "0" },
+    })));
+    assert_eq!(code(&error), "UnsupportedTarget");
+    assert_eq!(error["detail"]["reason"], json!("Configuration"));
     assert!(
         !fixture.app.join("effects/ops").exists(),
         "a refused route creates no operation-owned directory"
@@ -542,6 +581,7 @@ fn ids_and_revisions_serialize_as_exact_decimal_strings() {
         },
         pending: None,
         active_generation_id: Some(large_id.to_owned()),
+        reconciliation: marduk_workspace::Reconciliation::default(),
     })
     .unwrap();
 

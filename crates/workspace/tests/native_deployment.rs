@@ -1118,28 +1118,25 @@ fn dispatch_deploy_and_restore_through_the_whole_composition() {
 
 #[cfg(unix)]
 #[test]
-#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
 fn unqualified_installation_root_keeps_client_deploy_and_restore_refused() {
     let mut fixture = Fixture::new();
     fixture.setup();
 
-    // The gate asks the recorded installation root's volume class. Point that
-    // path at a link the probe cannot resolve: the record has no proof for the
-    // answer, so dispatch refuses before any effect. The fixture and its
-    // initial tree stay intact behind the link.
+    // Rename the recorded root without a replacement. Identity re-verification
+    // fails first, so the refusal is a lost target rather than a volume verdict.
     let real = fixture.temp.path().join("game-real");
     fs::rename(&fixture.game, &real).unwrap();
-    std::os::unix::fs::symlink("/sys/kernel", &fixture.game).unwrap();
 
     let status = expect_ok(fixture.send(json!({"op": "status", "args": {}})));
+    assert_eq!(status["availability"]["target"]["available"], json!(false));
+    assert_eq!(
+        status["availability"]["target"]["blocker"]["code"],
+        json!("TargetUnavailable")
+    );
     assert_eq!(status["availability"]["deploy"]["available"], json!(false));
     assert_eq!(
         status["availability"]["deploy"]["blocker"]["code"],
-        json!("UnsupportedTarget")
-    );
-    assert_eq!(
-        status["availability"]["deploy"]["blocker"]["detail"]["reason"],
-        json!("Configuration")
+        json!("TargetUnavailable")
     );
 
     for request in [
@@ -1147,8 +1144,7 @@ fn unqualified_installation_root_keeps_client_deploy_and_restore_refused() {
         json!({"op": "deploy_apply", "args": {"planId": "1"}}),
     ] {
         let error = expect_error(fixture.send(request));
-        assert_eq!(error["code"], json!("UnsupportedTarget"));
-        assert_eq!(error["detail"]["reason"], json!("Configuration"));
+        assert_eq!(error["code"], json!("TargetUnavailable"));
     }
 
     // A clean root has no recorded work, so Restore answers from the journal
