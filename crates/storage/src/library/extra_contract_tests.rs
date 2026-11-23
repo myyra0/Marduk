@@ -10,8 +10,6 @@ mod zip_fixture;
 
 // Keep the named witnesses discoverable by `cargo test --lib extra_contract_tests`.
 mod library_contract {
-    use std::path::Path;
-
     use marduk_core::ids::{MemberId, ProfileId, ProfileRevision};
     use marduk_core::import::{
         BeginImport, ImportId, ImportTarget, NamedProfile, PreparedImport, ProfileEditError,

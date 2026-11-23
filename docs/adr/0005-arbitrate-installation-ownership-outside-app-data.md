@@ -1,6 +1,6 @@
 # ADR 0005: arbitrate installation ownership outside app-data
 
-**Status:** Accepted, 2026-11-23. Linux runtime proof recorded; native Windows runtime `not run`.
+**Status:** Accepted, 2026-11-23. Linux runtime proof and native Windows runtime proof recorded (platform 7/7, workspace 3/3 on NTFS).
 
 ## Context
 
@@ -23,9 +23,14 @@ Arbitrate ownership of the *physical installation*, not of the catalog:
 - The record names the owning catalog root. A non-owner deploy, restore or recovery is refused with
   `ActiveDeployment` naming the owner; only the owner clears it, after a completed restore or a
   fully rolled-back deploy.
-- The existing `WriterGate` serialises examine/claim/release only. The record itself outlives
-  processes, because a deployment does.
+- The existing `WriterGate` serialises examine/claim/release only, on a separate `<key>.lock` object;
+  the record lives in `<key>.lease`. Windows byte-range locks are mandatory, so gating the record file
+  itself would make the read handle fail with `ERROR_LOCK_VIOLATION`; the two-object split keeps the
+  lock off the data path on both platforms. The record outlives processes, because a deployment does.
 - An unreadable or unparseable record is a typed refusal, never "absent".
+- On Linux the lease directory is created mode 0700 and refused if it is not owner-only. On Windows it
+  inherits `%LOCALAPPDATA%`'s ACL (SYSTEM, Administrators and the user); no narrower DACL is claimed.
+  The Windows path comes from `LOCALAPPDATA`; unset or relative refuses rather than guessing.
 - The journal's `root_leases` row is unchanged; this is additional arbitration, not a replacement.
 
 The rule and its wire surface live in `docs/contracts/m1-clients.md`.

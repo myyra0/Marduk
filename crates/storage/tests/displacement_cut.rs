@@ -545,7 +545,7 @@ fn attempting_fixture() -> (TempDir, OperationJournal, PreparedStep) {
 
 #[test]
 fn readability_degrading_keeps_history_and_advertises_only_a_latest_positive_read() {
-    let (dir, mut journal, step) = attempting_fixture();
+    let (dir, journal, step) = attempting_fixture();
     let op = step.op;
     let mut effects = MemEffects::new();
     let displaced = MemFile {

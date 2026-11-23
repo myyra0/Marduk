@@ -68,7 +68,10 @@ holds the expected pre-image. Recovery treats that shape as a first-class state 
   absent target, then the displaced object is retained, and `Applied`/`Undone` is recorded only after
   the post-state fingerprint matches.
 - Timestamp authority is bound to both objects before any move and never reopened by path afterwards.
-  An occupied target is never overwritten; any other slot shape remains a typed refusal.
+  An occupied target is never overwritten; any other slot shape remains a typed refusal. A publish
+  onto a name a restore recently vacated restores the staged object's birth time through the handle
+  bound before the move, so NTFS tunneling cannot re-apply the previous object's creation time and
+  make a successful publish re-observe as ambiguous.
 
 `windows_exchange_process_cut` in `crates/workspace/tests/native_deployment.rs` produces that state
 through the production effect path in one process and recovers it in a separate process on NTFS; the

@@ -27,7 +27,8 @@ flight, and gate acceptance** — not missing features or known code defects.
 | Finding | Fix | Evidence |
 |---|---|---|
 | Frozen library oracle drifted from its freeze commit | `6223d27` restores `57de606` byte-for-byte and moves the two witnesses to an unfrozen module | `git diff 57de606` empty; 10 frozen tests pass |
-| Two catalogs could each own one installation | `5d10180` installation lease outside app-data | workspace/platform witnesses on tmpfs and Btrfs; CLI end-to-end; NTFS run in flight |
+| Two catalogs could each own one installation | `5d10180` installation lease outside app-data; `3bd111a` gates on a separate lock object so Windows mandatory locks cannot block the record | workspace/platform witnesses on tmpfs and Btrfs; native NTFS 7/7 platform, 3/3 workspace; CLI end-to-end |
+| NTFS re-applied a vacated name's creation time to the next publish, blocking a deploy after a restore | `196a477` binds and restores the staged object's birth time around the move, as `replace` already did | witness failed on NTFS before the fix and passes after; platform 15/15 on the VM |
 | Recovery rejected the state between the two Windows renames | `3f58e98` reverts a pending deploy and completes a pending restore | native NTFS process cut: Deploy `rolled_back`, Restore `completed` |
 | Displaced bytes hidden in the physical stage slot | `e5c584c` reports `slot: "stage"` and latches until review | tmpfs and Btrfs witnesses |
 | Abandoned imports never reclaimed, `reconcile` never called | `750d9d8` ownership before staging; `f406c1c` one startup reconcile in status | storage witnesses both roots; desktop and CLI show the report |
@@ -40,7 +41,6 @@ flight, and gate acceptance** — not missing features or known code defects.
 
 | Item | Size | Blocks "M1 done"? |
 |---|---|---|
-| Windows installation lease runtime | one VM run | no, if it passes; it is in flight |
 | Hosted CI asserting `/dev/shm` is tmpfs | one CI run | no |
 | Crash and power-cut recovery | large (lab protocol) | yes — M1's acceptance names recovery tests |
 | Windows namespace barrier experiment | medium | no, if the narrowed guarantee in ADR 0004 stands |
