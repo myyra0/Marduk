@@ -105,6 +105,13 @@ A local, disposable Windows VM provides native NTFS evidence. It is isolated fro
 - Run tests through a scheduled task as `admin` (`schtasks /ru admin /rp 0000`), redirect to a log on the VM, then read the log. `cargo clean` once if crate metadata is corrupted (`E0786`/`LNK1207`).
 - Treat any Windows result as evidence only when the log names the test and its `test result:` line; an advisory CI job is not a substitute.
 
+## Design defaults
+
+- **Prefer a product constraint to a coordination protocol.** One client runs at a time, and one catalog owns an installation. Do not add simultaneous-client or multi-writer support without a milestone requirement; a lease, lock hierarchy or compare-and-swap needs a reason to exist.
+- **State that describes an installation lives with it.** An ownership marker belongs in the installation, not in a per-user directory derived from `HOME`/`XDG_*`; then every client sees it without key derivation or environment agreement.
+- **Interrupted work rolls back and is redone.** Do not resume by adopting an artifact whose ownership is unproven. Retained originals are the rollback source; a new attempt starts clean.
+- **When a review finding is really a scope question, delete the feature before hardening it.** Reducing surface area is a valid fix.
+
 ## Mod ordering
 
 As in MO2: lower-priority mods at the top, higher-priority mods (which overwrite them) at the bottom.
