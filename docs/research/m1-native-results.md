@@ -664,20 +664,9 @@ derivation; `not run` is never a pass.
 | `publish_keeps_the_staged_birth_time_on_a_recently_vacated_name` | NTFS, a restore detaches the name and a deploy refills it inside the tunneling window | `cargo test -p marduk-platform --test effects_primitives -- --exact publish_keeps_the_staged_birth_time_on_a_recently_vacated_name` | failed before the fix (observed creation time is the detached object's), passes after it; `publish_refuses_a_denied_attribute_write_before_moving_anything` also passes | `196a477` |
 | `cargo test -p marduk-workspace --test native_deployment -- --ignored` regression | NTFS after the recovery and tunneling fixes | as above | 4 compiled Windows witnesses pass, including `windows_exchange_process_cut` | `196a477` |
 
-Not run at this point: the hosted CI step that asserts `/dev/shm` is tmpfs. Power-cut durability, the Windows namespace-barrier experiment, a real Skyrim SE install, ext4 and Btrfs cross-subvolume remain as recorded in `docs/m1/limitations.md`.
-| `windows_exchange_process_cut` case-mismatch variants | NTFS | `cargo test -p marduk-workspace --test native_deployment -- --ignored --test-threads=1` | failed before the fix (`Unavailable(OutsideBoundary)`), all four Deploy/Restore × matched/mismatched variants pass after it; recovery names the recorded leaf | `b903625` |
-
-| `second_guard_in_one_process_is_busy`, `dropping_the_guard_allows_a_new_one`, `lock_lives_beneath_the_per_user_root_not_a_catalog_root` | Linux per-user instance gate | `cargo test -p marduk-platform --test instance_gate` | 4 passed; a second client is refused, the path is not under a catalog root | `265fd46` |
-| `deployment_marker_names_one_catalog_and_any_catalog_can_clear_it`, `deployment_marker_survives_a_fresh_adapter_and_unreadable_is_a_conflict`, `a_second_prepare_cannot_adopt_a_matching_stage_or_backup` | tmpfs and Btrfs | `TMPDIR=/tmp` and `/var/tmp cargo test -p marduk-storage --test native_effects -- --ignored` | 23 passed each; marker is create-once, unreadable is a conflict, no artifact adoption | `9143c38` |
-| `a_foreign_marker_refuses_preview_deploy_restore_and_recover_without_a_write`, `a_completed_restore_removes_the_marker_and_the_other_catalog_then_deploys`, `a_successful_deploy_keeps_the_marker`, `an_owned_marker_with_an_idle_journal_is_cleared_by_recover`, `a_fully_rolled_back_deploy_removes_the_marker`, `recovery_after_moving_the_installation_is_target_unavailable` | tmpfs and Btrfs | `TMPDIR=/tmp` and `/var/tmp cargo test -p marduk-workspace --test deployment_marker -- --ignored --test-threads=1` | 6 passed each | `c00a1d9` |
-
-Windows coverage for the marker and the instance gate: `instance_gate` 4/4 on NTFS (second
-acquisition `Busy`, lock under the per-user root, not a catalog root); `deployment_marker` 6/6 on
-NTFS (foreign refusal, restore removal, rollback removal, idle-owner recovery, moved installation);
-`deployment_marker_cross_platform` 2/2 on NTFS (fresh-adapter `Owned` read-back and refusal to adopt
-a matching stage/backup); `native_deployment` 4/4 including the case-mismatched cut. The
-unreadable-marker assertion remains Unix-only because mode bits have no Windows equivalent; on
-Windows the foreign-claim refusal is exercised with a readable marker.
+Superseded rows from earlier iterations are removed; the catalog-scoped redesign below is the
+current evidence. Power-cut durability, the Windows namespace-barrier experiment, a real Skyrim SE
+install, ext4 and Btrfs cross-subvolume remain as recorded in `docs/m1/limitations.md`.
 
 ### Catalog-scoped ownership redesign
 

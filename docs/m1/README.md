@@ -25,7 +25,7 @@ run. The required independent **Sol** review has **not** run, so M1 has not been
 | Capability | Linux tmpfs | Linux Btrfs | Windows NTFS |
 |---|---|---|---|
 | Import and publish | yes | yes | yes |
-| Deploy, restore, bytes and metadata | yes | yes | yes |
+| Deploy, restore, bytes and metadata | yes | yes | bytes; metadata via the copy primitive (composed metadata run not claimed) |
 | Recovery across a process restart | yes | yes | yes |
 | Recovery from a cut between the two Windows renames | n/a | n/a | yes |
 | Deployment marker and foreign-catalog refusal | yes | yes | yes |
