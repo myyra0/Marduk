@@ -406,6 +406,7 @@ version = "0.1.0"
 dependencies = [
  "marduk-archive",
  "marduk-core",
+ "marduk-games",
  "marduk-platform",
  "rusqlite",
  "sha2",

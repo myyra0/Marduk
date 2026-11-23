@@ -12,5 +12,6 @@ sha2 = { version = "=0.11.1", default-features = false }
 
 [dev-dependencies]
 marduk-archive = { path = "../archive" }
+marduk-games = { path = "../games" }
 rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled"] }
 tempfile = "=3.27.0"
