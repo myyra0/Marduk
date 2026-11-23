@@ -681,7 +681,7 @@ Windows the foreign-claim refusal is exercised with a readable marker.
 
 ### Catalog-scoped ownership redesign
 
-These runs used the tree recorded in the commit this section landed with. The native VM received
+These runs used the tree archived at `cd1ffa3`. The native VM received
 an archive of that tree, with `crates` removed before extraction. The rows above describe earlier implementations.
 
 | Witness | Configuration | Command | Result |
