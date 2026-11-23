@@ -6,6 +6,14 @@
 //! writer gate is held only while the record is examined or replaced; the
 //! ownership it records outlives every process by design.
 //!
+//! The gate and the record are separate objects: `<key>.lock` carries no data
+//! and is only ever locked, while `<key>.lease` holds the record and is read
+//! and written through ordinary file handles. Windows byte-range locks are
+//! mandatory, so gating on the record itself would make the second handle fail
+//! with `ERROR_LOCK_VIOLATION`; the separate lock object keeps the lock off the
+//! data path on every platform. The lock file stays after release, and a
+//! crashed claim leaves it behind, but neither is a record.
+//!
 //! The record names the owning catalog root and the operation or generation it
 //! holds. A present-but-unparseable record is a typed refusal: it is never
 //! read as absent.
@@ -60,10 +68,15 @@ pub enum LeaseClaim {
     Foreign(PathBuf),
 }
 
-/// One installation lease file pinned to its verified directory.
+/// One installation lease pinned to its verified directory.
+///
+/// `<key>.lock` is the gate and never carries data; `<key>.lease` is the
+/// record. The identities live in one verified directory handle, so both
+/// objects share its containment checks without sharing a data path.
 pub struct InstallationLease {
     dir: File,
-    name: String,
+    lock: String,
+    record: String,
 }
 
 impl InstallationLease {
@@ -97,7 +110,8 @@ impl InstallationLease {
         }
         Ok(Self {
             dir,
-            name: format!("{key}.lease"),
+            lock: format!("{key}.lock"),
+            record: format!("{key}.lease"),
         })
     }
 
@@ -105,7 +119,7 @@ impl InstallationLease {
     pub fn read(&self) -> Result<Option<LeaseRecord>, LeaseError> {
         let gate = self.gate()?;
         let _guard = gate.try_lock().map_err(gate_error)?;
-        read_locked(&self.dir, &self.name)
+        read_locked(&self.dir, &self.record)
     }
 
     /// Claim the installation for `record`, or report the foreign owner.
@@ -115,32 +129,34 @@ impl InstallationLease {
     pub fn claim(&self, record: &LeaseRecord) -> Result<LeaseClaim, LeaseError> {
         let gate = self.gate()?;
         let _guard = gate.try_lock().map_err(gate_error)?;
-        if let Some(current) = read_locked(&self.dir, &self.name)? {
+        if let Some(current) = read_locked(&self.dir, &self.record)? {
             if current.app_data != record.app_data {
                 return Ok(LeaseClaim::Foreign(current.app_data));
             }
         }
-        crate::write_private_file(&self.dir, &self.name, &encode(record)).map_err(root_error)?;
+        crate::write_private_file(&self.dir, &self.record, &encode(record)).map_err(root_error)?;
         Ok(LeaseClaim::Acquired)
     }
 
     /// Clear the record only when it names `app_data`, under one held gate.
-    /// Returns whether this catalog owned it. The lease file itself stays, so
-    /// a gate opened before the clear keeps a stable identity.
+    /// Returns whether this catalog owned it. The gate object stays, so a gate
+    /// opened before the clear keeps a stable identity; the record is cleared to
+    /// zero length rather than removed.
     pub fn release(&self, app_data: &Path) -> Result<bool, LeaseError> {
         let gate = self.gate()?;
         let _guard = gate.try_lock().map_err(gate_error)?;
-        match read_locked(&self.dir, &self.name)? {
+        match read_locked(&self.dir, &self.record)? {
             Some(current) if current.app_data == app_data => {
-                crate::write_private_file(&self.dir, &self.name, b"").map_err(root_error)?;
+                crate::write_private_file(&self.dir, &self.record, b"").map_err(root_error)?;
                 Ok(true)
             }
             _ => Ok(false),
         }
     }
 
+    /// Open the data-free lock object for this installation.
     fn gate(&self) -> Result<WriterGate, LeaseError> {
-        WriterGate::open_at(&self.dir, &self.name).map_err(gate_error)
+        WriterGate::open_at(&self.dir, &self.lock).map_err(gate_error)
     }
 }
 

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use marduk_platform::effects::directory_identity;
 use marduk_platform::lease::{InstallationLease, LeaseClaim, LeaseError, LeaseRecord};
+use marduk_platform::{WriterGate, open_private_directory};
 use tempfile::TempDir;
 
 fn lease_key(identity_key: [u8; 32]) -> String {
@@ -143,6 +144,70 @@ fn a_key_that_is_not_a_digest_is_refused() {
     assert_eq!(
         InstallationLease::open(&leases, &"0".repeat(63)).err(),
         Some(LeaseError::Unreadable)
+    );
+}
+
+#[test]
+fn a_held_gate_is_busy_on_the_record_and_never_an_io_failure() {
+    let temp = scratch();
+    let leases = temp.path().join("marduk").join("leases");
+    let key = lease_key([7u8; 32]);
+    let lease = InstallationLease::open(&leases, &key).unwrap();
+    let lock = format!("{key}.lock");
+
+    // Vacant record: a held gate reports Busy, and the record is still absent
+    // once the gate drops.
+    {
+        let dir = open_private_directory(&leases).unwrap();
+        let gate = WriterGate::open_at(&dir, &lock).unwrap();
+        let guard = gate.try_lock().unwrap();
+        assert_eq!(lease.read(), Err(LeaseError::Busy));
+        drop(guard);
+    }
+    assert_eq!(lease.read().unwrap(), None, "a vacant record stays vacant");
+
+    // Claimed record: the same held gate still reads as Busy, not Io, and the
+    // record is unchanged after the gate drops. On Windows the old design
+    // returned Io here because the lock and the data shared one file.
+    let owner = record("/data/owner", Some("plan:1"));
+    assert_eq!(lease.claim(&owner).unwrap(), LeaseClaim::Acquired);
+    {
+        let dir = open_private_directory(&leases).unwrap();
+        let gate = WriterGate::open_at(&dir, &lock).unwrap();
+        let guard = gate.try_lock().unwrap();
+        assert_eq!(lease.read(), Err(LeaseError::Busy));
+        drop(guard);
+    }
+    assert_eq!(lease.read().unwrap(), Some(owner));
+}
+
+#[test]
+fn a_torn_record_refuses_and_a_non_owner_release_leaves_it_intact() {
+    let temp = scratch();
+    let leases = temp.path().join("marduk").join("leases");
+    let key = lease_key([4u8; 32]);
+    let lease = InstallationLease::open(&leases, &key).unwrap();
+    let owner = record("/data/owner", Some("plan:2"));
+    lease.claim(&owner).unwrap();
+
+    assert!(
+        !lease.release(&PathBuf::from("/data/other")).unwrap(),
+        "only the owner releases"
+    );
+    assert_eq!(
+        lease.read().unwrap(),
+        Some(owner),
+        "a non-owner release leaves the record intact"
+    );
+
+    let path = leases.join(format!("{key}.lease"));
+    let torn = b"marduk-lease/1\ntorn";
+    fs::write(&path, torn).unwrap();
+    assert_eq!(lease.read(), Err(LeaseError::Unreadable));
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        torn,
+        "a refused read leaves the torn bytes for inspection"
     );
 }
 
