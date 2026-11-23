@@ -87,7 +87,9 @@ jobs:
   desktop-native:
     name: Desktop native build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # 45, not 30: a cold Ubuntu runner compiles Tauri and WebKitGTK from scratch,
+    # so the old limit cut a working build short rather than catching a hang.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -130,6 +132,13 @@ jobs:
     # The Windows entry is advisory on the same terms and is not evidence until
     # the hosted job has actually passed.
     #
+    # continue-on-error is set at job level so a failure here cannot turn the run
+    # red: the Windows legs have no interactive desktop session on a hosted
+    # runner, so msedgedriver fails at session creation ("DevToolsActivePort
+    # file doesn't exist") regardless of the shell. Such a leg still shows as a
+    # failed job in the run, but it is not a required check. No evidence is
+    # claimed from this job until it passes somewhere with a real desktop.
+    #
     # The environment, not the test, is the variable: on Ubuntu xvfb supplies
     # the display and WebKitWebDriver supplies the automation session; on
     # Windows the Edge WebDriver must match the installed WebView2 runtime.
@@ -137,6 +146,7 @@ jobs:
     name: Desktop shell smoke (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
