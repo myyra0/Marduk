@@ -1233,22 +1233,29 @@ impl Workspace {
         // Examine the marker before answering. A process can exit between
         // claiming the installation and recording an operation, leaving a marker
         // and an idle journal; returning `None` without looking would block the
-        // installation forever. An unqualified root cannot read the marker, so
-        // it is a typed refusal rather than a simulated clean answer.
-        let mut port = self.native_effects(&selected)?;
-        match port.deployment_owner().map_err(deploy_error)? {
-            DeploymentOwner::Foreign(owner) => return Err(foreign_deployment(&owner)),
-            DeploymentOwner::Owned(_) if state.pending.is_none() && state.active.is_none() => {
-                // The crash leftover: this catalog claimed the installation but
-                // recorded no pending work and no generation.
-                let _ = port.clear_deployment();
-                return Ok(None);
+        // installation forever. A clean but unqualified root must still answer
+        // from the journal, so the adapter is optional until there is work.
+        let mut port = match self.native_effects(&selected) {
+            Ok(port) => Some(port),
+            Err(error) if error.code == Code::UnsupportedTarget => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(port) = port.as_mut() {
+            match port.deployment_owner().map_err(deploy_error)? {
+                DeploymentOwner::Foreign(owner) => return Err(foreign_deployment(&owner)),
+                DeploymentOwner::Owned(_) if state.pending.is_none() && state.active.is_none() => {
+                    // The crash leftover: this catalog claimed the installation
+                    // but recorded no pending work and no generation.
+                    let _ = port.clear_deployment();
+                    return Ok(None);
+                }
+                DeploymentOwner::Owned(_) | DeploymentOwner::Vacant => {}
             }
-            DeploymentOwner::Owned(_) | DeploymentOwner::Vacant => {}
         }
         if state.pending.is_none() {
             return Ok(None);
         }
+        let mut port = port.ok_or_else(unsupported_effect)?;
         let recovered = marduk_core::recovery::recover_pending(
             &mut self.journal,
             &mut port,

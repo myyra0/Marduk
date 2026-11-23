@@ -129,16 +129,15 @@ impl Fixture {
 }
 
 #[test]
-fn clean_root_on_an_unqualified_volume_is_a_typed_refusal() {
+fn clean_root_on_an_unqualified_volume_answers_none() {
     let mut fixture = Fixture::new();
     fixture.setup();
-    // Recovery must read the marker before it can answer `None`; an
-    // unqualified app root cannot open the adapter, so it is a typed refusal
-    // rather than a simulated clean answer.
+    // Recovery creates no work: with nothing pending, an unqualified root
+    // answers `null` from the journal instead of pretending to need a port.
     let real = fixture.make_root_unqualified();
 
-    let error = expect_error(fixture.recover());
-    assert_eq!(error["code"], json!("UnsupportedTarget"));
+    let result = expect_ok(fixture.recover());
+    assert_eq!(result, Value::Null);
     assert_eq!(fixture.pending_in(&real), None);
 }
 
