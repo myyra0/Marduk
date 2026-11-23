@@ -30,7 +30,12 @@
 //!   failure removes the partial artifact.
 //! - `publish` is one `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`, so an
 //!   existing target makes the call fail; the target bytes are untouched. The
-//!   move is refused across volumes (`MOVEFILE_COPY_ALLOWED` is not set).
+//!   move is refused across volumes (`MOVEFILE_COPY_ALLOWED` is not set). NTFS
+//!   tunneling would give the target name the creation time of the object it
+//!   recently held, so the staged birth time is captured through a handle bound
+//!   before the move, restored through that same handle afterwards, and re-read
+//!   before success is reported. A denied attribute write therefore fails before
+//!   the name changes.
 //! - `replace` is an exchange of two no-replace renames in production: the
 //!   target object moves to the canonical `<operation>/displaced` slot, then the
 //!   staged object moves onto the target name. The target briefly has no name
@@ -219,10 +224,19 @@ pub fn publish(
     }
     #[cfg(windows)]
     {
+        // A restore detaches the target name moments before the next deploy
+        // publishes onto it. NTFS tunneling re-applies the detached entry's
+        // creation time to the moved object, which would break the sealed
+        // staged fingerprint. Bind the timestamp authority before the move so a
+        // denied attribute write fails while both names are still untouched,
+        // then restore the birth through that handle and never by name.
+        let staged_file = timestamp_authority(stage_path).map_err(attribute_error)?;
+        let staged_creation = creation_time(&staged_file).map_err(attribute_error)?;
         // No REPLACE_EXISTING and no COPY_ALLOWED: an existing target or another
         // volume fails the move and leaves both names as they were. The caller's
         // fresh observation classifies a reported failure as a conflict.
-        move_path_noreplace(stage_path, target_path)
+        move_path_noreplace(stage_path, target_path)?;
+        restore_creation_time(&staged_file, staged_creation).map_err(attribute_error)
     }
 }
 
@@ -811,6 +825,12 @@ fn wide(path: &std::path::Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
 
     path.as_os_str().encode_wide().chain([0]).collect()
+}
+
+/// Represent a typed root refusal in the `io` channel `publish` reports on.
+#[cfg(windows)]
+fn attribute_error(error: RootError) -> io::Error {
+    io::Error::other(error)
 }
 
 /// Open the timestamp-write authority for an object without following a final

@@ -105,16 +105,56 @@ fn publish_refuses_an_existing_target_and_leaves_it_intact() {
     assert_eq!(fingerprint_path(&stage_path).unwrap(), staged);
 }
 
+/// Deny `FILE_WRITE_ATTRIBUTES` to Everyone on `path`. Returns false when this
+/// environment cannot enforce the denial, so a witness skips rather than
+/// asserting on a token that still holds the right.
+#[cfg(windows)]
+fn deny_attribute_writes(path: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::process::Command;
+    use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
+
+    let acl = |arguments: &[&str]| {
+        Command::new("icacls")
+            .arg(path)
+            .args(arguments)
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    if !acl(&["/deny", "*S-1-1-0:(WA)"]) {
+        return false;
+    }
+    if std::fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .open(path)
+        .is_ok()
+    {
+        assert!(acl(&["/remove:d", "*S-1-1-0"]));
+        return false;
+    }
+    true
+}
+
+#[cfg(windows)]
+fn remove_attribute_write_denial(path: &Path) {
+    use std::process::Command;
+
+    assert!(
+        Command::new("icacls")
+            .arg(path)
+            .args(["/remove:d", "*S-1-1-0"])
+            .status()
+            .is_ok_and(|status| status.success()),
+        "could not remove the attribute-write denial"
+    );
+}
+
 /// A target that denies attribute writes must fail the exchange before either
 /// name moves. The read handle still works, so a preview can admit the file;
 /// only the timestamp authority is withheld.
 #[cfg(windows)]
 #[test]
 fn replace_refuses_a_denied_attribute_write_before_moving_anything() {
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::process::Command;
-    use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
-
     let directory = tempfile::tempdir().unwrap();
     let stage_directory = directory.path().join("stage-directory");
     let target_directory = directory.path().join("target-directory");
@@ -125,24 +165,8 @@ fn replace_refuses_a_denied_attribute_write_before_moving_anything() {
     fs::write(&stage_path, STAGED).unwrap();
     fs::write(&target_path, ORIGINAL).unwrap();
 
-    let acl = |arguments: &[&str]| {
-        Command::new("icacls")
-            .arg(&target_path)
-            .args(arguments)
-            .status()
-            .is_ok_and(|status| status.success())
-    };
-    if !acl(&["/deny", "*S-1-1-0:(WA)"]) {
+    if !deny_attribute_writes(&target_path) {
         eprintln!("skipped: this environment cannot deny FILE_WRITE_ATTRIBUTES");
-        return;
-    }
-    if std::fs::OpenOptions::new()
-        .access_mode(FILE_WRITE_ATTRIBUTES)
-        .open(&target_path)
-        .is_ok()
-    {
-        assert!(acl(&["/remove:d", "*S-1-1-0"]));
-        eprintln!("skipped: an ordinary token still holds FILE_WRITE_ATTRIBUTES");
         return;
     }
 
@@ -162,7 +186,109 @@ fn replace_refuses_a_denied_attribute_write_before_moving_anything() {
     assert_eq!(fs::read(&stage_path).unwrap(), STAGED);
     assert!(!stage_directory.join("displaced").exists(), "no name moved");
 
-    assert!(acl(&["/remove:d", "*S-1-1-0"]));
+    remove_attribute_write_denial(&target_path);
+}
+
+/// `publish` binds the timestamp authority on the staged object before its
+/// no-replace move, so a denied attribute write fails while both names are
+/// still untouched.
+#[cfg(windows)]
+#[test]
+fn publish_refuses_a_denied_attribute_write_before_moving_anything() {
+    let directory = tempfile::tempdir().unwrap();
+    let stage_directory = directory.path().join("stage-directory");
+    let target_directory = directory.path().join("target-directory");
+    fs::create_dir(&stage_directory).unwrap();
+    fs::create_dir(&target_directory).unwrap();
+    let stage_path = stage_directory.join("stage");
+    let target_path = target_directory.join("leaf");
+    fs::write(&stage_path, STAGED).unwrap();
+
+    if !deny_attribute_writes(&stage_path) {
+        eprintln!("skipped: this environment cannot deny FILE_WRITE_ATTRIBUTES");
+        return;
+    }
+
+    let stage = open_directory(&stage_directory).unwrap();
+    let target = open_directory(&target_directory).unwrap();
+    let result = publish(&stage, "stage", &target, "leaf", &stage_path, &target_path);
+    assert!(result.is_err(), "a denied attribute write must fail");
+    assert!(!target_path.exists(), "no name moved");
+    assert_eq!(fs::read(&stage_path).unwrap(), STAGED);
+
+    remove_attribute_write_denial(&stage_path);
+}
+
+/// NTFS tunneling gives a rename into a just-vacated name the removed entry's
+/// creation time. A restore detaches the previous object and the next deploy
+/// publishes onto that name moments later, so `publish` must restore the
+/// staged birth time and the target must re-observe as the sealed stage.
+#[test]
+fn publish_keeps_the_staged_birth_time_on_a_recently_vacated_name() {
+    let directory = tempfile::tempdir().unwrap();
+    let stage_directory = directory.path().join("stage-directory");
+    let target_directory = directory.path().join("target-directory");
+    let retain_directory = directory.path().join("retain-directory");
+    fs::create_dir(&stage_directory).unwrap();
+    fs::create_dir(&target_directory).unwrap();
+    fs::create_dir(&retain_directory).unwrap();
+    let stage_path = stage_directory.join("stage");
+    let next_stage_path = stage_directory.join("next-stage");
+    let target_path = target_directory.join("leaf");
+    let retain_path = retain_directory.join("displaced");
+    let stage = open_directory(&stage_directory).unwrap();
+    let target = open_directory(&target_directory).unwrap();
+    let retain = open_directory(&retain_directory).unwrap();
+
+    // The previous deploy published an object, then a restore detached it.
+    fs::write(&stage_path, ORIGINAL).unwrap();
+    set_modified(&stage_path, modified() - Duration::from_secs(60));
+    #[cfg(windows)]
+    set_creation_time(&stage_path, modified());
+    publish(&stage, "stage", &target, "leaf", &stage_path, &target_path).unwrap();
+    let detached = fingerprint_path(&target_path).unwrap();
+    detach(
+        &target,
+        "leaf",
+        &retain,
+        "displaced",
+        &target_path,
+        &retain_path,
+    )
+    .unwrap();
+    assert!(!target_path.exists());
+    assert_eq!(fingerprint_path(&retain_path).unwrap(), detached);
+
+    // The next deploy publishes a different staged object onto the name the
+    // detach just vacated, inside the tunneling window. A fresh stage name keeps
+    // the staged birth its own: recreating the old stage name would itself be
+    // tunnelled and the two sides would agree by accident.
+    fs::write(&next_stage_path, STAGED).unwrap();
+    set_modified(&next_stage_path, modified());
+    let staged = fingerprint_path(&next_stage_path).unwrap();
+    #[cfg(windows)]
+    assert_ne!(
+        creation_time(&retain_path),
+        creation_time(&next_stage_path),
+        "the witness needs a vacated birth time that differs from the staged one"
+    );
+
+    publish(
+        &stage,
+        "next-stage",
+        &target,
+        "leaf",
+        &next_stage_path,
+        &target_path,
+    )
+    .unwrap();
+
+    assert_eq!(fs::read(&target_path).unwrap(), STAGED);
+    assert_eq!(
+        fingerprint_path(&target_path).unwrap(),
+        staged,
+        "the moved object must keep the sealed stage fingerprint, creation time included"
+    );
 }
 
 /// NTFS tunneling gives a rename into a just-vacated name the removed entry's
@@ -733,6 +859,38 @@ fn creation_time(path: &Path) -> i64 {
         0
     );
     basic.CreationTime
+}
+
+/// Give a file an unmistakable birth time, so a witness can prove the value a
+/// vacated name carries differs from the staged object's own.
+#[cfg(windows)]
+fn set_creation_time(path: &Path, time: SystemTime) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::Storage::FileSystem::SetFileTime;
+
+    // FILETIME counts 100 ns units from 1601-01-01.
+    const UNIX_EPOCH_IN_FILETIME_SECONDS: u64 = 11_644_473_600;
+    let elapsed = time.duration_since(UNIX_EPOCH).unwrap();
+    let ticks = (elapsed.as_secs() + UNIX_EPOCH_IN_FILETIME_SECONDS) * 10_000_000
+        + u64::from(elapsed.subsec_nanos()) / 100;
+    let creation = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    let file = File::options().write(true).open(path).unwrap();
+    assert_ne!(
+        unsafe {
+            SetFileTime(
+                file.as_raw_handle(),
+                &creation,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        },
+        0,
+        "could not set the creation time"
+    );
 }
 
 #[cfg(windows)]
