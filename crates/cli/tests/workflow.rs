@@ -41,6 +41,7 @@ impl Fixture {
             .args(arguments)
             .current_dir(cwd)
             .env("XDG_DATA_HOME", &self.data)
+            .env("XDG_RUNTIME_DIR", self.temp.path().join("runtime"))
             .env("HOME", self.temp.path())
             .env_remove("APPDATA")
             .env_remove("LOCALAPPDATA");
@@ -412,4 +413,34 @@ fn id_and_revision_syntax_stops_at_the_signed_boundary() {
         assert_eq!(output.status.code(), Some(2));
         assert_eq!(code(&envelope(&output)), "InvalidRequest");
     }
+}
+
+#[test]
+fn a_running_client_makes_the_next_one_busy() {
+    let fixture = Fixture::new();
+    // Hold the same per-user gate the child resolves, without touching this
+    // process's environment.
+    let lock_dir = fixture.temp.path().join("runtime").join("marduk");
+    fs::create_dir_all(&lock_dir).unwrap();
+    let gate =
+        marduk_platform::WriterGate::open(lock_dir.join("instance.lock")).expect("open gate");
+    let held = gate.try_lock().expect("hold the instance gate");
+
+    let output = fixture.run(&["status", "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let value = envelope(&output);
+    assert_eq!(code(&value), "Busy");
+    assert_eq!(
+        value["error"]["message"].as_str(),
+        Some("another Marduk client is running")
+    );
+
+    drop(held);
+    let output = fixture.run(&["status", "--json"]);
+    let value = envelope(&output);
+    assert_ne!(
+        value["error"]["code"].as_str(),
+        Some("Busy"),
+        "gate frees after release"
+    );
 }

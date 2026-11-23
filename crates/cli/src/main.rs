@@ -120,6 +120,21 @@ fn resolved_app_data() -> Result<std::path::PathBuf, WireError> {
 }
 
 fn run(cli: Cli) -> i32 {
+    // One client at a time across the desktop shell and every CLI invocation.
+    let _instance = match marduk_platform::acquire_instance_guard() {
+        Ok(guard) => guard,
+        Err(marduk_platform::GateError::Busy) => {
+            let error = WireError::with_message(Code::Busy, "another Marduk client is running");
+            return report(Envelope::error(error), cli.json);
+        }
+        Err(error) => {
+            let error = WireError::with_message(
+                Code::Storage,
+                format!("could not take the Marduk instance gate: {error}"),
+            );
+            return report(Envelope::error(error), cli.json);
+        }
+    };
     let request = match request(cli.command) {
         Ok(request) => request,
         Err(error) => return report(Envelope::error(error), cli.json),

@@ -48,12 +48,15 @@ mod windows;
 #[cfg(windows)]
 pub use windows::{WriterGate, WriterGuard};
 
+pub use instance::{InstanceGuard, acquire_instance_guard};
+
 #[cfg(target_os = "linux")]
 use linux as native;
 #[cfg(windows)]
 use windows as native;
 
 pub mod effects;
+mod instance;
 pub mod lease;
 pub mod library_stage;
 #[doc(hidden)]

@@ -1929,6 +1929,7 @@ dependencies = [
 name = "marduk-desktop"
 version = "0.1.0"
 dependencies = [
+ "marduk-platform",
  "marduk-workspace",
  "serde",
  "serde_json",
