@@ -202,13 +202,18 @@ fn report(envelope: Envelope<Value>, wants_json: bool) -> i32 {
 /// Human mode keeps the stable code and the same serialized detail the wire
 /// envelope carries, so wording never replaces the typed reason.
 fn human_error(error: &WireError) -> String {
-    match &error.detail {
+    let mut text = match &error.detail {
         None => error.code.as_str().to_owned(),
         Some(detail) => match serde_json::to_string(detail) {
             Ok(text) => format!("{} {text}", error.code.as_str()),
             Err(_) => error.code.as_str().to_owned(),
         },
+    };
+    if let Some(message) = &error.message {
+        text.push_str(": ");
+        text.push_str(message);
     }
+    text
 }
 
 fn emit(envelope: &Envelope<Value>) {

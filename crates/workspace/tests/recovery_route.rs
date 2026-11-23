@@ -40,6 +40,11 @@ fn expect_error(envelope: Envelope<Value>) -> Value {
     }
 }
 
+/// The installation lease directory for one witness.
+fn state_root(temp: &Path) -> PathBuf {
+    temp.join("marduk").join("leases")
+}
+
 struct Fixture {
     temp: TempDir,
     app: PathBuf,
@@ -55,7 +60,7 @@ impl Fixture {
         fs::create_dir_all(game.join("Data/textures")).unwrap();
         fs::write(game.join("SkyrimSE.exe"), b"").unwrap();
         fs::write(game.join("Data/textures/winner.dds"), b"base\n").unwrap();
-        let workspace = Workspace::open(&app).unwrap();
+        let workspace = Workspace::open_at(&app, &state_root(temp.path())).unwrap();
         Self {
             temp,
             app,

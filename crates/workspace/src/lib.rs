@@ -30,6 +30,7 @@ use marduk_core::recovery::{BackupRef, BackupSlot, Journal, StepDirection};
 use marduk_core::root_identity::{NativeIdentity, RootError, RootIdentity, UnsupportedReason};
 use marduk_games::skyrim_se;
 use marduk_platform::InstallationBinding;
+use marduk_platform::lease::{InstallationLease, LeaseClaim, LeaseError, LeaseRecord};
 use marduk_storage::Catalog;
 use marduk_storage::native_effects::NativeEffects;
 use marduk_storage::operation_journal::OperationJournal;
@@ -171,6 +172,7 @@ pub enum Code {
     RecoveryConflict,
     UnknownOperation,
     NoActiveDeployment,
+    LeaseUnreadable,
     Io,
 }
 
@@ -204,6 +206,7 @@ impl Code {
             Self::RecoveryConflict => "RecoveryConflict",
             Self::UnknownOperation => "UnknownOperation",
             Self::NoActiveDeployment => "NoActiveDeployment",
+            Self::LeaseUnreadable => "LeaseUnreadable",
             Self::Io => "Io",
         }
     }
@@ -250,17 +253,35 @@ pub struct WireError {
     pub code: Code,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<Detail>,
+    /// Human-readable context for the typed refusal, such as the owning
+    /// catalog root of a foreign installation lease. Clients show it beside
+    /// the stable code; they never branch on its wording.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 impl WireError {
     pub fn new(code: Code) -> Self {
-        Self { code, detail: None }
+        Self {
+            code,
+            detail: None,
+            message: None,
+        }
     }
 
     pub fn with_detail(code: Code, detail: Detail) -> Self {
         Self {
             code,
             detail: Some(detail),
+            message: None,
+        }
+    }
+
+    pub fn with_message(code: Code, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            detail: None,
+            message: Some(message.into()),
         }
     }
 }
@@ -432,7 +453,10 @@ pub struct Progress {
 
 /// One shared client service over the authoritative catalog and journal.
 pub struct Workspace {
+    /// Absolute catalog root. Also the owner named in the cross-catalog
+    /// installation lease.
     app_data: PathBuf,
+    lease_root: PathBuf,
     catalog: Catalog,
     journal: OperationJournal,
     selections: SelectionStore,
@@ -440,11 +464,27 @@ pub struct Workspace {
 
 impl Workspace {
     /// Open the shared state under the application data root.
+    ///
+    /// The cross-catalog installation lease lives in the user's state
+    /// directory, outside every app-data root, so a second catalog of the same
+    /// user still sees who owns an installation.
     pub fn open(app_data: &Path) -> Result<Self, WireError> {
-        let catalog = Catalog::open(app_data).map_err(import_error)?;
-        let journal = OperationJournal::open(app_data).map_err(deploy_error)?;
+        let lease_root = marduk_platform::lease::installation_lease_dir().map_err(root_error)?;
+        Self::open_at(app_data, &lease_root)
+    }
+
+    /// Open the shared state with an explicit lease directory.
+    ///
+    /// Embedded clients and tests use this to keep the user's state directory
+    /// untouched; production clients call [`Workspace::open`].
+    pub fn open_at(app_data: &Path, lease_root: &Path) -> Result<Self, WireError> {
+        let app_data =
+            std::path::absolute(app_data).map_err(|_| WireError::new(Code::InvalidPath))?;
+        let catalog = Catalog::open(&app_data).map_err(import_error)?;
+        let journal = OperationJournal::open(&app_data).map_err(deploy_error)?;
         Ok(Self {
-            app_data: app_data.to_path_buf(),
+            app_data,
+            lease_root: lease_root.to_path_buf(),
             catalog,
             journal,
             selections: SelectionStore::new(),
@@ -599,7 +639,16 @@ impl Workspace {
         };
 
         if let Some(selected) = selected {
-            effects = effect_availability(self.require_native_effects(&selected));
+            // A record owned by another catalog is the dominant fact: this
+            // client may neither deploy nor restore, and the blocker names the
+            // owner rather than reporting a bare Busy.
+            effects = match self.foreign_owner(&selected)? {
+                Some(owner) => Availability {
+                    available: false,
+                    blocker: Some(foreign_deployment(&owner)),
+                },
+                None => effect_availability(self.require_native_effects(&selected)),
+            };
             let SelectedInstallation {
                 id,
                 locator,
@@ -798,16 +847,39 @@ impl Workspace {
         let selected = self.selected_pair()?;
         self.require_native_effects(&selected)?;
         let mut port = self.native_effects(&selected)?;
-        let status =
+        // Cross-catalog ownership is claimed after the port is open (no public
+        // write yet) and before the first effect; the record is held only
+        // while it changes. A record naming another catalog root is refused
+        // here, whatever this journal says.
+        self.claim_installation(&selected, format!("plan:{}", plan.get()))?;
+        let committed =
             marduk_core::deployment::commit_deployment(&mut self.journal, &mut port, plan, || {
                 false
-            })
-            .map_err(deploy_error)?;
+            });
+        let status = match committed {
+            Ok(status) => status,
+            Err(error) => {
+                // A failure that ended with no pending work and no active
+                // generation left nothing deployed. Anything else keeps the
+                // claim so an interrupted deployment cannot hide ownership.
+                self.release_if_idle(&selected);
+                return Err(deploy_error(error));
+            }
+        };
+        if let Some(generation) = status.generation {
+            self.reference_installation(&selected, format!("generation:{}", generation.get()));
+        }
         Ok(operation(status))
     }
 
     fn restore_generation(&mut self) -> Result<RestoreResult, WireError> {
         let selected = self.selected_pair()?;
+        // Only the recorded owner may restore. A foreign record refuses even a
+        // restore this catalog would answer as a no-op: the installation is
+        // not this catalog's to change.
+        if let Some(owner) = self.foreign_owner(&selected)? {
+            return Err(foreign_deployment(&owner));
+        }
         // Answer the no-work and pending cases from the journal before opening
         // the port. A clean root is `NoActiveDeployment`, not an unavailable
         // volume, and a pending Restore reports its tracked status.
@@ -832,24 +904,41 @@ impl Workspace {
             return Err(deploy_error(DeployError::Busy));
         }
         if state.active.is_none() {
+            // A claim left by an interrupted attempt that rolled back is this
+            // catalog's stale record and nothing is deployed; clear it.
+            self.release_if_idle(&selected);
             return Ok(RestoreResult::NoActiveDeployment {
                 code: Code::NoActiveDeployment,
             });
         }
         self.require_native_effects(&selected)?;
         let mut port = self.native_effects(&selected)?;
+        // Claim before the first restore effect; the record is held only while
+        // it changes, and only the recorded owner may perform this restore.
+        self.claim_installation(&selected, "restore".to_owned())?;
         match marduk_core::deployment::restore(
             &mut self.journal,
             &mut port,
             &selected.installation,
             &selected.data,
         ) {
-            Ok(status) => Ok(RestoreResult::Operation {
-                operation: operation(status),
-            }),
-            Err(DeployError::NoActiveDeployment) => Ok(RestoreResult::NoActiveDeployment {
-                code: Code::NoActiveDeployment,
-            }),
+            Ok(status) => {
+                // The restore is the journal's answer; a release that fails
+                // leaves an extra refusal behind, never a wrong write. No
+                // other catalog may claim this installation while it stands.
+                if let Ok(lease) = self.lease(&selected.installation) {
+                    let _ = lease.release(&self.app_data);
+                }
+                Ok(RestoreResult::Operation {
+                    operation: operation(status),
+                })
+            }
+            Err(DeployError::NoActiveDeployment) => {
+                self.release_if_idle(&selected);
+                Ok(RestoreResult::NoActiveDeployment {
+                    code: Code::NoActiveDeployment,
+                })
+            }
             Err(error) => Err(deploy_error(error)),
         }
     }
@@ -859,6 +948,80 @@ impl Workspace {
             .selected_installation()
             .map_err(deploy_error)?
             .ok_or_else(|| WireError::new(Code::TargetUnavailable))
+    }
+
+    /// The lease object for one physical installation. The key is derived from
+    /// the recorded root identity, not from any path.
+    fn lease(&self, installation: &RootIdentity) -> Result<InstallationLease, WireError> {
+        let key = hex(&installation.installation_key());
+        InstallationLease::open(&self.lease_root, &key).map_err(lease_error)
+    }
+
+    /// The recorded owner of this installation, when a record exists.
+    fn lease_owner(&self, installation: &RootIdentity) -> Result<Option<PathBuf>, WireError> {
+        let key = hex(&installation.installation_key());
+        let Some(lease) =
+            InstallationLease::open_existing(&self.lease_root, &key).map_err(lease_error)?
+        else {
+            return Ok(None);
+        };
+        Ok(lease
+            .read()
+            .map_err(lease_error)?
+            .map(|record| record.app_data))
+    }
+
+    /// The owning catalog root when it is not this catalog.
+    fn foreign_owner(&self, selected: &SelectedInstallation) -> Result<Option<PathBuf>, WireError> {
+        Ok(self
+            .lease_owner(&selected.installation)?
+            .filter(|owner| *owner != self.app_data))
+    }
+
+    /// Claim the installation for this catalog before its first public write.
+    fn claim_installation(
+        &self,
+        selected: &SelectedInstallation,
+        reference: String,
+    ) -> Result<(), WireError> {
+        let record = LeaseRecord {
+            app_data: self.app_data.clone(),
+            reference: Some(reference),
+        };
+        match self
+            .lease(&selected.installation)?
+            .claim(&record)
+            .map_err(lease_error)?
+        {
+            LeaseClaim::Acquired => Ok(()),
+            LeaseClaim::Foreign(owner) => Err(foreign_deployment(&owner)),
+        }
+    }
+
+    /// Point this catalog's record at the committed generation. A failure
+    /// leaves the earlier reference, which still names this catalog and so
+    /// still arbitrates correctly.
+    fn reference_installation(&self, selected: &SelectedInstallation, reference: String) {
+        let record = LeaseRecord {
+            app_data: self.app_data.clone(),
+            reference: Some(reference),
+        };
+        if let Ok(lease) = self.lease(&selected.installation) {
+            let _ = lease.claim(&record);
+        }
+    }
+
+    /// Clear this catalog's record once its journal records neither pending
+    /// work nor an active generation for the installation. A foreign record is
+    /// never cleared.
+    fn release_if_idle(&mut self, selected: &SelectedInstallation) {
+        let idle = match self.journal.root_state(&selected.data) {
+            Ok(state) => state.pending.is_none() && state.active.is_none(),
+            Err(_) => false,
+        };
+        if idle && let Ok(lease) = self.lease(&selected.installation) {
+            let _ = lease.release(&self.app_data);
+        }
     }
 
     /// One decision point for a new client-visible deploy or restore. A
@@ -939,15 +1102,35 @@ impl Workspace {
         if state.pending.is_none() {
             return Ok(None);
         }
+        // Recovery performs public writes, so only the recorded owner may run
+        // it.
+        if let Some(owner) = self.foreign_owner(&selected)? {
+            return Err(foreign_deployment(&owner));
+        }
         let mut port = self.native_effects(&selected)?;
-        marduk_core::recovery::recover_pending(
+        self.claim_installation(&selected, "recovery".to_owned())?;
+        let recovered = marduk_core::recovery::recover_pending(
             &mut self.journal,
             &mut port,
             &selected.installation,
             &selected.data,
-        )
-        .map(|status| status.map(operation))
-        .map_err(deploy_error)
+        );
+        match recovered {
+            Ok(status) => {
+                match &status {
+                    Some(settled) if settled.generation.is_some() => {
+                        let generation = settled.generation.expect("checked above");
+                        self.reference_installation(
+                            &selected,
+                            format!("generation:{}", generation.get()),
+                        );
+                    }
+                    _ => self.release_if_idle(&selected),
+                }
+                Ok(status.map(operation))
+            }
+            Err(error) => Err(deploy_error(error)),
+        }
     }
 
     /// Synthetic restart reconciliation, see [`Self::proof_preview_deployment`].
@@ -1144,6 +1327,7 @@ fn operation(status: OperationStatus) -> Operation {
             Blocker {
                 code: error.code,
                 detail: error.detail,
+                message: error.message,
             }
         }),
         retained: status.retained.into_iter().filter_map(retained).collect(),
@@ -1245,6 +1429,27 @@ fn unsupported_effect() -> WireError {
             reason: ReasonDto::Configuration,
         },
     )
+}
+
+/// The typed refusal for a record owned by another catalog root. The message
+/// names the owner so a client can say "deployed by another configuration"
+/// instead of showing a bare Busy.
+fn foreign_deployment(owner: &Path) -> WireError {
+    WireError::with_message(
+        Code::ActiveDeployment,
+        format!(
+            "this installation is deployed by another configuration: {}",
+            owner.display()
+        ),
+    )
+}
+
+fn lease_error(error: LeaseError) -> WireError {
+    match error {
+        LeaseError::Busy => WireError::with_message(Code::Busy, error.to_string()),
+        LeaseError::Unreadable => WireError::with_message(Code::LeaseUnreadable, error.to_string()),
+        LeaseError::Io => WireError::new(Code::Io),
+    }
 }
 
 fn import_error(error: ImportError) -> WireError {
@@ -1414,6 +1619,7 @@ mod tests {
             Code::RecoveryConflict,
             Code::UnknownOperation,
             Code::NoActiveDeployment,
+            Code::LeaseUnreadable,
             Code::Io,
         ];
         for code in codes {

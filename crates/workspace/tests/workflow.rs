@@ -14,6 +14,11 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use zip_fixture::{ClassicZip, Record};
 
+/// The installation lease directory for one witness.
+fn state_root(temp: &Path) -> PathBuf {
+    temp.join("marduk").join("leases")
+}
+
 struct Fixture {
     temp: TempDir,
     app: PathBuf,
@@ -28,13 +33,17 @@ impl Fixture {
         let game = temp.path().join("Skyrim Special Edition");
         fs::create_dir_all(game.join("Data")).unwrap();
         fs::write(game.join("SkyrimSE.exe"), b"").unwrap();
-        let workspace = Workspace::open(&app).unwrap();
+        let workspace = Workspace::open_at(&app, &state_root(temp.path())).unwrap();
         Self {
             temp,
             app,
             game,
             workspace,
         }
+    }
+
+    fn reopen(&self) -> Workspace {
+        Workspace::open_at(&self.app, &state_root(self.temp.path())).unwrap()
     }
 
     fn dispatch(&mut self, request: Request) -> Envelope<Value> {
@@ -167,7 +176,7 @@ fn setup_status_and_restart_share_the_authoritative_state() {
 
     // A new composition reloads the persisted pair; it never adopts state from
     // the previous process.
-    let mut reopened = Workspace::open(&fixture.app).unwrap();
+    let mut reopened = fixture.reopen();
     let status = expect_ok(reopened.dispatch(Request::new(Op::Status, json!({}))));
     assert_eq!(
         status["installation"]["label"],
@@ -191,7 +200,7 @@ fn empty_order_increments_the_profile_revision_once() {
 
     // Another client composition sees the committed revision, not a cached
     // sequence of its own.
-    let mut other = Workspace::open(&fixture.app).unwrap();
+    let mut other = fixture.reopen();
     let status = expect_ok(other.dispatch(Request::new(Op::Status, json!({}))));
     assert_eq!(status["profile"]["revision"], json!("1"));
     assert_eq!(
@@ -612,7 +621,7 @@ fn setup_returns_the_installation_committed_by_that_request() {
     })));
 
     // A second client changes the shared selected installation.
-    let mut second = Workspace::open(&fixture.app).unwrap();
+    let mut second = fixture.reopen();
     let second_selection = second
         .remember_selection(Purpose::Installation, other.clone())
         .unwrap();
