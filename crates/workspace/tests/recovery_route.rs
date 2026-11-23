@@ -156,6 +156,7 @@ fn moved_installation_is_target_unavailable() {
 }
 
 #[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs: reading the marker needs a native adapter"]
 fn nothing_pending_but_a_foreign_marker_refuses_and_names_the_owner() {
     let mut fixture = Fixture::new();
     fixture.setup();
@@ -185,6 +186,7 @@ fn nothing_pending_but_a_foreign_marker_refuses_and_names_the_owner() {
 }
 
 #[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs: reading the marker needs a native adapter"]
 fn idle_owned_marker_is_cleared_when_nothing_is_pending() {
     let mut fixture = Fixture::new();
     fixture.setup();
