@@ -35,6 +35,7 @@ export const CODES = [
   'RecoveryConflict',
   'UnknownOperation',
   'NoActiveDeployment',
+  'LeaseUnreadable',
   'Io',
 ] as const;
 
@@ -68,7 +69,7 @@ export type Detail =
   | { kind: LimitKind }
   | { reason: Reason };
 
-export type WireError = { code: Code; detail?: Detail };
+export type WireError = { code: Code; detail?: Detail; message?: string };
 export type Blocker = WireError;
 
 export type Envelope<T> = { ok: true; result: T } | { ok: false; error: WireError };
@@ -328,10 +329,13 @@ export function parseDetail(value: unknown, field = 'detail'): Detail {
 export function parseWireError(value: unknown, field = 'error'): WireError {
   const error = record(value, field);
   const code = parseCode(error.code, `${field}.code`);
+  const message =
+    error.message === undefined ? undefined : text(error.message, `${field}.message`);
+  const base: WireError = message === undefined ? { code } : { code, message };
   if (error.detail === undefined) {
-    return { code };
+    return base;
   }
-  return { code, detail: parseDetail(error.detail, `${field}.detail`) };
+  return { ...base, detail: parseDetail(error.detail, `${field}.detail`) };
 }
 
 export function parseEnvelope<T>(

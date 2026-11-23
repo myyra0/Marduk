@@ -90,7 +90,7 @@ describe('Rust-generated wire fixtures', () => {
     });
   });
 
-  it('keeps the stable code and typed detail when prose changes', () => {
+  it('keeps the stable code and detail while carrying message as context', () => {
     const original = parseEnvelope(errorInvalidPath, () => null);
     expect(original).toEqual({
       ok: false,
@@ -100,7 +100,25 @@ describe('Rust-generated wire fixtures', () => {
     const withWording = draft(errorInvalidPath, (value) => {
       value.error.message = 'The selected folder is not usable on this device.';
     });
-    expect(parseEnvelope(withWording, () => null)).toEqual(original);
+    expect(parseEnvelope(withWording, () => null)).toEqual({
+      ok: false,
+      error: {
+        code: 'InvalidPath',
+        detail: { reason: 'MissingParent' },
+        message: 'The selected folder is not usable on this device.',
+      },
+    });
+  });
+
+  it('parses LeaseUnreadable with its message instead of failing the transport', () => {
+    const tornLease = draft(errorStalePlan, (value) => {
+      value.error.code = 'LeaseUnreadable';
+      value.error.message = 'the lease record is torn';
+    });
+    expect(parseEnvelope(tornLease, () => null)).toEqual({
+      ok: false,
+      error: { code: 'LeaseUnreadable', message: 'the lease record is torn' },
+    });
   });
 
   it('parses limit details and detail-free blockers', () => {

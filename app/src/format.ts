@@ -9,9 +9,12 @@ export function describeDetail(detail: Detail): string {
 
 /** Stable code first; the detail is the typed reason, never prose. */
 export function describeBlocker(blocker: WireError): string {
-  return blocker.detail === undefined
-    ? blocker.code
-    : `${blocker.code} (${describeDetail(blocker.detail)})`;
+  const typed =
+    blocker.detail === undefined
+      ? blocker.code
+      : `${blocker.code} (${describeDetail(blocker.detail)})`;
+  // The message is context beside the stable code, never a branch point.
+  return blocker.message === undefined ? typed : `${typed}: ${blocker.message}`;
 }
 
 export function describeFailure(error: unknown): string {

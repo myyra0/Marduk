@@ -1017,5 +1017,8 @@ describe('workspace shell', () => {
     expect(describeBlocker(operationFixture.result.blocker ?? { code: 'Busy' })).toBe(
       'Busy',
     );
+    expect(describeBlocker({ code: 'LeaseUnreadable', message: 'the lease record is torn' })).toBe(
+      'LeaseUnreadable: the lease record is torn',
+    );
   });
 });
