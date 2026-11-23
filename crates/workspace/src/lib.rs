@@ -1233,7 +1233,8 @@ impl Workspace {
         // Examine the marker before answering. A process can exit between
         // claiming the installation and recording an operation, leaving a marker
         // and an idle journal; returning `None` without looking would block the
-        // installation forever.
+        // installation forever. An unqualified root cannot read the marker, so
+        // it is a typed refusal rather than a simulated clean answer.
         let mut port = self.native_effects(&selected)?;
         match port.deployment_owner().map_err(deploy_error)? {
             DeploymentOwner::Foreign(owner) => return Err(foreign_deployment(&owner)),

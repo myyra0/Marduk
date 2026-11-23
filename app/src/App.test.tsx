@@ -27,6 +27,7 @@ import {
   fixturePreview,
   fixturePrepared,
   fixtureRestore,
+  fixtureSnapshot,
   fixtureStatus,
 } from './test/fixtureTransport';
 
@@ -351,6 +352,36 @@ describe('workspace shell', () => {
 
     expect(await screen.findByText(/Not applied: StalePlan/)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Apply import/ })).not.toBeInTheDocument();
+  });
+
+  it('reloads status after Import Apply instead of trusting a replay snapshot', async () => {
+    const user = userEvent.setup();
+    const base = statusWithImport();
+    const later: WorkspaceStatus = {
+      ...base,
+      profile: { ...base.profile, revision: '99' },
+    };
+    let advanced = false;
+    const status = vi.fn<WorkspaceTransport['status']>(async () => ({
+      ok: true,
+      result: advanced ? later : base,
+    }));
+    const prepared = preparedFor(base);
+    await renderReady({
+      status,
+      importPreview: async () => ({ ok: true, result: prepared }),
+      importApply: async () => {
+        advanced = true;
+        return { ok: true, result: fixtureSnapshot() };
+      },
+    });
+
+    await user.type(screen.getByLabelText('Mod name'), 'Textures');
+    await user.click(screen.getByRole('button', { name: /Preview ZIP/ }));
+    await user.click(await screen.findByRole('button', { name: /Apply import/ }));
+
+    expect(await screen.findByText(/revision 99/)).toBeInTheDocument();
+    expect(status.mock.calls.length).toBeGreaterThan(1);
   });
 
   it('disables mutating controls when a status refresh fails', async () => {

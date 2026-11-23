@@ -15,7 +15,7 @@ run. The required independent **Sol** review has **not** run, so M1 has not been
 - Preview a deployment: per-file winner, the original that needs backing up, and any typed blocker.
 - Apply and restore on Linux (tmpfs, Btrfs) and Windows (NTFS), with a journal that settles an
   interrupted operation on restart instead of guessing.
-- Cross-catalog ownership: one installation is deployed by at most one catalog root at a time.
+- One client at a time, and one catalog per installation: a visible marker in the game folder refuses a foreign deployment.
 - CLI and desktop drive the same engine through the same typed API.
 - Availability is evidence-backed: a route is enabled only where a recorded run proves it, and a
   guard test fails the build when code and evidence drift.
@@ -28,7 +28,7 @@ run. The required independent **Sol** review has **not** run, so M1 has not been
 | Deploy, restore, bytes and metadata | yes | yes | yes |
 | Recovery across a process restart | yes | yes | yes |
 | Recovery from a cut between the two Windows renames | n/a | n/a | yes |
-| Installation lease, including foreign refusal | yes | yes | yes |
+| Deployment marker and foreign-catalog refusal | yes | yes | yes |
 | Read-only original deploys and restores | yes | yes | yes |
 | Launched desktop shell (smoke) | yes | — | not proven |
 
@@ -44,7 +44,7 @@ end-to-end desktop write run.
 |---|---|
 | Sol whole-packet review at `15e885b` | blocked; findings fixed |
 | DeepSeek whole-packet review at `7edccc8` | blocked; finding fixed |
-| Sol whole-packet review at `6df9342` | blocked; findings fixed, desktop workflow accepted as a gap; re-review pending |
+| Sol whole-packet review at `6df9342` | blocked; findings resolved by the single-client simplification; re-review pending |
 
 The project's rule is that the final whole-packet review is a Sol pass. That pass is running against
 the current commit; until it returns a verdict, no document or reply may call M1 accepted.
@@ -57,6 +57,6 @@ the current commit; until it returns a verdict, no document or reply may call M1
 | [limitations](limitations.md) | Accepted limitations and unproven claims, with impact and closure |
 | [evidence](../research/m1-native-results.md) | The run record. Its tables are parsed by a test, so witnesses and commit revisions are normative |
 | [contracts](../contracts/) | Normative behaviour: library, roots, recovery, clients |
-| [ADRs](../adr/) | Decisions and their cost, including the Windows write guarantee and the installation lease |
+| [ADRs](../adr/) | Decisions and their cost, including the Windows write guarantee and single-client ownership |
 
 `docs/m1/` is the place to start. The evidence file is the audit trail, not an introduction.

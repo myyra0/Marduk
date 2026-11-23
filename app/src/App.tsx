@@ -415,9 +415,12 @@ export function App({ transport }: Props) {
     await perform(
       () => transport.importApply(prepared.id),
       {
-        apply: (snapshot) => {
-          applySnapshot(snapshot);
+        // The returned snapshot is the profile at commit time. A replay after
+        // another client's change would install stale state, so reload the
+        // authoritative status instead of trusting it.
+        apply: async () => {
           setPrepared(null);
+          await refresh('Import applied; authoritative state reloaded.');
         },
         // A plan tied to another revision is dead, as is the staged archive
         // after a stage change; neither may stay behind an enabled Apply.
