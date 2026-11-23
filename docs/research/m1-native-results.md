@@ -674,7 +674,7 @@ Not run at this point: the hosted CI step that asserts `/dev/shm` is tmpfs. Powe
 Windows coverage for the marker and the instance gate: `instance_gate` 4/4 on NTFS (second
 acquisition `Busy`, lock under the per-user root, not a catalog root); `deployment_marker` 6/6 on
 NTFS (foreign refusal, restore removal, rollback removal, idle-owner recovery, moved installation);
-`native_deployment` 4/4 including the case-mismatched cut. Not evidenced on Windows: the
-fresh-adapter owned read-back and the refusal to adopt a matching stage/backup; those two witnesses
-live in `crates/storage/tests/native_effects.rs`, which is Linux-gated. The marker code they exercise
-is platform-independent, but this is Linux evidence only.
+`deployment_marker_cross_platform` 2/2 on NTFS (fresh-adapter `Owned` read-back and refusal to adopt
+a matching stage/backup); `native_deployment` 4/4 including the case-mismatched cut. The
+unreadable-marker assertion remains Unix-only because mode bits have no Windows equivalent; on
+Windows the foreign-claim refusal is exercised with a readable marker.
