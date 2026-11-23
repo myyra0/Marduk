@@ -151,6 +151,14 @@ Use only these models. Select the exact configured ID and high effort for each d
 - Provider limits, missing environments and gate failures are not failed code cycles. Resume at the same tier if practical, or use the next allowed tier if justified; record the cause. A wrong or unsettled contract, unsafe action, or new product choice requires a ruling or user decision, not more retries.
 - Do not run parallel writers in the same paths. Only a packet marked `ready` can be dispatched. No product work, runner changes, Git setup, or distribution from a planning-only session.
 
+## Review scope
+
+- Report only defects reachable in ordinary use, or after a crash at a point a normal operation can reach. A same-privilege process deliberately racing, swapping a path, or planting a file is not a finding; if it matters, note it as a limitation.
+- For every blocking finding, give the smallest patch **or** a design change that removes the problem and is objectively simpler, shorter or harder to misuse. If neither exists and the trigger is unrealistic, put it under a "not needed" or suggestion list; it is not a block.
+- Do not propose a change per finding for its own sake. A review that only adds ceremony is a failed review.
+- Convergence is monotonic: each round reduces surface area or it does not happen. Never relocate complexity and call it a fix.
+- When the owner has accepted an issue or a scope, a reviewer may check that the code and docs match the ruling, but may not re-open the ruling without new evidence of ordinary-use harm.
+
 ## Docs (sources of truth; update, don't duplicate)
 
 `GLOSSARY.md` (terms), `docs/PLAN.md` (roadmap), `docs/inventory.md` (parity and evidence), `docs/architecture.md` (design and gates),
