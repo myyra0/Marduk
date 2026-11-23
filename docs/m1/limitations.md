@@ -7,6 +7,10 @@ No open defects are recorded. This page lists what is knowingly not covered, and
 **Ownership and marker durability.** See [ADR 0005](../adr/0005-one-client-and-one-catalog-per-installation.md)
 for catalog and installation ownership, upgrade limitations, and marker durability.
 
+**Desktop second-client startup.** If the CLI holds the catalog gate, the desktop exits before
+creating a window; on a Windows release build there is no visible message. The refusal is correct,
+nothing is written, and the CLI reports `Busy`; only the presentation is missing.
+
 **Catalog sidecars are name-resolved.** SQLite derives `catalog.sqlite3-wal`/`-shm`/`-journal` from
 a pathname, so a same-privilege process can substitute them inside the verified app-data directory.
 The main file and the app-data root are handle-verified; the sidecars are not. Closing it needs a
