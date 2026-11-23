@@ -867,6 +867,24 @@ export function App({ transport }: Props) {
               Active generation:{' '}
               {status.activeGenerationId === null ? 'none' : <code>{status.activeGenerationId}</code>}
             </p>
+            {(status.reconciliation.reclaimed.length > 0 ||
+              status.reconciliation.quarantinedCount > 0) && (
+              <p role="status">
+                <span className="badge">Startup reconciliation</span>{' '}
+                {status.reconciliation.reclaimed.length} reclaimed,{' '}
+                {status.reconciliation.quarantinedCount} quarantined
+                {status.reconciliation.quarantined.length > 0 && (
+                  <>
+                    :{' '}
+                    <code>
+                      {status.reconciliation.quarantined
+                        .map((leftover) => `${leftover.id} (${leftover.reason})`)
+                        .join(', ')}
+                    </code>
+                  </>
+                )}
+              </p>
+            )}
             {recoveryError !== null && (
               <p role="alert">
                 <span className="badge badge--blocked">Recovery refused</span>{' '}

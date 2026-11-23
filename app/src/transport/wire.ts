@@ -134,12 +134,35 @@ export type AvailabilitySet = {
   restore: Availability;
 };
 
+/** Stable reason tokens for a leftover import the catalog refused to reclaim. */
+export const QUARANTINE_REASONS = [
+  'ownership_missing',
+  'stage_changed',
+  'stage_unavailable',
+  'published',
+] as const;
+
+export type QuarantineReason = (typeof QUARANTINE_REASONS)[number];
+
+export type QuarantinedLeftover = { id: Id; reason: QuarantineReason };
+
+/**
+ * The one startup reconciliation. It is computed when the workspace opens, so
+ * polling status does not repeat it.
+ */
+export type Reconciliation = {
+  reclaimed: Id[];
+  quarantined: QuarantinedLeftover[];
+  quarantinedCount: number;
+};
+
 export type WorkspaceStatus = {
   installation: Installation | null;
   profile: Snapshot;
   availability: AvailabilitySet;
   pending: Operation | null;
   activeGenerationId: Id | null;
+  reconciliation: Reconciliation;
 };
 
 export type Target = { role: 'data'; path: string };
@@ -408,9 +431,38 @@ export function parseOperation(value: unknown, field = 'operation'): Operation {
   };
 }
 
+export function parseReconciliation(value: unknown, field = 'reconciliation'): Reconciliation {
+  const reconciliation = record(value, field);
+  const quarantined = list(
+    reconciliation.quarantined,
+    `${field}.quarantined`,
+  ).map((entry, index) => {
+    const entryField = `${field}.quarantined[${index}]`;
+    const leftover = record(entry, entryField);
+    return {
+      id: parseId(leftover.id, `${entryField}.id`),
+      reason: oneOf(leftover.reason, QUARANTINE_REASONS, `${entryField}.reason`),
+    };
+  });
+  const quarantinedCount = integer(
+    reconciliation.quarantinedCount,
+    `${field}.quarantinedCount`,
+  );
+  if (quarantinedCount !== quarantined.length) {
+    throw new WireFormatError(`${field}.quarantinedCount: does not match quarantined`);
+  }
+  return {
+    reclaimed: list(reconciliation.reclaimed, `${field}.reclaimed`).map((id, index) =>
+      parseId(id, `${field}.reclaimed[${index}]`),
+    ),
+    quarantined,
+    quarantinedCount,
+  };
+}
+
 export function parseWorkspaceStatus(value: unknown, field = 'status'): WorkspaceStatus {
   const status = record(value, field);
-  for (const key of ['installation', 'pending', 'activeGenerationId']) {
+  for (const key of ['installation', 'pending', 'activeGenerationId', 'reconciliation']) {
     if (!(key in status)) {
       throw new WireFormatError(`${field}.${key}: missing`);
     }
@@ -447,6 +499,7 @@ export function parseWorkspaceStatus(value: unknown, field = 'status'): Workspac
       activeGenerationId === null || activeGenerationId === undefined
         ? null
         : parseId(activeGenerationId, `${field}.activeGenerationId`),
+    reconciliation: parseReconciliation(status.reconciliation, `${field}.reconciliation`),
   };
 }
 

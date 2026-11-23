@@ -103,6 +103,26 @@ describe('workspace shell', () => {
     expect(screen.queryByRole('button', { name: /Preview ZIP/ })).not.toBeInTheDocument();
   });
 
+  it('shows quarantined imports from the one startup reconciliation', async () => {
+    const status = fixtureStatus();
+    await renderReady({
+      status: async () => ({
+        ok: true,
+        result: {
+          ...status,
+          reconciliation: {
+            reclaimed: ['9007199254740995'],
+            quarantined: [{ id: '9007199254740997', reason: 'stage_changed' }],
+            quarantinedCount: 1,
+          },
+        },
+      }),
+    });
+
+    expect(screen.getByText(/1 reclaimed, 1 quarantined/)).toBeInTheDocument();
+    expect(screen.getByText('9007199254740997 (stage_changed)')).toBeInTheDocument();
+  });
+
   it('shows the typed effects blocker in the operations hint when deploy is blocked', async () => {
     await renderReady();
 

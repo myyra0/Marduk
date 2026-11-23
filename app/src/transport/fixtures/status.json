@@ -69,6 +69,18 @@
         }
       ],
       "revision": "9223372036854775807"
+    },
+    "reconciliation": {
+      "quarantined": [
+        {
+          "id": "9007199254740997",
+          "reason": "stage_changed"
+        }
+      ],
+      "quarantinedCount": 1,
+      "reclaimed": [
+        "9007199254740995"
+      ]
     }
   }
 }

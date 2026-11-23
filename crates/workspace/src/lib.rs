@@ -32,6 +32,7 @@ use marduk_games::skyrim_se;
 use marduk_platform::InstallationBinding;
 use marduk_platform::lease::{InstallationLease, LeaseClaim, LeaseError, LeaseRecord};
 use marduk_storage::Catalog;
+use marduk_storage::library::{QuarantineReason, ReconcileReport};
 use marduk_storage::native_effects::NativeEffects;
 use marduk_storage::operation_journal::OperationJournal;
 use marduk_storage::operation_journal::SelectedInstallation;
@@ -374,6 +375,28 @@ pub struct AvailabilitySet {
     pub restore: Availability,
 }
 
+/// What the one startup reconciliation did. It is computed when the
+/// [`Workspace`] opens and never rerun per status load.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Reconciliation {
+    /// Imports whose abandoned private snapshot was reclaimed at this open.
+    pub reclaimed: Vec<String>,
+    /// Imports left untouched because the catalog could not prove them.
+    pub quarantined: Vec<QuarantinedLeftover>,
+    /// Number of entries in [`Self::quarantined`], for a count-only display.
+    pub quarantined_count: usize,
+}
+
+/// One leftover import that reconciliation left in place. `reason` is a stable
+/// token; clients may display it but never parse its prose.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuarantinedLeftover {
+    pub id: String,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceStatus {
@@ -382,6 +405,7 @@ pub struct WorkspaceStatus {
     pub availability: AvailabilitySet,
     pub pending: Option<Operation>,
     pub active_generation_id: Option<String>,
+    pub reconciliation: Reconciliation,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -460,6 +484,7 @@ pub struct Workspace {
     catalog: Catalog,
     journal: OperationJournal,
     selections: SelectionStore,
+    reconciliation: Reconciliation,
 }
 
 impl Workspace {
@@ -480,7 +505,12 @@ impl Workspace {
     pub fn open_at(app_data: &Path, lease_root: &Path) -> Result<Self, WireError> {
         let app_data =
             std::path::absolute(app_data).map_err(|_| WireError::new(Code::InvalidPath))?;
-        let catalog = Catalog::open(&app_data).map_err(import_error)?;
+        let mut catalog = Catalog::open(&app_data).map_err(import_error)?;
+        // Reclaim catalog-office leftovers exactly once per open, before any
+        // command is served. A failure is the open's failure: a client must
+        // never get a workspace whose abandoned imports are unaccounted for,
+        // and this path never deletes anything the catalog refused to reclaim.
+        let reconciliation = reconciliation(catalog.reconcile().map_err(import_error)?);
         let journal = OperationJournal::open(&app_data).map_err(deploy_error)?;
         Ok(Self {
             app_data,
@@ -488,6 +518,7 @@ impl Workspace {
             catalog,
             journal,
             selections: SelectionStore::new(),
+            reconciliation,
         })
     }
 
@@ -704,6 +735,7 @@ impl Workspace {
             },
             pending,
             active_generation_id,
+            reconciliation: self.reconciliation.clone(),
         })
     }
 
@@ -1317,6 +1349,36 @@ fn prepared_dto(prepared: PreparedImport) -> Prepared {
     }
 }
 
+fn reconciliation(report: ReconcileReport) -> Reconciliation {
+    let quarantined: Vec<QuarantinedLeftover> = report
+        .quarantined
+        .into_iter()
+        .map(|entry| QuarantinedLeftover {
+            id: decimal(entry.id.get()),
+            reason: quarantine_reason(entry.reason).to_owned(),
+        })
+        .collect();
+    Reconciliation {
+        quarantined_count: quarantined.len(),
+        reclaimed: report
+            .reclaimed
+            .into_iter()
+            .map(|id| decimal(id.get()))
+            .collect(),
+        quarantined,
+    }
+}
+
+/// Stable reason tokens for the client contract.
+fn quarantine_reason(reason: QuarantineReason) -> &'static str {
+    match reason {
+        QuarantineReason::OwnershipMissing => "ownership_missing",
+        QuarantineReason::StageChanged => "stage_changed",
+        QuarantineReason::StageUnavailable => "stage_unavailable",
+        QuarantineReason::Published => "published",
+    }
+}
+
 fn operation(status: OperationStatus) -> Operation {
     Operation {
         id: decimal(status.id.get()),
@@ -1664,6 +1726,50 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_projects_ids_and_stable_reason_tokens() {
+        use marduk_storage::library::QuarantinedImport;
+        let id = |value| ImportId::try_from_u64(value).unwrap();
+        let report = ReconcileReport {
+            prepared: Vec::new(),
+            reclaimed: vec![id(7)],
+            quarantined: vec![
+                QuarantinedImport {
+                    id: id(8),
+                    reason: QuarantineReason::OwnershipMissing,
+                },
+                QuarantinedImport {
+                    id: id(9),
+                    reason: QuarantineReason::StageChanged,
+                },
+                QuarantinedImport {
+                    id: id(10),
+                    reason: QuarantineReason::StageUnavailable,
+                },
+                QuarantinedImport {
+                    id: id(11),
+                    reason: QuarantineReason::Published,
+                },
+            ],
+        };
+
+        let dto = reconciliation(report);
+        assert_eq!(dto.reclaimed, ["7"]);
+        assert_eq!(dto.quarantined_count, 4);
+        assert_eq!(
+            dto.quarantined
+                .iter()
+                .map(|entry| (entry.id.as_str(), entry.reason.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("8", "ownership_missing"),
+                ("9", "stage_changed"),
+                ("10", "stage_unavailable"),
+                ("11", "published"),
+            ]
+        );
+    }
+
+    #[test]
     fn alternate_displacement_is_a_distinct_reported_location() {
         let dto = retained(backup(BackupSlot::AlternateDisplaced)).unwrap();
         assert_eq!(
@@ -1858,6 +1964,14 @@ mod wire_fixture {
                 }],
             }),
             active_generation_id: Some("9223372036854775804".to_owned()),
+            reconciliation: Reconciliation {
+                reclaimed: vec![LARGE_B.to_owned()],
+                quarantined: vec![QuarantinedLeftover {
+                    id: LARGE_C.to_owned(),
+                    reason: "stage_changed".to_owned(),
+                }],
+                quarantined_count: 1,
+            },
         }
     }
 
