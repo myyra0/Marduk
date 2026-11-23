@@ -120,11 +120,15 @@ fn resolved_app_data() -> Result<std::path::PathBuf, WireError> {
 }
 
 fn run(cli: Cli) -> i32 {
-    // One client at a time across the desktop shell and every CLI invocation.
-    let _instance = match marduk_platform::acquire_instance_guard() {
+    let app_data = match resolved_app_data() {
+        Ok(path) => path,
+        Err(error) => return report(Envelope::error(error), cli.json),
+    };
+    let _instance = match marduk_platform::acquire_instance_guard(&app_data) {
         Ok(guard) => guard,
         Err(marduk_platform::GateError::Busy) => {
-            let error = WireError::with_message(Code::Busy, "another Marduk client is running");
+            let error =
+                WireError::with_message(Code::Busy, "another Marduk client is using this catalog");
             return report(Envelope::error(error), cli.json);
         }
         Err(error) => {
@@ -137,10 +141,6 @@ fn run(cli: Cli) -> i32 {
     };
     let request = match request(cli.command) {
         Ok(request) => request,
-        Err(error) => return report(Envelope::error(error), cli.json),
-    };
-    let app_data = match resolved_app_data() {
-        Ok(path) => path,
         Err(error) => return report(Envelope::error(error), cli.json),
     };
     let mut workspace = match Workspace::open(&app_data) {

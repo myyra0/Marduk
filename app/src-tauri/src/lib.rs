@@ -22,19 +22,20 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            // One Marduk client at a time across the desktop shell and the CLI.
-            let instance =
-                marduk_platform::acquire_instance_guard().map_err(|error| match error {
-                    marduk_platform::GateError::Busy => std::io::Error::new(
-                        std::io::ErrorKind::AddrInUse,
-                        "another Marduk client is running",
-                    ),
-                    other => std::io::Error::other(format!(
-                        "could not take the Marduk instance gate: {other}"
-                    )),
-                })?;
-            app.manage(instance);
             let app_data = app_data_root().map_err(std::io::Error::other)?;
+            let instance =
+                marduk_platform::acquire_instance_guard(&app_data).map_err(
+                    |error| match error {
+                        marduk_platform::GateError::Busy => std::io::Error::new(
+                            std::io::ErrorKind::AddrInUse,
+                            "another Marduk client is using this catalog",
+                        ),
+                        other => std::io::Error::other(format!(
+                            "could not take the Marduk instance gate: {other}"
+                        )),
+                    },
+                )?;
+            app.manage(instance);
             app.manage(DesktopState::new(app_data));
             Ok(())
         })

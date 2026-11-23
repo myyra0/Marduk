@@ -29,10 +29,10 @@ use marduk_core::import::{
 use marduk_core::recovery::{BackupRef, BackupSlot, Journal, StepDirection};
 use marduk_core::root_identity::{NativeIdentity, RootError, RootIdentity, UnsupportedReason};
 use marduk_games::skyrim_se;
-use marduk_platform::InstallationBinding;
+use marduk_platform::{DeploymentOwner, InstallationBinding};
 use marduk_storage::Catalog;
 use marduk_storage::library::{QuarantineReason, ReconcileReport};
-use marduk_storage::native_effects::{DeploymentOwner, NativeEffects};
+use marduk_storage::native_effects::NativeEffects;
 use marduk_storage::operation_journal::OperationJournal;
 use marduk_storage::operation_journal::SelectedInstallation;
 use serde::ser::SerializeMap;
@@ -394,8 +394,7 @@ pub struct QuarantinedLeftover {
     pub reason: String,
 }
 
-/// The catalog root the installation's deployment marker records. Present
-/// exactly when a marker exists, whether this catalog or another one wrote it.
+/// The catalog root a readable deployment marker records.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeploymentInfo {
@@ -410,7 +409,7 @@ pub struct WorkspaceStatus {
     pub availability: AvailabilitySet,
     pub pending: Option<Operation>,
     pub active_generation_id: Option<String>,
-    /// The marker owner, or `null` when the installation is not claimed.
+    /// The owner of a readable marker, or `null` if no owner could be read.
     pub deployment: Option<DeploymentInfo>,
     pub reconciliation: Reconciliation,
 }
@@ -742,17 +741,25 @@ impl Workspace {
         };
 
         if let Some(selected) = selected {
-            // A marker owned by another catalog is the dominant fact: this
-            // client may neither deploy nor restore, and the blocker names the
-            // owner rather than reporting a bare Busy.
-            (effects, deployment) = self.deployment_state(&selected);
+            match self.reopen(&selected) {
+                Ok(binding) => {
+                    target = Availability {
+                        available: true,
+                        blocker: None,
+                    };
+                    (effects, deployment) = self.deployment_state(&selected, &binding);
+                }
+                Err(error) => {
+                    target.blocker = Some(error.clone());
+                    effects.blocker = Some(error);
+                }
+            }
             let SelectedInstallation {
                 id,
                 locator,
-                installation: expected_installation,
-                data,
                 pending: pending_status,
                 active_generation,
+                ..
             } = selected;
 
             installation = Some(Installation {
@@ -761,21 +768,6 @@ impl Workspace {
             });
             active_generation_id = active_generation.map(decimal);
             pending = pending_status.map(operation);
-            target = match marduk_platform::reopen_installation(
-                &locator,
-                &skyrim_se::LAYOUT,
-                &expected_installation,
-                &data,
-            ) {
-                Ok(_) => Availability {
-                    available: true,
-                    blocker: None,
-                },
-                Err(error) => Availability {
-                    available: false,
-                    blocker: Some(root_error(error)),
-                },
-            };
         }
 
         let import = if self.catalog.stage_available() {
@@ -861,16 +853,11 @@ impl Workspace {
     }
 
     fn deploy_preview(&mut self, revision: ProfileRevision) -> Result<Preview, WireError> {
-        // A preview must not be applyable on a root that would refuse the
-        // write, so the native gate runs before the catalog is read.
         let selected = self.selected_pair()?;
-        self.require_native_effects(&selected)?;
+        let binding = self.reopen(&selected)?;
+        self.marker_owner(&binding)?;
+        self.require_native_effects(&selected, &binding)?;
         let mut port = self.native_effects(&selected)?;
-        // A preview on an installation another catalog owns would save a plan
-        // this client cannot apply. Refuse before any plan is persisted.
-        if let DeploymentOwner::Foreign(owner) = port.deployment_owner().map_err(deploy_error)? {
-            return Err(foreign_deployment(&owner));
-        }
         let named = self
             .catalog
             .named_profile(profile())
@@ -955,19 +942,26 @@ impl Workspace {
         // native port, so a replay on a clean or unsupported root still reports
         // the recorded terminal status instead of `UnsupportedTarget`.
         if let Some(status) = self.journal.claimed(plan).map_err(deploy_error)? {
+            if let Some(selected) = self.journal.selected_installation().map_err(deploy_error)?
+                && let Some(stored) = self.journal.plan(plan).map_err(deploy_error)?
+                && stored.installation == selected.installation
+                && stored.data == selected.data
+                && let Ok(binding) = self.reopen(&selected)
+            {
+                if matches!(self.marker_owner(&binding)?, DeploymentOwner::Owned(_)) {
+                    self.clear_marker_if_idle(&binding, &selected)?;
+                }
+            }
             if let Some(event) = StepEvent::terminal(&status) {
                 feed.emit(event);
             }
             return Ok(operation(status));
         }
         let selected = self.selected_pair()?;
-        self.require_native_effects(&selected)?;
+        let binding = self.reopen(&selected)?;
+        self.marker_owner(&binding)?;
+        self.require_native_effects(&selected, &binding)?;
         let mut port = self.native_effects(&selected)?;
-        // A marker naming another catalog root is refused before the plan is
-        // examined or any public effect runs, whatever this journal says.
-        if let DeploymentOwner::Foreign(owner) = port.deployment_owner().map_err(deploy_error)? {
-            return Err(foreign_deployment(&owner));
-        }
         // The marker is claimed after the plan exists and names this
         // installation, but before the first public effect.
         let stored = self
@@ -978,8 +972,12 @@ impl Workspace {
         if stored.installation != selected.installation || stored.data != selected.data {
             return Err(WireError::new(Code::TargetUnavailable));
         }
-        port.claim_deployment(&self.app_data)
-            .map_err(deploy_error)?;
+        if let DeploymentOwner::Foreign(owner) = binding
+            .claim_deployment(&self.app_data)
+            .map_err(deploy_error)?
+        {
+            return Err(foreign_deployment(&owner));
+        }
         let committed = marduk_core::deployment::commit_deployment_with_progress(
             &mut self.journal,
             &mut port,
@@ -987,16 +985,8 @@ impl Workspace {
             || false,
             |event| feed.emit(event),
         );
-        let status = match committed {
-            Ok(status) => status,
-            Err(error) => {
-                // A failure that ended with no pending work and no active
-                // generation left nothing deployed; anything else keeps the
-                // marker so an interrupted deployment cannot hide ownership.
-                self.clear_marker_if_idle(&port, &selected);
-                return Err(deploy_error(error));
-            }
-        };
+        self.clear_marker_if_idle(&binding, &selected)?;
+        let status = committed.map_err(deploy_error)?;
         Ok(operation(status))
     }
 
@@ -1010,17 +1000,12 @@ impl Workspace {
     ) -> Result<RestoreResult, WireError> {
         let mut feed = ProgressFeed::new(progress);
         let selected = self.selected_pair()?;
-        // Ownership is examined before the no-work answers when this catalog
-        // can open the adapter: a foreign marker refuses even a restore this
-        // catalog would answer as a no-op. A moved or unqualified root cannot be
-        // observed here and still falls through to the journal answer.
-        let port = self.native_effects(&selected).ok();
-        if let Some(port) = &port
-            && let DeploymentOwner::Foreign(owner) =
-                port.deployment_owner().map_err(deploy_error)?
-        {
-            return Err(foreign_deployment(&owner));
-        }
+        let binding = self.reopen(&selected);
+        let owner = binding
+            .as_ref()
+            .ok()
+            .map(|binding| self.marker_owner(binding))
+            .transpose()?;
         // Answer the no-work and pending cases from the journal before the
         // effects gate. A clean root is `NoActiveDeployment`, not an unavailable
         // volume, and a pending Restore reports its tracked status.
@@ -1048,33 +1033,33 @@ impl Workspace {
             return Err(deploy_error(DeployError::Busy));
         }
         if state.active.is_none() {
+            if let Ok(binding) = &binding
+                && matches!(owner, Some(DeploymentOwner::Owned(_)))
+            {
+                self.clear_marker(binding)?;
+            }
             return Ok(RestoreResult::NoActiveDeployment {
                 code: Code::NoActiveDeployment,
             });
         }
-        self.require_native_effects(&selected)?;
-        let mut port = match port {
-            Some(port) => port,
-            None => self.native_effects(&selected)?,
-        };
-        // Recheck on the port that will perform the effects, so a missed early
-        // observation can never clear another catalog's marker afterwards.
-        if let DeploymentOwner::Foreign(owner) = port.deployment_owner().map_err(deploy_error)? {
-            return Err(foreign_deployment(&owner));
-        }
+        let binding = binding?;
+        self.require_native_effects(&selected, &binding)?;
+        let mut port = self.native_effects(&selected)?;
         match marduk_core::deployment::restore_with_progress(
             &mut self.journal,
             &mut port,
             &selected.installation,
             &selected.data,
-            |event| feed.emit(event),
+            |event| {
+                if event.phase != Phase::Completed {
+                    feed.emit(event);
+                }
+            },
         ) {
             Ok(status) => {
-                // Only a completed outcome proves the marker can be removed. A
-                // pending or failed status keeps it so ownership cannot be
-                // cleared under live or unfinished work.
                 if status.phase == Phase::Completed {
-                    let _ = port.clear_deployment();
+                    self.clear_marker(&binding)?;
+                    feed.emit(StepEvent::terminal(&status).expect("completed restore"));
                 }
                 Ok(RestoreResult::Operation {
                     operation: operation(status),
@@ -1101,20 +1086,12 @@ impl Workspace {
     fn deployment_state(
         &self,
         selected: &SelectedInstallation,
+        binding: &InstallationBinding,
     ) -> (Availability, Option<DeploymentInfo>) {
-        if let Err(blocker) = self.require_native_effects(selected) {
-            return (
-                Availability {
-                    available: false,
-                    blocker: Some(blocker),
-                },
-                None,
-            );
-        }
-        let owner = self
-            .native_effects(selected)
-            .and_then(|port| port.deployment_owner().map_err(deploy_error));
-        match owner {
+        match binding
+            .deployment_owner(&self.app_data)
+            .map_err(deploy_error)
+        {
             Ok(DeploymentOwner::Foreign(owner)) => (
                 Availability {
                     available: false,
@@ -1122,13 +1099,16 @@ impl Workspace {
                 },
                 Some(deployment_info(&owner)),
             ),
-            Ok(owner) => (
-                Availability {
-                    available: true,
-                    blocker: None,
-                },
-                marker_owner(owner),
-            ),
+            Ok(owner) => {
+                let blocker = self.require_native_effects(selected, binding).err();
+                (
+                    Availability {
+                        available: blocker.is_none(),
+                        blocker,
+                    },
+                    marker_owner(owner),
+                )
+            }
             Err(error) => (
                 Availability {
                     available: false,
@@ -1139,16 +1119,38 @@ impl Workspace {
         }
     }
 
-    /// Clear the marker once this catalog's journal records neither pending
-    /// work nor an active generation for the installation.
-    fn clear_marker_if_idle(&mut self, port: &NativeEffects, selected: &SelectedInstallation) {
-        let idle = match self.journal.root_state(&selected.data) {
-            Ok(state) => state.pending.is_none() && state.active.is_none(),
-            Err(_) => false,
-        };
-        if idle {
-            let _ = port.clear_deployment();
+    fn marker_owner(&self, binding: &InstallationBinding) -> Result<DeploymentOwner, WireError> {
+        match binding
+            .deployment_owner(&self.app_data)
+            .map_err(deploy_error)?
+        {
+            DeploymentOwner::Foreign(owner) => Err(foreign_deployment(&owner)),
+            owner => Ok(owner),
         }
+    }
+
+    fn clear_marker(&self, binding: &InstallationBinding) -> Result<(), WireError> {
+        binding.clear_deployment(&self.app_data).map_err(|error| {
+            WireError::with_message(
+                deploy_error(error).code,
+                "could not clear the deployment marker; retry recovery",
+            )
+        })
+    }
+
+    fn clear_marker_if_idle(
+        &mut self,
+        binding: &InstallationBinding,
+        selected: &SelectedInstallation,
+    ) -> Result<(), WireError> {
+        let state = self
+            .journal
+            .root_state(&selected.data)
+            .map_err(deploy_error)?;
+        if state.pending.is_none() && state.active.is_none() {
+            self.clear_marker(binding)?;
+        }
+        Ok(())
     }
 
     /// One decision point for a new client-visible deploy or restore. A
@@ -1156,12 +1158,11 @@ impl Workspace {
     /// reopen with its supported layout, both roots must sit on a proven
     /// volume, and the app and game roots must share a rename domain or the
     /// staged object cannot be renamed onto the target.
-    fn require_native_effects(&self, selected: &SelectedInstallation) -> Result<(), WireError> {
-        // Identity first: a recorded installation that no longer reopens is a
-        // lost target (`TargetUnavailable`), not a verdict on its volume. A
-        // genuine volume or rename-domain refusal still answers
-        // `UnsupportedTarget`.
-        let binding = self.reopen(selected)?;
+    fn require_native_effects(
+        &self,
+        selected: &SelectedInstallation,
+        binding: &InstallationBinding,
+    ) -> Result<(), WireError> {
         if !marduk_platform::deploy_volume_qualified(&self.app_data)
             || !marduk_platform::deploy_volume_qualified(&selected.locator)
         {
@@ -1223,39 +1224,20 @@ impl Workspace {
     /// work; the availability rule is owned by `docs/contracts/m1-clients.md`.
     fn recover_pending(&mut self) -> Result<Option<Operation>, WireError> {
         let selected = self.selected_pair()?;
-        // Identity first: a moved installation is a lost target, not a verdict
-        // on its volume.
-        self.reopen(&selected)?;
+        let binding = self.reopen(&selected)?;
+        let owner = self.marker_owner(&binding)?;
         let state = self
             .journal
             .root_state(&selected.data)
             .map_err(deploy_error)?;
-        // Examine the marker before answering. A process can exit between
-        // claiming the installation and recording an operation, leaving a marker
-        // and an idle journal; returning `None` without looking would block the
-        // installation forever. A clean but unqualified root must still answer
-        // from the journal, so the adapter is optional until there is work.
-        let mut port = match self.native_effects(&selected) {
-            Ok(port) => Some(port),
-            Err(error) if error.code == Code::UnsupportedTarget => None,
-            Err(error) => return Err(error),
-        };
-        if let Some(port) = port.as_mut() {
-            match port.deployment_owner().map_err(deploy_error)? {
-                DeploymentOwner::Foreign(owner) => return Err(foreign_deployment(&owner)),
-                DeploymentOwner::Owned(_) if state.pending.is_none() && state.active.is_none() => {
-                    // The crash leftover: this catalog claimed the installation
-                    // but recorded no pending work and no generation.
-                    let _ = port.clear_deployment();
-                    return Ok(None);
-                }
-                DeploymentOwner::Owned(_) | DeploymentOwner::Vacant => {}
-            }
-        }
         if state.pending.is_none() {
+            if state.active.is_none() && matches!(owner, DeploymentOwner::Owned(_)) {
+                self.clear_marker(&binding)?;
+            }
             return Ok(None);
         }
-        let mut port = port.ok_or_else(unsupported_effect)?;
+        self.require_native_effects(&selected, &binding)?;
+        let mut port = self.native_effects(&selected)?;
         let recovered = marduk_core::recovery::recover_pending(
             &mut self.journal,
             &mut port,
@@ -1267,7 +1249,9 @@ impl Workspace {
                 // Completed recovery may have rolled the deployment back, so an
                 // idle journal now means nothing is deployed and the marker is
                 // this catalog's leftover.
-                self.clear_marker_if_idle(&port, &selected);
+                if matches!(owner, DeploymentOwner::Owned(_)) {
+                    self.clear_marker_if_idle(&binding, &selected)?;
+                }
                 Ok(status.map(operation))
             }
             Err(error) => Err(deploy_error(error)),

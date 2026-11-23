@@ -1640,6 +1640,37 @@ fn direction_tag(direction: StepDirection) -> i64 {
     }
 }
 
+pub(crate) fn has_prepared_artifacts(
+    connection: &Connection,
+    op: OperationId,
+    ordinal: u32,
+    direction: StepDirection,
+) -> Result<bool, DeployError> {
+    connection
+        .query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM operation_steps
+                 WHERE operation_id = ?1 AND ordinal = ?2 AND (?3 = 0 OR undo IS NOT NULL)
+                 UNION ALL
+                 SELECT 1 FROM displacement_observations
+                 WHERE operation_id = ?1 AND ordinal = ?2 AND direction = ?3
+                 UNION ALL
+                 SELECT 1 FROM displacement_evidence
+                 WHERE operation_id = ?1 AND ordinal = ?2 AND direction = ?3
+                 UNION ALL
+                 SELECT 1 FROM unexpected_displacements
+                 WHERE operation_id = ?1 AND ordinal = ?2 AND direction = ?3
+             )",
+            params![
+                i64::try_from(op.get()).map_err(|_| DeployError::Io)?,
+                ordinal,
+                direction_tag(direction)
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|_| DeployError::Io)
+}
+
 fn write_displacement(
     transaction: &Transaction<'_>,
     op: i64,

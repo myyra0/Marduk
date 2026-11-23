@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 use marduk_core::deployment::PlanId;
 use marduk_core::ids::ProfileRevision;
 use marduk_core::recovery::Journal;
-use marduk_storage::native_effects::DEPLOYMENT_MARKER;
+use marduk_games::skyrim_se::LAYOUT;
+use marduk_platform::DEPLOYMENT_MARKER;
 use marduk_workspace::{Code, Envelope, Op, Request, RestoreResult, WireError, Workspace};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -128,11 +129,21 @@ impl Fixture {
     }
 
     fn marker_owner(&self) -> Option<String> {
-        fs::read_to_string(self.marker()).ok()
+        use marduk_platform::DeploymentOwner;
+        let binding = marduk_platform::bind_installation(&self.game, &LAYOUT).unwrap();
+        match binding.deployment_owner(&self.app_a).unwrap() {
+            DeploymentOwner::Vacant => None,
+            DeploymentOwner::Owned(path) | DeploymentOwner::Foreign(path) => {
+                Some(path.to_string_lossy().into_owned())
+            }
+        }
     }
 
     fn claim_marker(&self, owner: &Path) {
-        fs::write(self.marker(), owner.to_string_lossy().as_bytes()).unwrap();
+        marduk_platform::bind_installation(&self.game, &LAYOUT)
+            .unwrap()
+            .claim_deployment(owner)
+            .unwrap();
     }
 
     fn deployed(&self) -> Vec<u8> {
@@ -274,6 +285,69 @@ fn a_completed_restore_removes_the_marker_and_the_other_catalog_then_deploys() {
         Some(fixture.app_b.to_string_lossy().as_ref()),
         "the new owner replaced the cleared marker"
     );
+}
+
+#[test]
+#[ignore = "requires a qualified effect volume"]
+fn failed_marker_clear_after_restore_blocks_until_cleanup_can_retry() {
+    let mut fixture = Fixture::new();
+    setup(&mut fixture.workspace_a, &fixture.game);
+    let plan = review_plan(&mut fixture.workspace_a, &fixture.zip);
+    fixture.workspace_a.proof_apply_deployment(plan).unwrap();
+
+    #[cfg(unix)]
+    let unblock = {
+        use std::os::unix::fs::PermissionsExt;
+        let previous = fs::metadata(&fixture.game).unwrap().permissions();
+        fs::set_permissions(&fixture.game, fs::Permissions::from_mode(0o555)).unwrap();
+        let game = fixture.game.clone();
+        move || fs::set_permissions(game, previous).unwrap()
+    };
+    #[cfg(windows)]
+    let unblock = {
+        use std::os::windows::fs::OpenOptionsExt;
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3) // FILE_SHARE_READ | FILE_SHARE_WRITE
+            .open(fixture.marker())
+            .unwrap();
+        move || drop(held)
+    };
+    let mut progress = Vec::new();
+    let Envelope::Error { error } = fixture
+        .workspace_a
+        .dispatch_streaming(Request::new(Op::Restore, json!({})), |event| {
+            progress.push(event.phase)
+        })
+    else {
+        unblock();
+        panic!("a completed restore with a blocked marker must report an error");
+    };
+    assert_eq!(error.code, Code::Io);
+    assert!(!progress.iter().any(|phase| phase == "completed"));
+    assert_eq!(fixture.deployed(), BASE);
+    assert!(fixture.marker().exists());
+    assert_eq!(
+        fixture
+            .workspace_a
+            .proof_recover_pending()
+            .unwrap_err()
+            .code,
+        Code::Io
+    );
+
+    unblock();
+    let edited = fixture.game.join("Data/textures/winner.dds");
+    fs::write(&edited, b"after restore\n").unwrap();
+    assert!(
+        fixture
+            .workspace_a
+            .proof_recover_pending()
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(fs::read(edited).unwrap(), b"after restore\n");
+    assert!(!fixture.marker().exists());
 }
 
 #[test]

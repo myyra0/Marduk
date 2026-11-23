@@ -4,20 +4,8 @@ No open defects are recorded. This page lists what is knowingly not covered, and
 
 ## Accepted limitations
 
-**One client at a time.** The desktop and the CLI share an account-wide guard; a second client is
-refused, never queued. The CLI cannot run while the desktop is open. This is deliberate: it removes
-the multi-writer windows rather than defending them.
-
-**One catalog per installation.** A deploy writes `.marduk-deployment` in the installation root, and
-a marker naming another catalog refuses writes. If the owning catalog is deleted while deployed, the
-marker blocks other catalogs until it is removed by hand at `<installation>/.marduk-deployment`;
-status names the owner but not the path. The marker stores no generation, so it cannot help a restore
-decide what to put back; the journal does that.
-
-**Marker durability.** The file is flushed and its directory is synced on Linux; the Windows
-directory sync is a standard flush, not a power-cut barrier (ADR 0004). A crash between writing the
-marker and recording the operation leaves a marker that the owning catalog's recovery clears only
-when the journal is idle.
+**Ownership and marker durability.** See [ADR 0005](../adr/0005-one-client-and-one-catalog-per-installation.md)
+for catalog and installation ownership, upgrade limitations, and marker durability.
 
 **Catalog sidecars are name-resolved.** SQLite derives `catalog.sqlite3-wal`/`-shm`/`-journal` from
 a pathname, so a same-privilege process can substitute them inside the verified app-data directory.
@@ -26,13 +14,16 @@ custom SQLite VFS, which is not justified for a same-privilege window.
 
 **Final-window substitution.** A same-privilege process can substitute a parent or leaf between the
 last verification and the native call. Marduk detects it afterwards, keeps the displaced bytes, and
-refuses to retry automatically. It does not claim prevention.
+refuses to retry automatically for deployment file effects. It does not claim prevention. Marker
+operations pin the root on Linux; Windows marker calls use its verified final pathname. Neither
+platform excludes deliberate marker-leaf replacement between inspection and use.
 
 ## Unproven claims
 
 - **Crash and power-cut recovery.** Recovery is proven across process restarts, and the interrupted
   Windows exchange is proven across a deliberate process cut. NTFS cache flushing, dirty-volume
-  replay and a real power cut are not exercised, and a cut during recovery is not modelled.
+  replay and a real power cut are not exercised. Recovery cuts other than the witnessed boundaries
+  are unproven.
 - **Windows namespace barrier.** Windows runs on the narrowed guarantee in
   [ADR 0004](../adr/0004-windows-writes-use-standard-flush.md). The stricter barrier is unproven.
 - **Real game smoke.** No real Skyrim SE install has been exercised; every fixture is synthetic.

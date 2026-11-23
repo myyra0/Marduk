@@ -315,6 +315,133 @@ impl Fixture {
     }
 }
 
+#[test]
+#[ignore = "requires a qualified volume and separate cut and recovery processes"]
+fn undo_prepare_process_cut() {
+    use marduk_core::deployment::{Phase, commit_deployment_with_progress};
+    use marduk_core::recovery::{StepDirection, recover_pending};
+    use marduk_games::skyrim_se::LAYOUT;
+    use marduk_storage::native_effects::NativeEffects;
+    use std::process::{Command, exit};
+
+    const ROOT: &str = "MARDUK_UNDO_WITNESS_ROOT";
+    const MODE: &str = "MARDUK_UNDO_WITNESS_MODE";
+    if let Some(root) = std::env::var_os(ROOT) {
+        let app = PathBuf::from(root);
+        let mut journal = OperationJournal::open(&app).unwrap();
+        let selected = journal.selected_installation().unwrap().unwrap();
+        let mut port = NativeEffects::open(&app, &selected.locator, LAYOUT).unwrap();
+        match std::env::var(MODE).unwrap().as_str() {
+            "deploy" => {
+                let plan = PlanId::try_from_u64(1).unwrap();
+                commit_deployment_with_progress(
+                    &mut journal,
+                    &mut port,
+                    plan,
+                    || false,
+                    |event| {
+                        if event.phase == Phase::Applying && event.completed == event.total {
+                            exit(71);
+                        }
+                    },
+                )
+                .unwrap();
+                panic!("deploy did not reach cut");
+            }
+            "undo" => {
+                port.proof_after_prepare(|direction| {
+                    if direction == StepDirection::Undo {
+                        exit(72);
+                    }
+                });
+                recover_pending(
+                    &mut journal,
+                    &mut port,
+                    &selected.installation,
+                    &selected.data,
+                )
+                .unwrap();
+                panic!("undo did not reach cut");
+            }
+            "recover" => {
+                let status = recover_pending(
+                    &mut journal,
+                    &mut port,
+                    &selected.installation,
+                    &selected.data,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(status.phase, Phase::RolledBack);
+                assert!(
+                    recover_pending(
+                        &mut journal,
+                        &mut port,
+                        &selected.installation,
+                        &selected.data
+                    )
+                    .unwrap()
+                    .is_none()
+                );
+                return;
+            }
+            mode => panic!("unknown child mode {mode}"),
+        }
+    }
+
+    let mut fixture = Fixture::new();
+    fixture.setup();
+    let (revision, _) = fixture.import_and_order();
+    let reviewed = fixture
+        .workspace
+        .proof_preview_deployment(ProfileRevision::new(revision))
+        .unwrap();
+    assert_eq!(reviewed.id.as_deref(), Some("1"));
+    let child = |mode| {
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "undo_prepare_process_cut",
+                "--nocapture",
+            ])
+            .env(ROOT, &fixture.app)
+            .env(MODE, mode)
+            .status()
+            .unwrap()
+    };
+    assert_eq!(child("deploy").code(), Some(71));
+    assert_eq!(child("undo").code(), Some(72));
+    let mut journal = OperationJournal::open(&fixture.app).unwrap();
+    let selected = journal.selected_installation().unwrap().unwrap();
+    let op = journal.root_state(&selected.data).unwrap().pending.unwrap();
+    let row = journal
+        .steps(op)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.prepared.spec.target.target.relative.as_str() == "textures/winner.dds")
+        .unwrap();
+    assert!(row.undo.is_none());
+    let undo_dir = fixture.app.join(format!(
+        "effects/ops/{}/{}/undo",
+        op.get(),
+        row.prepared.ordinal
+    ));
+    assert_eq!(fs::read(undo_dir.join("stage")).unwrap(), BASE);
+    assert_eq!(fs::read(undo_dir.join("step")).unwrap(), POST);
+    let winner = fixture.game.join("Data/textures/winner.dds");
+    assert_eq!(fs::read(&winner).unwrap(), POST);
+    drop(journal);
+    assert!(child("recover").success());
+    assert_eq!(fs::read(&winner).unwrap(), BASE);
+    assert!(!fixture.game.join("Data/textures/a-only.dds").exists());
+    assert_eq!(fs::read(undo_dir.join("stage.quarantine-0")).unwrap(), BASE);
+    assert_eq!(fs::read(undo_dir.join("step.quarantine-0")).unwrap(), POST);
+    println!(
+        "undo cut: no undo row; recovery rolled back, original and both quarantined copies byte-exact"
+    );
+}
+
 #[cfg(windows)]
 #[test]
 #[ignore = "requires native NTFS; spawns separate cut and recovery processes"]
@@ -1062,10 +1189,8 @@ fn clean_unqualified_root_answers_before_opening_a_native_port() {
         restore,
         RestoreResult::NoActiveDeployment { code } if code == Code::NoActiveDeployment
     ));
-    // Recovery must read the marker, so an unqualified root is a typed refusal
-    // rather than a clean answer.
-    let recover = fixture.workspace.proof_recover_pending().unwrap_err();
-    assert_eq!(recover.code, Code::UnsupportedTarget);
+    // The marker is readable without opening the native effects port.
+    assert!(fixture.workspace.proof_recover_pending().unwrap().is_none());
 }
 
 #[cfg(unix)]

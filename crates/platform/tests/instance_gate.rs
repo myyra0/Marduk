@@ -1,109 +1,102 @@
-//! One-client instance gate witnesses.
-//!
-//! Each test points the gate at its own temporary per-user root, so the
-//! witnesses never contend with a Marduk client on the test machine. Env
-//! mutation and the gate itself are process-global, so the tests serialize.
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::Path;
+use std::process::{Command, Stdio, exit};
 
-use std::ffi::OsString;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
-
-use marduk_platform::{GateError, acquire_instance_guard};
-
-static SERIAL: Mutex<()> = Mutex::new(());
-
-fn serial() -> MutexGuard<'static, ()> {
-    SERIAL
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// Point the per-user instance root at `base` and return the previous value.
-fn point_instance_root(base: &Path) -> (OsString, OsString) {
-    #[cfg(target_os = "linux")]
-    const KEY: &str = "XDG_RUNTIME_DIR";
-    #[cfg(windows)]
-    const KEY: &str = "LOCALAPPDATA";
-
-    let previous = std::env::var_os(KEY).unwrap_or_default();
-    // Safety: every env-mutating witness holds `SERIAL`.
-    unsafe { std::env::set_var(KEY, base) };
-    (KEY.into(), previous)
-}
-
-fn restore_instance_root(key: OsString, previous: OsString) {
-    let key = key.to_string_lossy().into_owned();
-    if previous.is_empty() {
-        // Safety: every env-mutating witness holds `SERIAL`.
-        unsafe { std::env::remove_var(key) };
-    } else {
-        // Safety: every env-mutating witness holds `SERIAL`.
-        unsafe { std::env::set_var(key, previous) };
-    }
-}
-
-fn expected_lock(base: &Path) -> PathBuf {
-    base.join("marduk").join("instance.lock")
-}
+use marduk_platform::{GateError, InstanceGuard, acquire_instance_guard};
 
 #[test]
-fn guard_is_send_and_sync_for_managed_state() {
+fn catalog_guard_is_nonblocking_and_independent_of_other_catalogs() {
+    let _serial = PROCESS_SPAWN.lock().unwrap();
     fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<marduk_platform::InstanceGuard>();
-}
-
-#[test]
-fn second_guard_in_one_process_is_busy() {
-    let _serial = serial();
+    assert_send_sync::<InstanceGuard>();
     let temp = tempfile::tempdir().unwrap();
-    let key = point_instance_root(temp.path());
-
-    let first = acquire_instance_guard().expect("first guard");
-    assert!(matches!(acquire_instance_guard(), Err(GateError::Busy)));
-    drop(first);
-    let _second = acquire_instance_guard().expect("dropping the first guard releases the gate");
-
-    restore_instance_root(key.0, key.1);
+    let a = temp.path().join("a");
+    let b = temp.path().join("b");
+    let guard = acquire_instance_guard(&a).unwrap();
+    assert!(matches!(acquire_instance_guard(&a), Err(GateError::Busy)));
+    let _other = acquire_instance_guard(&b).unwrap();
+    assert!(a.join("instance.lock").is_file());
+    drop(guard);
+    let _reacquired = acquire_instance_guard(&a).unwrap();
 }
 
-#[test]
-fn dropping_the_guard_allows_a_new_one() {
-    let _serial = serial();
-    let temp = tempfile::tempdir().unwrap();
-    let key = point_instance_root(temp.path());
-
-    let first = acquire_instance_guard().expect("first guard");
-    assert!(matches!(acquire_instance_guard(), Err(GateError::Busy)));
-    drop(first);
-    let _reacquired = acquire_instance_guard().expect("gate is free after the guard drops");
-
-    restore_instance_root(key.0, key.1);
-}
+// A concurrently forked child can keep a CLOEXEC lock descriptor until exec.
+static PROCESS_SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
-fn lock_lives_beneath_the_per_user_root_not_a_catalog_root() {
-    let _serial = serial();
+fn same_catalog_refuses_two_processes_with_different_environments() {
+    const CATALOG: &str = "MARDUK_INSTANCE_WITNESS_CATALOG";
+    const HOLD: &str = "MARDUK_INSTANCE_WITNESS_HOLD";
+    if let Some(root) = std::env::var_os(CATALOG) {
+        match acquire_instance_guard(Path::new(&root)) {
+            Ok(_guard) => {
+                if std::env::var_os(HOLD).is_some() {
+                    std::io::stdout().write_all(b"\nheld!\n").unwrap();
+                    std::io::stdout().flush().unwrap();
+                    let _ = std::io::stdin().read(&mut [0]);
+                }
+                exit(0);
+            }
+            Err(GateError::Busy) => exit(71),
+            Err(error) => panic!("{error:?}"),
+        }
+    }
+
+    let _serial = PROCESS_SPAWN.lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
     let catalog = temp.path().join("catalog");
-    fs::create_dir_all(&catalog).unwrap();
-    let key = point_instance_root(temp.path());
-
-    let _guard = acquire_instance_guard().expect("instance guard");
-    let lock = expected_lock(temp.path());
-    assert!(lock.is_file(), "{} is not a file", lock.display());
-    assert!(!lock.starts_with(&catalog));
-
-    #[cfg(target_os = "linux")]
+    let command = |env_name| {
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "same_catalog_refuses_two_processes_with_different_environments",
+                "--nocapture",
+            ])
+            .env(CATALOG, &catalog)
+            .env("HOME", temp.path().join(env_name).join("home"))
+            .env(
+                "XDG_RUNTIME_DIR",
+                temp.path().join(env_name).join("runtime"),
+            )
+            .env("XDG_DATA_HOME", temp.path().join(env_name).join("data"))
+            .env("LOCALAPPDATA", temp.path().join(env_name).join("local"));
+        child
+    };
+    let mut first = command("one")
+        .env(HOLD, "1")
+        .stdout(Stdio::piped())
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = first.stdout.take().unwrap();
+    let (ready, seen) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let found = BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+            .any(|line| line == "held!");
+        let _ = ready.send(found);
+    });
+    if !seen
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap_or(false)
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(temp.path().join("marduk"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o700);
+        let _ = first.kill();
+        let _ = first.wait();
+        panic!("first process did not acquire catalog");
     }
-
-    restore_instance_root(key.0, key.1);
+    let mut second = command("two").stdout(Stdio::null()).spawn().unwrap();
+    let (status, observed) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = status.send(second.wait());
+    });
+    let second = observed.recv_timeout(std::time::Duration::from_secs(5));
+    drop(first.stdin.take());
+    assert!(first.wait().unwrap().success());
+    assert_eq!(
+        second.expect("second acquisition queued").unwrap().code(),
+        Some(71)
+    );
+    assert!(command("two").output().unwrap().status.success());
 }

@@ -678,3 +678,22 @@ NTFS (foreign refusal, restore removal, rollback removal, idle-owner recovery, m
 a matching stage/backup); `native_deployment` 4/4 including the case-mismatched cut. The
 unreadable-marker assertion remains Unix-only because mode bits have no Windows equivalent; on
 Windows the foreign-claim refusal is exercised with a readable marker.
+
+### Catalog-scoped ownership redesign
+
+These runs used the tree recorded in the commit this section landed with. The native VM received
+an archive of that tree, with `crates` removed before extraction. The rows above describe earlier implementations.
+
+| Witness | Configuration | Command | Result |
+| --- | --- | --- | --- |
+| `same_catalog_refuses_two_processes_with_different_environments`, `catalog_guard_is_nonblocking_and_independent_of_other_catalogs` | Linux tmpfs and Btrfs; Windows NTFS | `cargo test --locked -p marduk-platform --test instance_gate` | 2 passed on each; same catalog refused with different environments, distinct catalogs admitted |
+| `a_running_client_makes_the_next_one_busy`, `nothing_pending_but_a_foreign_marker_refuses_and_names_the_owner` | Linux tmpfs and Btrfs | `cargo test --workspace --locked`, once per `TMPDIR` | Both passed; CLI reported `Busy`; Status, Preview and Recover reported the foreign owner with an unqualified app root |
+| `deployment_marker`, including `failed_marker_clear_after_restore_blocks_until_cleanup_can_retry` | Linux tmpfs and Btrfs; Windows NTFS | `cargo test --locked -p marduk-workspace --test deployment_marker -- --ignored --test-threads=1` | 7 passed on each; a failed clear reports `Io` instead of completed restore, and retry clears without touching the restored bytes |
+| `deployment_marker_cross_platform` | Linux tmpfs and Btrfs; Windows NTFS | `cargo test --locked -p marduk-storage --test deployment_marker_cross_platform -- --ignored --test-threads=1` | 4 passed on each; one simultaneous claim wins; empty and incomplete markers conflict; unrecorded bytes are quarantined, recorded slots refuse |
+| `native_effects` | Linux tmpfs and Btrfs | `cargo test --locked -p marduk-storage --test native_effects -- --ignored --test-threads=1` | 20 passed on each |
+| `native_deployment`, including `undo_prepare_process_cut` | Linux tmpfs and Btrfs; Windows NTFS | `cargo test --locked -p marduk-workspace --test native_deployment -- --ignored --test-threads=1 --nocapture` | 11 passed on each Linux volume; 5 passed on NTFS. With no durable undo row, a fresh process rolled back and preserved the original and both quarantined copies byte-exact; on NTFS `windows_exchange_process_cut` also passed all four phase/case variants |
+
+The Linux workspace suite passed 369 tests per volume; the ignored workspace/storage suites
+and workspace build also passed on each. The frontend passed 82 tests and built on both.
+The separate Linux Tauri build could not resolve `webkit2gtk-4.1` and `javascriptcoregtk-4.1`.
+Neither a power cut nor an installed desktop deployment was run.

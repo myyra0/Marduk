@@ -276,6 +276,13 @@ mod root {
     }
 
     impl Binding {
+        pub(crate) fn installation_directory(&self) -> (&File, PathBuf) {
+            (
+                &self.installation.file,
+                PathBuf::from(&self.installation.final_path),
+            )
+        }
+
         pub(crate) fn identities(&self) -> (&RootIdentity, &RootIdentity) {
             (&self.installation.identity, &self.data.identity)
         }

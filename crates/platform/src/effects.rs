@@ -201,6 +201,26 @@ pub fn sync_bound_directory(directory: &File, path: &std::path::Path) -> Result<
     sync_directory(path)
 }
 
+/// Move an entry within a bound directory without replacing another entry.
+/// `path` is the directory spelling used on Windows.
+pub fn move_noreplace_in(
+    directory: &File,
+    path: &std::path::Path,
+    from: &str,
+    to: &str,
+) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = path;
+        crate::native::renameat2(directory, from, directory, to, libc::RENAME_NOREPLACE)
+    }
+    #[cfg(windows)]
+    {
+        let _ = directory;
+        move_path_noreplace(&path.join(from), &path.join(to))
+    }
+}
+
 /// Move `stage_dir/stage_name` onto `target_dir/leaf` only when the target name
 /// is absent. An existing target is never replaced.
 #[allow(unused_variables)]

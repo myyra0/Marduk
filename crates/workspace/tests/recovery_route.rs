@@ -19,7 +19,8 @@ use marduk_core::recovery::{
     Claim, CopyEffects, Journal, PreImage, StepDirection, StepOutput, StepPhase, StepSpec,
 };
 use marduk_games::skyrim_se;
-use marduk_storage::native_effects::{DEPLOYMENT_MARKER, NativeEffects};
+use marduk_platform::DEPLOYMENT_MARKER;
+use marduk_storage::native_effects::NativeEffects;
 use marduk_storage::operation_journal::OperationJournal;
 use marduk_workspace::{Envelope, Op, Request, Workspace};
 use serde_json::{Value, json};
@@ -124,7 +125,10 @@ impl Fixture {
     }
 
     fn claim_marker(&self, owner: &Path) {
-        fs::write(self.marker(), owner.to_string_lossy().as_bytes()).unwrap();
+        marduk_platform::bind_installation(&self.game, &skyrim_se::LAYOUT)
+            .unwrap()
+            .claim_deployment(owner)
+            .unwrap();
     }
 }
 
@@ -156,13 +160,33 @@ fn moved_installation_is_target_unavailable() {
 }
 
 #[test]
-#[ignore = "requires TMPDIR on tmpfs or Btrfs: reading the marker needs a native adapter"]
 fn nothing_pending_but_a_foreign_marker_refuses_and_names_the_owner() {
     let mut fixture = Fixture::new();
     fixture.setup();
     let owner = fixture.temp.path().join("other-catalog");
     fixture.claim_marker(&owner);
+    let marker = fs::read(fixture.marker()).unwrap();
     let before = fixture.game_bytes();
+    fixture.make_root_unqualified();
+
+    let status = expect_ok(
+        fixture
+            .workspace
+            .dispatch(Request::new(Op::Status, json!({}))),
+    );
+    assert_eq!(
+        status["deployment"]["owner"],
+        json!(owner.to_string_lossy())
+    );
+    assert_eq!(
+        status["availability"]["deploy"]["blocker"]["code"],
+        json!("ActiveDeployment")
+    );
+    let preview = expect_error(fixture.workspace.dispatch(Request::new(
+        Op::DeployPreview,
+        json!({ "atRevision": "0" }),
+    )));
+    assert_eq!(preview["code"], json!("ActiveDeployment"));
 
     let error = expect_error(fixture.recover());
     assert_eq!(error["code"], json!("ActiveDeployment"));
@@ -175,7 +199,7 @@ fn nothing_pending_but_a_foreign_marker_refuses_and_names_the_owner() {
     );
     assert_eq!(
         fs::read(fixture.marker()).unwrap(),
-        owner.to_string_lossy().as_bytes(),
+        marker,
         "a foreign marker is never cleared"
     );
     assert_eq!(
@@ -186,7 +210,6 @@ fn nothing_pending_but_a_foreign_marker_refuses_and_names_the_owner() {
 }
 
 #[test]
-#[ignore = "requires TMPDIR on tmpfs or Btrfs: reading the marker needs a native adapter"]
 fn idle_owned_marker_is_cleared_when_nothing_is_pending() {
     let mut fixture = Fixture::new();
     fixture.setup();

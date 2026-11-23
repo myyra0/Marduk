@@ -55,8 +55,10 @@ use linux as native;
 #[cfg(windows)]
 use windows as native;
 
+mod deployment_marker;
 pub mod effects;
 mod instance;
+pub use deployment_marker::{DEPLOYMENT_MARKER, DeploymentOwner};
 pub mod library_stage;
 #[doc(hidden)]
 pub mod native_proof;

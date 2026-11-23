@@ -1,6 +1,6 @@
 # ADR 0005: one client and one catalog per installation
 
-**Status:** Accepted.
+**Status:** Accepted; scope revised 2026-11-23.
 
 ## Context
 
@@ -11,19 +11,14 @@ simultaneous writers.
 
 ## Decision
 
-- **One client at a time.** The desktop and the CLI share one account-wide instance guard. A second
-  client fails with a typed refusal instead of waiting. The guard is held for the desktop process or
-  for the CLI command.
-- **One catalog per installation, marked on the installation.** A deploy creates
-  `.marduk-deployment` in the installation root before its first public effect. The file contains the
-  owning catalog root and is never updated. A completed restore or a fully rolled-back deploy deletes
-  it. A marker naming another catalog refuses preview, deploy, restore and recovery with
-  `ActiveDeployment`; status shows the owner.
-- **No coordination protocol.** There is no lease gate, no claim token, no compare-and-swap and no
-  per-user ownership directory. Single-instance makes them unnecessary; the marker makes sequential
-  catalog switching safe.
+- **One client per catalog.** The desktop and CLI hold the catalog's `instance.lock` for the desktop
+  process or CLI command. Competing clients on that catalog get a typed refusal without waiting.
+  Once the catalog is resolved, the lock location does not consult the environment.
+- **One catalog per installation.** The verified installation binding publishes a marker with a
+  no-replace move before deployment can affect the installation. Catalogs can run concurrently;
+  the marker, not a cross-catalog lease or protocol, arbitrates ownership.
 - **The journal stays authoritative** for what is deployed. The marker records only ownership; it
-  stores no generation and is not consulted to decide what to restore.
+  stores no generation. See the [client contract](../contracts/m1-clients.md) for refusals and cleanup.
 
 ## Rejected alternatives
 
@@ -36,9 +31,12 @@ simultaneous writers.
 
 ## Cost if wrong
 
-- The CLI is refused while the desktop is open. A user who wants both must close one.
+- The CLI is refused while the desktop is using the same catalog. Clients on distinct catalogs
+  can still use separate installations.
 - If the owning catalog is deleted while a deployment exists, the marker blocks other catalogs until it
   is removed by hand at `<installation>/.marduk-deployment`. Status names the owner, not the path.
-- The marker adds one file inside the game folder for the duration of a deployment; Steam ignores it.
-- A crash between writing the marker and recording the operation leaves a marker that the owning
-  catalog's recovery clears when the journal is idle.
+- A process cut before publication can leave a uniquely named temporary in the installation root;
+  it does not claim the installation. Windows standard flushing does not prove power-cut durability
+  ([ADR 0004](0004-windows-writes-use-standard-flush.md)).
+- Pre-redesign unframed records are not distinguishable from truncated writes. They fail closed;
+  restore with the previous build before upgrading a still-deployed development installation.

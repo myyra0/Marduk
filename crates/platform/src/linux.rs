@@ -237,6 +237,14 @@ pub(crate) struct Binding {
 }
 
 impl Binding {
+    pub(crate) fn installation_directory(&self) -> (&File, PathBuf) {
+        let file = &self.installation.file;
+        (
+            file,
+            PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())),
+        )
+    }
+
     pub(crate) fn identities(&self) -> (&RootIdentity, &RootIdentity) {
         (&self.installation.identity, &self.data.identity)
     }
