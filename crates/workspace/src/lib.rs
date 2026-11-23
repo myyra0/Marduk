@@ -398,6 +398,14 @@ pub struct QuarantinedLeftover {
     pub reason: String,
 }
 
+/// The installation lease record a status observed. The path is the exact file
+/// an owner must remove by hand when a crashed deploy left a claim that cannot
+/// be cleared safely.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LeaseInfo {
+    pub path: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceStatus {
@@ -406,6 +414,8 @@ pub struct WorkspaceStatus {
     pub availability: AvailabilitySet,
     pub pending: Option<Operation>,
     pub active_generation_id: Option<String>,
+    /// Present exactly when an installation lease record exists.
+    pub lease: Option<LeaseInfo>,
     pub reconciliation: Reconciliation,
 }
 
@@ -736,6 +746,7 @@ impl Workspace {
         };
         let mut pending = None;
         let mut active_generation_id = None;
+        let mut lease = None;
         // Client deploy/restore is available only where the recorded pair still
         // reopens, both roots sit on a volume the record proves, and the app and
         // game roots share a rename domain. The locator's volume class alone is
@@ -764,6 +775,12 @@ impl Workspace {
                 pending: pending_status,
                 active_generation,
             } = selected;
+
+            lease = self
+                .lease_record(&expected_installation)?
+                .map(|_| LeaseInfo {
+                    path: self.lease_path(&expected_installation),
+                });
 
             installation = Some(Installation {
                 id: decimal(id),
@@ -811,6 +828,7 @@ impl Workspace {
             },
             pending,
             active_generation_id,
+            lease,
             reconciliation: self.reconciliation.clone(),
         })
     }
@@ -873,6 +891,11 @@ impl Workspace {
         // A preview must not be applyable on a root that would refuse the
         // write, so the native gate runs before the catalog is read.
         let selected = self.selected_pair()?;
+        // A preview on an installation another catalog owns would save a plan
+        // this client cannot apply. Refuse before any plan is persisted.
+        if let Some(owner) = self.foreign_owner(&selected)? {
+            return Err(foreign_deployment(&owner));
+        }
         self.require_native_effects(&selected)?;
         let named = self
             .catalog
@@ -1063,10 +1086,12 @@ impl Workspace {
             |event| feed.emit(event),
         ) {
             Ok(status) => {
-                // Clear only this call's reference: a replay served to a
-                // concurrent call must not erase a newer operation's claim.
-                if let Ok(lease) = self.lease(&selected.installation) {
-                    let _ = lease.clear_if(&self.app_data, Some(&reference));
+                // A restore call can be served another restore's recorded
+                // pending status. Only a completed outcome with an idle journal
+                // proves the work is done; a pending or failed status keeps the
+                // record so ownership cannot be cleared under live work.
+                if status.phase == Phase::Completed {
+                    self.release_if_idle(&selected, Some(&reference));
                 }
                 Ok(RestoreResult::Operation {
                     operation: operation(status),
@@ -1106,6 +1131,16 @@ impl Workspace {
             return Ok(None);
         };
         lease.read().map_err(lease_error)
+    }
+
+    /// The exact record file [`InstallationLease`] writes for this installation.
+    /// Display only: the lease object still owns every containment check.
+    fn lease_path(&self, installation: &RootIdentity) -> String {
+        let key = hex(&installation.installation_key());
+        self.lease_root
+            .join(format!("{key}.lease"))
+            .display()
+            .to_string()
     }
 
     /// The recorded owner of this installation, when a record exists.
@@ -1264,17 +1299,17 @@ impl Workspace {
         }
         if state.pending.is_none() {
             // No native work. Only a reference this command family writes can
-            // be attributed to a dead claim: a `recovery:` record with an idle
-            // journal is a recovery that exited before claiming journal work.
-            // A `plan:` or `generation:` record is left alone — a deploy can
-            // sit between its lease claim and its journal claim with an idle
+            // be attributed to a dead claim: `recovery:` and `restore:` with an
+            // idle journal. A restore claims only after seeing an active
+            // generation, so an idle journal cannot hide a live restore. A
+            // `plan:` or `generation:` record is left alone — a deploy can sit
+            // between its lease claim and its journal claim with an idle
             // journal, and clearing it would delete a live claim.
             if state.active.is_none()
                 && let Some(record) = record
-                && record
-                    .reference
-                    .as_deref()
-                    .is_some_and(|reference| reference.starts_with("recovery:"))
+                && record.reference.as_deref().is_some_and(|reference| {
+                    reference.starts_with("recovery:") || reference.starts_with("restore:")
+                })
                 && let Ok(lease) = self.lease(&selected.installation)
             {
                 let _ = lease.clear_if(&self.app_data, record.reference.as_deref());
@@ -2198,6 +2233,9 @@ mod wire_fixture {
                 }],
             }),
             active_generation_id: Some("9223372036854775804".to_owned()),
+            lease: Some(LeaseInfo {
+                path: "/home/user/.local/state/marduk/leases/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.lease".to_owned(),
+            }),
             reconciliation: Reconciliation {
                 reclaimed: vec![LARGE_B.to_owned()],
                 quarantined: vec![QuarantinedLeftover {

@@ -42,6 +42,9 @@ describe('Rust-generated wire fixtures', () => {
     expect(BigInt(status.profile.members[0].id)).toBeGreaterThan(MAX_SAFE);
     expect(status.installation?.id).toBe('9007199254740993');
     expect(status.activeGenerationId).toBe('9223372036854775804');
+    expect(status.lease?.path).toBe(
+      '/home/user/.local/state/marduk/leases/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.lease',
+    );
 
     // A JSON round trip must not turn the decimal text into a number.
     const roundTripped = JSON.parse(JSON.stringify(status)) as typeof status;
@@ -188,6 +191,20 @@ describe('Rust-generated wire fixtures', () => {
         'missing activeGenerationId',
         draft(statusFixture, (value) => {
           delete value.result.activeGenerationId;
+        }),
+        parseWorkspaceStatus,
+      ],
+      [
+        'missing lease',
+        draft(statusFixture, (value) => {
+          delete value.result.lease;
+        }),
+        parseWorkspaceStatus,
+      ],
+      [
+        'lease without a path',
+        draft(statusFixture, (value) => {
+          delete value.result.lease.path;
         }),
         parseWorkspaceStatus,
       ],

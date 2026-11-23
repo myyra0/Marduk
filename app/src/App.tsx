@@ -867,6 +867,11 @@ export function App({ transport }: Props) {
               Active generation:{' '}
               {status.activeGenerationId === null ? 'none' : <code>{status.activeGenerationId}</code>}
             </p>
+            {status.lease !== null && (
+              <p className="muted">
+                Installation lease: <code>{status.lease.path}</code>
+              </p>
+            )}
             {(status.reconciliation.reclaimed.length > 0 ||
               status.reconciliation.quarantinedCount > 0) && (
               <p role="status">

@@ -157,12 +157,20 @@ export type Reconciliation = {
   quarantinedCount: number;
 };
 
+/**
+ * The installation lease record a status observed, naming the exact file an
+ * owner must remove when a crashed deploy left a claim that cannot be cleared
+ * safely.
+ */
+export type LeaseInfo = { path: string };
+
 export type WorkspaceStatus = {
   installation: Installation | null;
   profile: Snapshot;
   availability: AvailabilitySet;
   pending: Operation | null;
   activeGenerationId: Id | null;
+  lease: LeaseInfo | null;
   reconciliation: Reconciliation;
 };
 
@@ -466,7 +474,13 @@ export function parseReconciliation(value: unknown, field = 'reconciliation'): R
 
 export function parseWorkspaceStatus(value: unknown, field = 'status'): WorkspaceStatus {
   const status = record(value, field);
-  for (const key of ['installation', 'pending', 'activeGenerationId', 'reconciliation']) {
+  for (const key of [
+    'installation',
+    'pending',
+    'activeGenerationId',
+    'lease',
+    'reconciliation',
+  ]) {
     if (!(key in status)) {
       throw new WireFormatError(`${field}.${key}: missing`);
     }
@@ -474,6 +488,7 @@ export function parseWorkspaceStatus(value: unknown, field = 'status'): Workspac
   const installation = status.installation;
   const pending = status.pending;
   const activeGenerationId = status.activeGenerationId;
+  const lease = status.lease;
   const availability = record(status.availability, `${field}.availability`);
   const installed =
     installation === null || installation === undefined
@@ -503,6 +518,12 @@ export function parseWorkspaceStatus(value: unknown, field = 'status'): Workspac
       activeGenerationId === null || activeGenerationId === undefined
         ? null
         : parseId(activeGenerationId, `${field}.activeGenerationId`),
+    lease:
+      lease === null || lease === undefined
+        ? null
+        : {
+            path: text(record(lease, `${field}.lease`).path, `${field}.lease.path`),
+          },
     reconciliation: parseReconciliation(status.reconciliation, `${field}.reconciliation`),
   };
 }

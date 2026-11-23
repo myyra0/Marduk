@@ -12,9 +12,11 @@ mod zip_fixture;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use marduk_core::deployment::PlanId;
+use marduk_core::deployment::{GenerationId, Phase, PlanId};
 use marduk_core::ids::ProfileRevision;
+use marduk_core::recovery::{Claim, Journal};
 use marduk_platform::lease::{InstallationLease, LeaseRecord};
+use marduk_storage::operation_journal::OperationJournal;
 use marduk_workspace::{Code, Envelope, Op, Request, RestoreResult, WireError, Workspace};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -29,6 +31,15 @@ fn setup(workspace: &mut Workspace, game: &Path) {
 
 /// Import and order one pair, then return the reviewed plan.
 fn review_plan(workspace: &mut Workspace, zip: &Path) -> PlanId {
+    let revision = arrange_pair(workspace, zip);
+    let preview = workspace
+        .proof_preview_deployment(ProfileRevision::new(revision))
+        .unwrap();
+    PlanId::try_from_u64(preview.id.as_ref().unwrap().parse().unwrap()).unwrap()
+}
+
+/// Import and order one pair, returning the new profile revision.
+fn arrange_pair(workspace: &mut Workspace, zip: &Path) -> u64 {
     let status = expect_ok(workspace.dispatch(Request::new(Op::Status, json!({}))));
     let at_revision = status["profile"]["revision"].as_str().unwrap().to_owned();
     let prepared = expect_ok(workspace.dispatch(Request::new(
@@ -56,11 +67,7 @@ fn review_plan(workspace: &mut Workspace, zip: &Path) -> PlanId {
             "memberIds": members,
         }),
     )));
-    let revision = ordered["revision"].as_str().unwrap().parse().unwrap();
-    let preview = workspace
-        .proof_preview_deployment(ProfileRevision::new(revision))
-        .unwrap();
-    PlanId::try_from_u64(preview.id.as_ref().unwrap().parse().unwrap()).unwrap()
+    ordered["revision"].as_str().unwrap().parse().unwrap()
 }
 
 const BASE: &[u8] = b"base\n";
@@ -96,6 +103,7 @@ struct Fixture {
     temp: TempDir,
     game: PathBuf,
     app_a: PathBuf,
+    app_b: PathBuf,
     zip: PathBuf,
     workspace_a: Workspace,
     workspace_b: Workspace,
@@ -130,6 +138,7 @@ impl Fixture {
             temp,
             game,
             app_a,
+            app_b,
             zip,
             workspace_a,
             workspace_b,
@@ -173,7 +182,10 @@ fn a_foreign_catalog_is_refused_until_the_owner_restores() {
     assert_eq!(fixture.deployed(), POST);
 
     setup(&mut fixture.workspace_b, &fixture.game);
-    let foreign_plan = review_plan(&mut fixture.workspace_b, &fixture.zip);
+    // The preview also refuses a foreign-owned installation, so apply is
+    // witnessed with a plan id this catalog never planned: the ownership gate
+    // refuses before any plan is read.
+    let foreign_plan = PlanId::try_from_u64(1).unwrap();
     let refused = fixture
         .workspace_b
         .proof_apply_deployment(foreign_plan)
@@ -241,7 +253,7 @@ fn the_record_survives_a_restart_and_a_torn_record_refuses() {
         Workspace::open_at(&fixture.app_a, &state_root(fixture.temp.path())).unwrap();
 
     setup(&mut fixture.workspace_b, &fixture.game);
-    let foreign_plan = review_plan(&mut fixture.workspace_b, &fixture.zip);
+    let foreign_plan = PlanId::try_from_u64(1).unwrap();
     let refused = fixture
         .workspace_b
         .proof_apply_deployment(foreign_plan)
@@ -262,9 +274,9 @@ fn the_record_survives_a_restart_and_a_torn_record_refuses() {
     fixture.workspace_a.proof_apply_deployment(plan).unwrap();
     let path = fixture.lease_path();
     assert!(path.exists(), "the claim is on disk");
-    // The reviewed plan exists before the corruption; only the arbitration
-    // record is damaged.
-    let torn_plan = review_plan(&mut fixture.workspace_b, &fixture.zip);
+    // The ownership record, not a plan, is what is damaged here: B cannot
+    // review a plan on a foreign installation, so a fresh plan id stands in.
+    let torn_plan = PlanId::try_from_u64(1).unwrap();
     fs::write(&path, b"marduk-lease/1\ntorn").unwrap();
 
     let refused = fixture
@@ -449,5 +461,194 @@ fn a_crashed_recovery_claim_is_cleared_when_the_journal_is_idle() {
         lease.read().unwrap(),
         None,
         "an idle recovery claim this family wrote is the crash leftover and is cleared"
+    );
+}
+
+fn record_app_generation(fixture: &Fixture) -> GenerationId {
+    let mut journal = OperationJournal::open(&fixture.app_a).unwrap();
+    let selected = journal.selected_installation().unwrap().unwrap();
+    journal
+        .root_state(&selected.data)
+        .unwrap()
+        .active
+        .expect("the deploy leaves an active generation")
+}
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn a_replayed_pending_restore_keeps_the_record_until_the_work_completes() {
+    let mut fixture = Fixture::new();
+    setup(&mut fixture.workspace_a, &fixture.game);
+    // A zero-file profile keeps this witness about ownership: the restore has a
+    // real generation and no effects to replay.
+    let revision = expect_ok(
+        fixture
+            .workspace_a
+            .dispatch(Request::new(Op::Status, json!({}))),
+    )["profile"]["revision"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let preview = fixture
+        .workspace_a
+        .proof_preview_deployment(ProfileRevision::new(revision))
+        .unwrap();
+    let plan = PlanId::try_from_u64(preview.id.as_ref().unwrap().parse().unwrap()).unwrap();
+    fixture.workspace_a.proof_apply_deployment(plan).unwrap();
+    let lease = fixture.lease();
+
+    // The first restore claimed the lease, recorded its operation and died
+    // before any effect. This is the exact state a second call can observe.
+    let generation = record_app_generation(&fixture);
+    let reference = {
+        let record = lease.read().unwrap().expect("the deploy records its claim");
+        format!("restore:{}:1-2", record.reference.unwrap())
+    };
+    let pending = {
+        let mut journal = OperationJournal::open(&fixture.app_a).unwrap();
+        let selected = journal.selected_installation().unwrap().unwrap();
+        let pending = journal
+            .claim(Claim::Restore {
+                installation: selected.installation,
+                data: selected.data,
+                generation,
+            })
+            .unwrap();
+        // Seal the generation and enter Restoring, so recovery completes the
+        // interrupted restore instead of cancelling a claim that never started.
+        journal.seal(pending, Vec::new()).unwrap();
+        journal
+            .set_phase(pending, Phase::Prepared, Phase::Restoring)
+            .unwrap();
+        pending
+    };
+    lease
+        .claim(&LeaseRecord {
+            app_data: fixture.app_a.clone(),
+            reference: Some(reference.clone()),
+        })
+        .unwrap();
+
+    // The second restore receives the recorded pending status, not a second
+    // execution, and must not clear the record while that work is unfinished.
+    let replay = fixture.workspace_a.proof_restore().unwrap();
+    let RestoreResult::Operation { operation } = replay else {
+        panic!("expected the recorded pending restore, got {replay:?}");
+    };
+    assert_eq!(operation.id, pending.get().to_string());
+    assert_ne!(operation.phase, "completed");
+    assert_eq!(
+        lease.read().unwrap().and_then(|record| record.reference),
+        Some(reference),
+        "a replayed pending restore keeps ownership"
+    );
+
+    // A foreign catalog is still refused while the pending restore owns the
+    // installation, and its status names the lease file that holds the claim.
+    setup(&mut fixture.workspace_b, &fixture.game);
+    let status = expect_ok(
+        fixture
+            .workspace_b
+            .dispatch(Request::new(Op::Status, json!({}))),
+    );
+    assert_eq!(
+        status["availability"]["deploy"]["blocker"]["code"],
+        json!("ActiveDeployment")
+    );
+    assert_eq!(
+        status["lease"]["path"],
+        json!(fixture.lease_path().display().to_string()),
+        "status names the exact lease record"
+    );
+
+    // The completing call settles the recorded operation and clears the
+    // record; nothing is left claiming the installation.
+    let settled = fixture
+        .workspace_a
+        .proof_recover_pending()
+        .unwrap()
+        .expect("the pending restore is settled");
+    assert_eq!(settled.phase, "completed");
+    assert_eq!(lease.read().unwrap(), None, "completion clears the record");
+}
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn recover_clears_an_idle_restore_claim_but_not_a_plan_claim() {
+    let mut fixture = Fixture::new();
+    setup(&mut fixture.workspace_a, &fixture.game);
+    let lease = fixture.lease();
+    lease
+        .claim(&LeaseRecord {
+            app_data: fixture.app_a.clone(),
+            reference: Some("restore:generation:1:1-1".to_owned()),
+        })
+        .unwrap();
+
+    // An idle journal cannot hide a live restore: a restore claims only after
+    // seeing an active generation. The leftover is a completed restore cut
+    // before its lease removal.
+    assert!(
+        fixture
+            .workspace_a
+            .proof_recover_pending()
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        lease.read().unwrap(),
+        None,
+        "an idle restore claim is cleared by recovery"
+    );
+
+    lease
+        .claim(&LeaseRecord {
+            app_data: fixture.app_a.clone(),
+            reference: Some("plan:9".to_owned()),
+        })
+        .unwrap();
+    assert!(
+        fixture
+            .workspace_a
+            .proof_recover_pending()
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        lease.read().unwrap().and_then(|record| record.reference),
+        Some("plan:9".to_owned()),
+        "a plan claim can still be a live deploy and is left alone"
+    );
+}
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn a_foreign_owner_refuses_preview_before_a_plan_is_saved() {
+    let mut fixture = Fixture::new();
+    setup(&mut fixture.workspace_a, &fixture.game);
+    let plan = review_plan(&mut fixture.workspace_a, &fixture.zip);
+    fixture.workspace_a.proof_apply_deployment(plan).unwrap();
+
+    setup(&mut fixture.workspace_b, &fixture.game);
+    let revision = arrange_pair(&mut fixture.workspace_b, &fixture.zip);
+    let refused = fixture
+        .workspace_b
+        .proof_preview_deployment(ProfileRevision::new(revision))
+        .expect_err("a foreign claim refuses the preview");
+    assert_eq!(refused.code, Code::ActiveDeployment);
+    let message = refused.message.expect("the refusal names the owner");
+    assert!(
+        message.contains(&fixture.app_a.to_string_lossy().into_owned()),
+        "the refusal names the owning catalog root: {message}"
+    );
+
+    let mut journal = OperationJournal::open(&fixture.app_b).unwrap();
+    assert!(
+        journal
+            .plan(PlanId::try_from_u64(1).unwrap())
+            .unwrap()
+            .is_none(),
+        "a refused preview persists no plan"
     );
 }

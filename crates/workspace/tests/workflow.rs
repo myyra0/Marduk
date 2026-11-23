@@ -581,6 +581,7 @@ fn ids_and_revisions_serialize_as_exact_decimal_strings() {
         },
         pending: None,
         active_generation_id: Some(large_id.to_owned()),
+        lease: None,
         reconciliation: marduk_workspace::Reconciliation::default(),
     })
     .unwrap();

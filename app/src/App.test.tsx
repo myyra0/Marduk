@@ -123,6 +123,16 @@ describe('workspace shell', () => {
     expect(screen.getByText('9007199254740997 (stage_changed)')).toBeInTheDocument();
   });
 
+  it('shows the lease record path from status', async () => {
+    await renderReady();
+
+    expect(
+      screen.getByText(
+        /0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\.lease/,
+      ),
+    ).toBeInTheDocument();
+  });
+
   it('shows the typed effects blocker in the operations hint when deploy is blocked', async () => {
     await renderReady();
 
