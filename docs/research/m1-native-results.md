@@ -8,7 +8,7 @@ is the identity of a run. Start with [M1 status](../m1/README.md) if you want th
 `not run` is never a pass. No qualifying power-cut result exists. [ADR 0004](../adr/0004-windows-writes-use-standard-flush.md) narrows the Windows barrier to
 standard flushing, which excludes power-cut recovery from the claim.
 
-Environment: Linux 7.3.5-1-cachyos, x86-64, rustc 1.100.0, uid 1000 with `CapEff: 0` (ordinary user, no elevated token). tmpfs scratch: `/tmp` `rw,noatime,inode64,huge=advise`, fsid `b6b575e7…`, mount view 74, no Btrfs tree. Btrfs scratch: `/home` on `/dev/nvme0n1p2[/@home]` `rw,noatime,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/@home`, fsid `b68b24bc…`, view 61, tree 257. All fixtures are synthetic files under a disposable parent; no game, external root or elevated operation was touched.
+Environment: Linux 7.3.5-1-cachyos, x86-64, rustc 1.100.0, uid 1000 with `CapEff: 0` (ordinary user, no elevated token). tmpfs scratch: `/tmp` `rw,noatime,inode64,huge=advise`, fsid `b6b575e7…`, no Btrfs tree. Btrfs scratch: `/home` on `/dev/nvme0n1p2[/@home]` `rw,noatime,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/@home`, fsid `b68b24bc…`, tree 257. All fixtures are synthetic files under a disposable parent; no game, external root or elevated operation was touched.
 
 | Proof case | Linux Btrfs | Linux tmpfs | Linux ext4 | Hosted `windows-2025` NTFS | Power |
 |---|---|---|---|---|---|
@@ -702,4 +702,35 @@ passed 2 unit and 10 workflow tests, including
 check and locked build passed. `npm --prefix app test` passed 82 tests and
 `npm --prefix app run build` passed. The separate Linux Tauri build could
 not resolve `webkit2gtk-4.1` and `javascriptcoregtk-4.1`.
-No remount experiment, power cut, installed desktop deployment or real-game write was run.
+No power cut, installed desktop deployment or real-game write was run.
+
+## Durable installation identity (ADR 0006)
+
+Code `d50850f`, base `003cb80`. Linux 7.3.5-1-cachyos, x86-64, uid 1000 with `CapEff: 0`.
+The bind-mount witness ran in a disposable `unshare -Urnm` namespace with private mounts, so no
+host mount or privilege was changed. Windows ran on the `win10-ltsc` VM `DESKTOP-4NP2KM5` as a
+scheduled task under `admin`, with `rustc 1.100.0` and `%TEMP%` on NTFS `C:`.
+
+| Witness | Configuration | Command | Result | Commit |
+|---|---|---|---|---|
+| `linux_identity_is_exactly_the_durable_object_fields`, `reopen_requires_exact_object_identity_for_each_root` | Btrfs `/var/tmp` | `cargo test --locked -p marduk-platform --test linux_root_regressions` | 10 passed, 1 ignored. Exhaustive destructuring of the token compiles only the durable fields; a mutated inode still refuses reopen for either root | `d50850f` |
+| `same_objects_on_another_mount_view_keep_identity` | tmpfs and Btrfs, two independent bind mounts of one tree | `unshare -Urnm` then `MARDUK_M1_VIEW_A=<a> MARDUK_M1_VIEW_B=<b> cargo test --locked -p marduk-platform --test linux_root_regressions same_objects_on_another_mount_view_keep_identity -- --ignored --exact` | passed on both. `/proc/self/mountinfo` showed distinct mount IDs 554 and 555 for the two views; the durable identities were equal and reopen through the second view returned the recorded pair | `d50850f` |
+| `identity_codec_round_trips_both_domains`, `identity_codec_refuses_the_v1_mount_view_layout`, malformed and trailing-byte refusals | Linux | `cargo test --locked -p marduk-storage --lib identity_codec` | 4 passed. v1 Linux and v1 Windows blobs both return `DeployError::UnsupportedEvidenceVersion`, not `Io` and not a decoded identity | `d50850f` |
+| `cargo test --workspace --locked` | Linux tmpfs (`TMPDIR=/tmp`) and Btrfs (`TMPDIR=/var/tmp`) | as written | 372 passed, 0 failed on each | `d50850f` |
+| ignored storage suites | same two volumes | `cargo test --locked -p marduk-storage --tests -- --ignored` | 25 passed, 0 failed on each (20 `native_effects`, 4 `deployment_marker_cross_platform`, 1 `qualified_stage`) | `d50850f` |
+| ignored workspace suites | same two volumes | `cargo test --locked -p marduk-workspace --tests -- --ignored` | 22 passed, 0 failed on each | `d50850f` |
+| `library_boundary` | Btrfs `/var/tmp` | `MARDUK_M1_BTRFS_SCRATCH=/var/tmp cargo test --locked -p marduk-platform --test library_boundary -- --ignored --test-threads=1` | 10 passed | `d50850f` |
+| `cargo test --workspace --locked` | NTFS, native VM | `cargo test --workspace --locked` | exit 0; no failed suite | `d50850f` |
+| `native_deployment` ignored, including `windows_exchange_process_cut` | NTFS, native VM | `cargo test -p marduk-workspace --test native_deployment -- --ignored --test-threads=1 --nocapture` | `test result: ok. 5 passed; 0 failed`; `windows_exchange_process_cut` passed all four phase/case variants, with both case-mismatched cuts logged as `Ambiguous` and no alternate object | `d50850f` |
+| `deployment_marker_cross_platform` | NTFS, native VM | `cargo test -p marduk-storage --test deployment_marker_cross_platform -- --ignored --test-threads=1` | `test result: ok. 4 passed; 0 failed` | `d50850f` |
+| CLI and desktop frontend | Linux | `cargo test --locked -p marduk-cli`; `npm --prefix app test`; `npm --prefix app run build` | 2 unit and 10 workflow tests passed; 82 vitest tests passed; Vite build passed | `d50850f` |
+| Tauri app test/build | Linux | `cargo test --manifest-path app/src-tauri/Cargo.toml --locked`; `cargo build --manifest-path app/src-tauri/Cargo.toml --locked` | not run: `javascriptcoregtk-4.1` and `webkit2gtk-4.1` are absent on this host | — |
+
+`cargo fmt --all -- --check` and `cargo build --workspace --locked` passed. The ignored
+`root_contract` Btrfs rows (`btrfs_reopened_snapshot_is_not_original_root`,
+`unapproved_nested_btrfs_subvolume_is_refused`) were attempted at `d50850f` and remain **not run**:
+their assertions completed but cleanup failed with `EPERM` deleting the scratch subvolumes, so no
+pass is claimed. One parallel invocation of the two ignored workspace suites produced a transient
+`dispatch_deploy_and_restore_through_the_whole_composition` failure; three subsequent sequential and
+parallel runs passed 22/22 on both volumes, so it is not recorded as a pass or as a defect.
+
