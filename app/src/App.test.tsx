@@ -442,6 +442,91 @@ describe('workspace shell', () => {
     expect(deployApply).toHaveBeenCalledTimes(1);
   });
 
+  it('reports an Ok Apply result with a blocker as blocked, not accepted', async () => {
+    const user = userEvent.setup();
+    const status = statusWithEffects();
+    const replayed: Operation = {
+      ...fixtureOperation(),
+      kind: 'deploy',
+      phase: 'rolled_back',
+      blocker: { code: 'RecoveryConflict' },
+    };
+    const statusCall = vi.fn(async () => ({ ok: true as const, result: status }));
+    const deployApply = vi.fn(async () => ({ ok: true as const, result: replayed }));
+    const restore = vi.fn(async () => ({ ok: true as const, result: fixtureRestore() }));
+    await renderReady({
+      status: statusCall,
+      deployPreview: async () => ({ ok: true, result: reviewFor(status) }),
+      deployApply,
+      restore,
+    });
+
+    await user.click(screen.getByRole('button', { name: /Review deployment/ }));
+    await user.click(await screen.findByRole('button', { name: /Apply deployment/ }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/Deployment blocked: RecoveryConflict/);
+    expect(alert).not.toHaveTextContent(/accepted/i);
+    expect(screen.queryByText(/accepted/i)).not.toBeInTheDocument();
+
+    // The authoritative reload still happens, and the blocked write is not retried.
+    await waitFor(() => expect(statusCall).toHaveBeenCalledTimes(2));
+    expect(deployApply).toHaveBeenCalledTimes(1);
+    expect(restore).not.toHaveBeenCalled();
+  });
+
+  it('reports an Ok Apply result that is still running as pending, not accepted', async () => {
+    const user = userEvent.setup();
+    const status = statusWithEffects();
+    const running: Operation = {
+      ...fixtureOperation(),
+      kind: 'deploy',
+      phase: 'applying',
+      blocker: null,
+    };
+    const deployApply = vi.fn(async () => ({ ok: true as const, result: running }));
+    await renderReady({
+      status: async () => ({ ok: true, result: status }),
+      deployPreview: async () => ({ ok: true, result: reviewFor(status) }),
+      deployApply,
+    });
+
+    await user.click(screen.getByRole('button', { name: /Review deployment/ }));
+    await user.click(await screen.findByRole('button', { name: /Apply deployment/ }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/Deployment still pending \(applying\)/);
+    expect(screen.queryByText(/accepted/i)).not.toBeInTheDocument();
+    expect(deployApply).toHaveBeenCalledTimes(1);
+  });
+
+  it('still announces a clean completed Apply as accepted', async () => {
+    const user = userEvent.setup();
+    const status = statusWithEffects();
+    const completed: Operation = {
+      ...fixtureOperation(),
+      kind: 'deploy',
+      phase: 'completed',
+      blocker: null,
+    };
+    const deployApply = vi.fn(async () => ({ ok: true as const, result: completed }));
+    const restore = vi.fn(async () => ({ ok: true as const, result: fixtureRestore() }));
+    await renderReady({
+      status: async () => ({ ok: true, result: status }),
+      deployPreview: async () => ({ ok: true, result: reviewFor(status) }),
+      deployApply,
+      restore,
+    });
+
+    await user.click(screen.getByRole('button', { name: /Review deployment/ }));
+    await user.click(await screen.findByRole('button', { name: /Apply deployment/ }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Deployment accepted; authoritative state reloaded.');
+    expect(deployApply).toHaveBeenCalledTimes(1);
+    expect(restore).not.toHaveBeenCalled();
+  });
+
   it('keeps Apply disabled with the typed blocker when availability forbids it', async () => {
     const user = userEvent.setup();
     const status = fixtureStatus();

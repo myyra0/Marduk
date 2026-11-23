@@ -475,7 +475,7 @@ export function App({ transport }: Props) {
           setOperationState(operation);
           setReview(null);
           setReviewInvalidated(false);
-          await refresh('Deployment accepted; authoritative state reloaded.');
+          await refresh(describeDeployOutcome(operation));
         },
         reject: () => {
           setReview(null);
@@ -907,6 +907,26 @@ export function App({ transport }: Props) {
 // which platform note to show. It is not a capability decision.
 function isWindowsPlatform(): boolean {
   return /Windows/i.test(navigator.userAgent);
+}
+
+/**
+ * An `Ok` envelope carries the recorded operation, not a verdict: a non-null
+ * blocker is a refusal, and a non-terminal phase is still running, so neither
+ * may be announced as accepted.
+ */
+function describeDeployOutcome(operation: Operation): string {
+  if (operation.blocker !== null) {
+    return `Deployment blocked: ${describeBlocker(operation.blocker)}; authoritative state reloaded. No write was retried.`;
+  }
+  switch (operation.phase) {
+    case 'completed':
+      return 'Deployment accepted; authoritative state reloaded.';
+    case 'rolled_back':
+    case 'cancelled':
+      return `Deployment ${operation.phase}; authoritative state reloaded. No write was retried.`;
+    default:
+      return `Deployment still pending (${operation.phase}); authoritative state reloaded.`;
+  }
 }
 
 function AvailabilityRow({ label, availability }: { label: string; availability: Availability }) {
