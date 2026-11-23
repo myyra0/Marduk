@@ -15,9 +15,9 @@ use std::path::{Path, PathBuf};
 
 use marduk_core::ids::{ProfileId, ProfileRevision};
 use marduk_core::import::{BeginImport, ImportError, ImportId, ImportTarget};
-use marduk_storage::library::{QuarantineReason, QuarantinedImport};
 use marduk_storage::Catalog;
-use rusqlite::{params, Connection, OptionalExtension};
+use marduk_storage::library::{QuarantineReason, QuarantinedImport};
+use rusqlite::{Connection, OptionalExtension, params};
 use zip_fixture::{ClassicZip, Record};
 
 const FILE: &str = "textures/synthetic.dds";
@@ -205,11 +205,13 @@ fn refused_import_leaves_no_private_snapshot_after_reconcile() {
     }
 
     assert_eq!(writing_rows(root), 0);
-    assert!(catalog
-        .snapshot(ProfileId::new(1))
-        .unwrap()
-        .members
-        .is_empty());
+    assert!(
+        catalog
+            .snapshot(ProfileId::new(1))
+            .unwrap()
+            .members
+            .is_empty()
+    );
 }
 
 #[test]
