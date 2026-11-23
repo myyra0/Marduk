@@ -48,5 +48,19 @@ The rule and its wire surface live in `docs/contracts/m1-clients.md`.
 A stale or torn record refuses every catalog for that installation until the owner restores or the
 operator removes the lease file by hand. Residuals carried knowingly: deployments made before this
 change have no record and are invisible until their catalog claims once; a crash between the lease
-claim and the journal claim leaves a record only the owner's recovery clears; the lease directory
-entry is not fsynced; arbitration is per OS user, so two users share nothing.
+claim and the journal claim left a record that only the owner's recovery could clear, and recovery
+now does clear it when the journal is idle; the lease directory entry is not fsynced, and the Windows
+directory inherits `%LOCALAPPDATA%`'s ACL; arbitration is per OS user, so two users share nothing.
+
+The lease directory is resolved from the process environment (`LOCALAPPDATA`; `XDG_STATE_HOME` else
+`HOME`), so two clients of the same account launched with deliberately different settings can resolve
+different directories and not see each other's record. The ownership guarantee is therefore scoped to
+clients that resolve the same state directory, not to the account as a whole. Record updates are
+atomic (temp file, replace, directory flush) and release removes the record under the gate, but the
+journal-idle check that precedes a release is not serialized with the lease gate. Only the exact
+claim reference that a call wrote can be cleared, so a stale call cannot clear a newer claim; the
+remaining window is recorded rather than claimed closed (user ruling, 2026-11-23).
+
+Enabling client deploy or restore is the availability record's decision: a recorded composition proof
+on that volume. It is not a statement that a real game install has been written; no real Skyrim SE
+write was performed in M1, and the first one is the user's own action on their own installation.

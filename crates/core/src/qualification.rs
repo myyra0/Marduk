@@ -182,27 +182,27 @@ pub const PROOFS: &[Proof] = &[
         os: Os::Linux,
         volume: VolumeClass::Btrfs,
         layer: Layer::Catalog,
-        witnesses: &["qualified_volume_stages_the_payload_through_the_production_catalog"],
-        date: "2026-11-22",
-        revision: "a2250e9",
+        witnesses: &["import_preview_and_apply_round_trip_on_a_qualified_volume"],
+        date: "2026-11-23",
+        revision: "76f7850",
     },
     Proof {
         capability: Capability::LibraryStaging,
         os: Os::Linux,
         volume: VolumeClass::Tmpfs,
         layer: Layer::Catalog,
-        witnesses: &["qualified_volume_stages_the_payload_through_the_production_catalog"],
-        date: "2026-11-22",
-        revision: "a2250e9",
+        witnesses: &["import_preview_and_apply_round_trip_on_a_qualified_volume"],
+        date: "2026-11-23",
+        revision: "76f7850",
     },
     Proof {
         capability: Capability::LibraryStaging,
         os: Os::Windows,
         volume: VolumeClass::Ntfs,
         layer: Layer::Catalog,
-        witnesses: &["windows_catalog_stages_a_payload_beside_its_root_pin"],
-        date: "2026-11-22",
-        revision: "62b9b94b",
+        witnesses: &["import_preview_and_apply_round_trip_on_a_qualified_volume"],
+        date: "2026-11-23",
+        revision: "76f7850",
     },
     Proof {
         capability: Capability::LibraryStaging,
@@ -577,7 +577,11 @@ mod tests {
             revision: "0000000",
         };
         let defined = |name: &str| {
-            name == "qualified_volume_stages_the_payload_through_the_production_catalog"
+            matches!(
+                name,
+                "qualified_volume_stages_the_payload_through_the_production_catalog"
+                    | "import_preview_and_apply_round_trip_on_a_qualified_volume"
+            )
         };
         assert_eq!(
             missing_witness(&PROOF, &defined),

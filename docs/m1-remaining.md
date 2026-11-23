@@ -35,6 +35,11 @@ flight, and gate acceptance** — not missing features or known code defects.
 | Privileged CI mount and unguarded Windows delete | `2982621` `/dev/shm` asserted tmpfs; Windows cleanup guarded by CI and profile | hosted job pending |
 | Desktop Apply/Restore discarded progress | `d32575d` engine transitions streamed to the channel | core/workspace/app witnesses; real desktop run pending |
 | Moved installation reported two different codes | `6e214f7` identity check before volume classification | witness on status and preview |
+| A crash during a lease update could leave an empty record read as vacant | `24047fa` publishes the record through a temp file and atomic replace; release unlinks; an empty record is `Unreadable` | platform witnesses both roots; NTFS run in flight |
+| An unowned revision was enumerated and deleted recursively after an emptiness check | `800e336` removes only an empty directory with one non-recursive call; anything that arrived is quarantined | storage witnesses both roots |
+| A stale restore, or a crash between claim and journal, could clear a newer claim or lock the install | `76f7850` reference-scoped clears, per-call restore references, and recovery clears an idle owned record | workspace witnesses both roots |
+| A blocked replay was announced as "Deployment accepted" | `fdee802` derives the notice from the blocker and phase | 81 frontend tests |
+| Import availability cited a witness that never published | publication witness recorded on tmpfs, Btrfs and NTFS; proof rows updated | `import_preview_and_apply_round_trip_on_a_qualified_volume` |
 | README claimed a Windows launched shell | `2982621` qualifies the claim | text |
 
 ## Open or unproven

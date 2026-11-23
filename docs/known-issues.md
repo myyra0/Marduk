@@ -22,10 +22,15 @@ last verification and the native syscall. Marduk detects it afterwards, retains 
 to retry automatically. It does not claim prevention. See the contract's "Known limitation" paragraph.
 
 **Cross-catalog installation ownership.** Deployments made before the installation lease existed carry no record, so
-another catalog root can deploy over them until their owning catalog claims once. A crash between the lease claim and
-the journal claim leaves a record only that owner's recovery clears; it is never adopted silently. The lease directory
-entry is not fsynced, and arbitration is per OS user — two users on one machine share nothing. See
-[ADR 0005](adr/0005-arbitrate-installation-ownership-outside-app-data.md).
+another catalog root can deploy over them until their owning catalog claims once. The lease record is published
+atomically and a crash between the claim and the journal claim is cleared by that catalog's next recovery when the
+journal is idle. The lease directory entry is not fsynced; on Windows the directory inherits `%LOCALAPPDATA%`'s ACL.
+Arbitration is per OS user, and the state directory is resolved from the process environment, so two clients of the
+same account launched with deliberately different `HOME`/`XDG_STATE_HOME`/`LOCALAPPDATA` may not share a record — the
+guarantee covers clients that resolve the same directory. A release checks journal idleness before clearing, and that
+check is not serialized with the lease gate; only the exact claim reference a call wrote can be cleared, so a stale
+call cannot clear a newer claim, but the remaining window is unproven under two simultaneous operations (user ruling,
+2026-11-23). See [ADR 0005](adr/0005-arbitrate-installation-ownership-outside-app-data.md).
 
 ## Unproven claims (no defect, no evidence)
 
