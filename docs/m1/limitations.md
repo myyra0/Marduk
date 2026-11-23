@@ -43,7 +43,8 @@ refuses to retry automatically. It does not claim prevention.
   frontend tests against a fake transport, but no installed-shell run has driven them. A golden
   desktop-and-CLI workflow closes it.
 - **Windows launched shell.** The smoke job exists and runs; on a headless hosted runner the webview
-  exposes no debugging port (`DevToolsActivePort`). The job is advisory and proves nothing there.
+  exposes no debugging port (`DevToolsActivePort`). The job is advisory: its failure is visible but
+  does not fail the run, and it proves nothing there.
 
 ## What would close each
 
