@@ -5,8 +5,9 @@ handling, deployed into the game folder with a recovery journal.
 
 ## Platform support
 
-Windows and Linux. The desktop app runs on both; each game, mod source and
-deploy method plugs into the same core.
+Windows and Linux. Marduk runs on Linux; the Windows native build and its unit
+tests pass, but a launched desktop shell there has not been verified yet. Each
+game, mod source and deploy method plugs into the same core.
 
 ## Known limitations
 
