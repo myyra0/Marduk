@@ -670,3 +670,11 @@ Not run at this point: the hosted CI step that asserts `/dev/shm` is tmpfs. Powe
 | `second_guard_in_one_process_is_busy`, `dropping_the_guard_allows_a_new_one`, `lock_lives_beneath_the_per_user_root_not_a_catalog_root` | Linux per-user instance gate | `cargo test -p marduk-platform --test instance_gate` | 4 passed; a second client is refused, the path is not under a catalog root | `265fd46` |
 | `deployment_marker_names_one_catalog_and_any_catalog_can_clear_it`, `deployment_marker_survives_a_fresh_adapter_and_unreadable_is_a_conflict`, `a_second_prepare_cannot_adopt_a_matching_stage_or_backup` | tmpfs and Btrfs | `TMPDIR=/tmp` and `/var/tmp cargo test -p marduk-storage --test native_effects -- --ignored` | 23 passed each; marker is create-once, unreadable is a conflict, no artifact adoption | `9143c38` |
 | `a_foreign_marker_refuses_preview_deploy_restore_and_recover_without_a_write`, `a_completed_restore_removes_the_marker_and_the_other_catalog_then_deploys`, `a_successful_deploy_keeps_the_marker`, `an_owned_marker_with_an_idle_journal_is_cleared_by_recover`, `a_fully_rolled_back_deploy_removes_the_marker`, `recovery_after_moving_the_installation_is_target_unavailable` | tmpfs and Btrfs | `TMPDIR=/tmp` and `/var/tmp cargo test -p marduk-workspace --test deployment_marker -- --ignored --test-threads=1` | 6 passed each | `c00a1d9` |
+
+Windows coverage for the marker and the instance gate: `instance_gate` 4/4 on NTFS (second
+acquisition `Busy`, lock under the per-user root, not a catalog root); `deployment_marker` 6/6 on
+NTFS (foreign refusal, restore removal, rollback removal, idle-owner recovery, moved installation);
+`native_deployment` 4/4 including the case-mismatched cut. Not evidenced on Windows: the
+fresh-adapter owned read-back and the refusal to adopt a matching stage/backup; those two witnesses
+live in `crates/storage/tests/native_effects.rs`, which is Linux-gated. The marker code they exercise
+is platform-independent, but this is Linux evidence only.
