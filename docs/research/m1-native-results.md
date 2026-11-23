@@ -126,9 +126,11 @@ deployed bytes and staged metadata, the status ref for the actually displaced
 original with its bytes and metadata, the committed generation after a restart,
 a completed restore that brings back the original tree and metadata, and a second
 restore answering `NoActiveDeployment` with the tree unchanged.
-`unqualified_installation_root_keeps_client_deploy_and_restore_refused` asserts
-the same three routes stay `UnsupportedTarget`/`Configuration` when the recorded
-installation root yields no class with a proof.
+`unqualified_installation_root_keeps_client_deploy_and_restore_refused` renames the
+recorded installation root without a replacement; identity re-verification fails first,
+so status, preview, apply and restore all refuse with `TargetUnavailable` rather than a
+volume verdict. It builds its fixture on a qualified volume, so it stays `#[ignore]` and
+runs only where `TMPDIR` is tmpfs or Btrfs.
 
 Runs at `97c03d9` (`cargo test --locked -p marduk-workspace --test
 native_deployment -- --ignored --test-threads=1`, 6 passed on each volume):

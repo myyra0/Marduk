@@ -1118,6 +1118,7 @@ fn dispatch_deploy_and_restore_through_the_whole_composition() {
 
 #[cfg(unix)]
 #[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
 fn unqualified_installation_root_keeps_client_deploy_and_restore_refused() {
     let mut fixture = Fixture::new();
     fixture.setup();
