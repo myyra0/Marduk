@@ -29,7 +29,7 @@ use std::path::Path;
 
 use marduk_archive::{M1_ZIP_LIMITS, admit_zip};
 use marduk_core::import::{
-    ArchiveError, ImportAllocation, ImportError, LimitKind, PayloadFile, StageEvidence,
+    ArchiveError, ImportAllocation, ImportError, ImportId, LimitKind, PayloadFile, StageEvidence,
 };
 use marduk_core::root_identity::{RootError, RootIdentity};
 use marduk_core::targets::{RootRole, TargetFile};
@@ -136,16 +136,16 @@ impl NativeStage {
     }
 
     /// Reclaim only a fully re-verified owned stage. Changed or unavailable data
-    /// is preserved.
+    /// is preserved. Returns whether a directory was actually removed.
     pub fn reclaim(
         &mut self,
         _guard: &WriterGuard,
         evidence: &StageEvidence,
-    ) -> Result<(), ImportError> {
+    ) -> Result<bool, ImportError> {
         let name = evidence.allocation.id.get().to_string();
         let revision = match self.tree.open_revision(&name) {
             Ok(Some(revision)) => revision,
-            Ok(None) => return Ok(()),
+            Ok(None) => return Ok(false),
             Err(error) => return Err(fsops::stage_error(error)),
         };
         if revision.identity() != &evidence.owner {
@@ -178,8 +178,98 @@ impl NativeStage {
         self.tree
             .sync_revisions()
             .map_err(|_| ImportError::Storage)?;
-        self.tree.sync_root().map_err(|_| ImportError::Storage)
+        self.tree.sync_root().map_err(|_| ImportError::Storage)?;
+        Ok(true)
     }
+
+    /// Reclaim a reservation whose stage receipt is incomplete, for example an
+    /// import refused before admission or a process killed while streaming.
+    ///
+    /// The reservation owns `revisions/<id>` from the committed catalog row.
+    /// A recorded owner proves the bound directory is the one this import
+    /// created; without one, only an empty directory may be removed, because
+    /// an unowned non-empty stage cannot be proven ours. Contents of a proved
+    /// directory are removed wholesale; there is no receipt to re-observe.
+    /// Returns whether a directory was actually removed.
+    pub fn reclaim_reservation(
+        &mut self,
+        _guard: &WriterGuard,
+        id: ImportId,
+        owner: Option<&RootIdentity>,
+    ) -> Result<bool, ImportError> {
+        let name = id.get().to_string();
+        let revision = match self.tree.open_revision(&name).map_err(fsops::stage_error)? {
+            Some(revision) => revision,
+            None => return Ok(false),
+        };
+        match owner {
+            Some(expected) => {
+                if revision.identity() != expected {
+                    return Err(ImportError::StageChanged);
+                }
+                self.tree
+                    .reverify_revision(&name, &revision)
+                    .map_err(fsops::stage_error)?;
+            }
+            None => {
+                let empty = revision
+                    .list_relative(&[])
+                    .map_err(|_| ImportError::StageUnavailable)?
+                    .is_empty();
+                if !empty {
+                    return Err(ImportError::StageChanged);
+                }
+            }
+        }
+
+        remove_staged_tree(&revision, &mut Vec::new())?;
+        // Windows removes the name only after the pinned revision handle, which
+        // denies delete sharing, is dropped.
+        drop(revision);
+        match self.tree.remove_revision_dir(&name) {
+            Ok(true) => {}
+            Ok(false) => return Err(ImportError::StageChanged),
+            Err(_) => return Err(ImportError::Storage),
+        }
+        self.tree
+            .sync_revisions()
+            .map_err(|_| ImportError::Storage)?;
+        self.tree.sync_root().map_err(|_| ImportError::Storage)?;
+        Ok(true)
+    }
+}
+
+/// Remove every entry below `components` using only handle-relative operations.
+/// A link, special object or unexpected shape is refused, never followed.
+fn remove_staged_tree(
+    revision: &fsops::StagedDirectory,
+    components: &mut Vec<String>,
+) -> Result<(), ImportError> {
+    let relative = components.iter().map(String::as_str).collect::<Vec<_>>();
+    let entries = revision
+        .list_relative(&relative)
+        .map_err(|_| ImportError::StageUnavailable)?;
+    for (name, is_file, is_dir) in entries {
+        components.push(name);
+        if is_dir {
+            remove_staged_tree(revision, components)?;
+            let relative = components.iter().map(String::as_str).collect::<Vec<_>>();
+            match revision.remove_relative_dir(&relative) {
+                Ok(true) => {}
+                Ok(false) => return Err(ImportError::StageChanged),
+                Err(_) => return Err(ImportError::Storage),
+            }
+        } else if is_file {
+            let relative = components.iter().map(String::as_str).collect::<Vec<_>>();
+            revision
+                .remove_relative_file(&relative)
+                .map_err(|_| ImportError::Storage)?;
+        } else {
+            return Err(ImportError::StageChanged);
+        }
+        components.pop();
+    }
+    Ok(())
 }
 
 fn copy_archive(

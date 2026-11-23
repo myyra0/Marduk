@@ -57,6 +57,64 @@ const PAYLOAD_DIR: &str = "payload";
 #[cfg(test)]
 const ARCHIVE_FILE: &str = "archive.zip";
 
+/// Typed result of [`Catalog::reconcile`], shaped for display rather than for
+/// control flow. `prepared` keeps the historical meaning: the prepared imports
+/// whose private stage still matched its recorded evidence.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReconcileReport {
+    /// Prepared imports re-observed intact and still pending publication.
+    pub prepared: Vec<ImportId>,
+    /// Imports whose abandoned private snapshot was reclaimed by this call.
+    pub reclaimed: Vec<ImportId>,
+    /// Imports left in place because the catalog could not prove them.
+    pub quarantined: Vec<QuarantinedImport>,
+}
+
+impl ReconcileReport {
+    /// Whether no intact prepared import was retained. Matches the value the
+    /// pre-report API returned as a bare vector.
+    pub fn is_empty(&self) -> bool {
+        self.prepared.is_empty()
+    }
+
+    fn quarantine(&mut self, id: ImportId, reason: QuarantineReason) {
+        self.quarantined.push(QuarantinedImport { id, reason });
+    }
+}
+
+/// One import left untouched by reconciliation, with the reason it was not
+/// reclaimed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuarantinedImport {
+    pub id: ImportId,
+    pub reason: QuarantineReason,
+}
+
+/// Why reconciliation refused to reclaim an abandoned import.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuarantineReason {
+    /// The row records no owner receipt and the stage is not provably empty.
+    OwnershipMissing,
+    /// Recorded ownership or staged shape no longer matches the bytes present.
+    StageChanged,
+    /// This volume has no qualified private stage adapter.
+    StageUnavailable,
+    /// The import is already referenced by a published revision.
+    Published,
+}
+
+impl PartialEq<Vec<ImportId>> for ReconcileReport {
+    fn eq(&self, other: &Vec<ImportId>) -> bool {
+        self.prepared == *other
+    }
+}
+
+impl<const N: usize> PartialEq<[ImportId; N]> for ReconcileReport {
+    fn eq(&self, other: &[ImportId; N]) -> bool {
+        self.prepared.as_slice() == other.as_slice()
+    }
+}
+
 pub struct Catalog {
     root: PathBuf,
     /// Pins the verified app-owned directory for this catalog's lifetime.
@@ -364,88 +422,117 @@ impl Catalog {
             return Err(ImportError::ImportNotPrepared);
         }
 
-        let stage = StageRecord {
-            id,
-            archive_sha256: record.archive_sha256,
-            owner: record.owner,
-            files: stored_files(&self.connection, id)?,
-        };
-        self.stage.reclaim(&_guard, &self.root, &stage)
+        match (record.archive_sha256, record.owner.as_deref()) {
+            (Some(archive_sha256), Some(owner)) => {
+                let stage = StageRecord {
+                    id,
+                    archive_sha256: Some(archive_sha256),
+                    owner: Some(owner.to_vec()),
+                    files: stored_files(&self.connection, id)?,
+                };
+                self.stage.reclaim(&_guard, &self.root, &stage).map(|_| ())
+            }
+            // A partial reservation has no complete receipt; its directory
+            // identity is the only proof, and the adapter refuses when that is
+            // missing or the directory is not empty.
+            (_, owner) => self
+                .stage
+                .reclaim_reservation(&_guard, &self.root, id, owner)
+                .map(|_| ()),
+        }
     }
 
     /// Verify prepared stages and account for abandoned reservations.
     ///
-    /// Only stages that the private adapter re-observes intact are returned as
+    /// Only stages that the private adapter re-observes intact are reported as
     /// pending. A changed or unavailable stage stays `prepared` in the catalog
     /// but is not presented as intact. Owned `writing` reservations are
-    /// tombstoned before the adapter reclaims them; unowned ones remain
-    /// quarantined. Committed and prepared bytes are never reclaimed here.
-    pub fn reconcile(&mut self) -> Result<Vec<ImportId>, ImportError> {
+    /// tombstoned before the adapter reclaims them; non-empty unowned ones stay
+    /// quarantined, while an empty unowned directory is removed because it
+    /// holds no bytes. Committed and prepared bytes are never reclaimed here.
+    ///
+    /// A reservation owns `revisions/<id>` from the moment its row commits: the
+    /// row is the path authority and the adapter records the native directory
+    /// identity before it writes the first archive byte. A crash before that
+    /// identity write therefore leaves an empty owned directory, which the
+    /// adapter removes without needing a receipt; any directory with bytes and
+    /// no receipt is quarantined, never guessed at.
+    pub fn reconcile(&mut self) -> Result<ReconcileReport, ImportError> {
         let _guard = self.lock()?;
 
         let prepared = import_ids_in_state(&self.connection, "prepared")?;
         let writing = import_ids_in_state(&self.connection, "writing")?;
         let discarded = import_ids_in_state(&self.connection, "discarded")?;
+        let mut report = ReconcileReport::default();
 
         // A tombstone may survive a crash or a failed reclaim. Retry cleanup
-        // only for rows whose ownership receipt is intact; committed and
-        // unprovable entries are never touched.
+        // for rows whose ownership receipt is intact (or whose stage is
+        // provably empty); committed and unprovable entries are never touched.
         for id in discarded {
             let record = load_import(&self.connection, id)?;
-            if record.owner.is_none()
-                || record.archive_sha256.is_none()
-                || !self.stage.available()
-                || is_published(&self.connection, id)?
-            {
+            if is_published(&self.connection, id)? {
+                report.quarantine(id, QuarantineReason::Published);
                 continue;
             }
-            let stage = StageRecord {
-                id,
-                archive_sha256: record.archive_sha256,
-                owner: record.owner,
-                files: stored_files(&self.connection, id)?,
-            };
-            match self.stage.reclaim(&_guard, &self.root, &stage) {
-                Ok(()) | Err(ImportError::StageChanged) | Err(ImportError::StageUnavailable) => {}
+            match self.reclaim_abandoned(&_guard, &record) {
+                Ok(true) => report.reclaimed.push(id),
+                Ok(false) => {}
+                Err(ImportError::StageChanged) => {
+                    report.quarantine(id, QuarantineReason::StageChanged)
+                }
+                Err(ImportError::StageUnavailable) => {
+                    report.quarantine(id, QuarantineReason::StageUnavailable)
+                }
                 Err(error) => return Err(error),
             }
         }
 
         for id in writing {
             let record = load_import(&self.connection, id)?;
-            if record.owner.is_none() || record.archive_sha256.is_none() {
-                // No ownership receipt: quarantine rather than guess.
+            if is_published(&self.connection, id)? {
+                report.quarantine(id, QuarantineReason::Published);
                 continue;
             }
-            if !self.stage.available() {
+            if record.owner.is_none() {
+                // No identity receipt: the adapter removes this reservation only
+                // when the directory is empty, otherwise it refuses and the
+                // bytes stay.
+                match self
+                    .stage
+                    .reclaim_reservation(&_guard, &self.root, id, None)
+                {
+                    Ok(_) => {
+                        self.tombstone(id)?;
+                        report.reclaimed.push(id);
+                    }
+                    Err(ImportError::StageChanged) => {
+                        report.quarantine(id, QuarantineReason::OwnershipMissing)
+                    }
+                    Err(ImportError::StageUnavailable) => {
+                        report.quarantine(id, QuarantineReason::StageUnavailable)
+                    }
+                    Err(error) => return Err(error),
+                }
                 continue;
             }
 
-            let changed = self
-                .connection
-                .execute(
-                    "UPDATE imports SET state = 'discarded' \
-                     WHERE id = ?1 AND state = 'writing'",
-                    [sql_import_id(id)?],
-                )
-                .map_err(storage_error)?;
-            if changed != 1 {
-                continue;
-            }
-
-            let stage = StageRecord {
-                id,
-                archive_sha256: record.archive_sha256,
-                owner: record.owner,
-                files: stored_files(&self.connection, id)?,
-            };
-            match self.stage.reclaim(&_guard, &self.root, &stage) {
-                Ok(()) | Err(ImportError::StageChanged) | Err(ImportError::StageUnavailable) => {}
+            // Tombstone before reclamation so an interruption is retryable.
+            self.tombstone(id)?;
+            match self
+                .stage
+                .reclaim_reservation(&_guard, &self.root, id, record.owner.as_deref())
+            {
+                Ok(_) => report.reclaimed.push(id),
+                Err(ImportError::StageChanged) => {
+                    report.quarantine(id, QuarantineReason::StageChanged)
+                }
+                Err(ImportError::StageUnavailable) => {
+                    report.quarantine(id, QuarantineReason::StageUnavailable)
+                }
                 Err(error) => return Err(error),
             }
         }
 
-        let mut retained = Vec::with_capacity(prepared.len());
         for id in prepared {
             let record = load_import(&self.connection, id)?;
             let stage = StageRecord {
@@ -455,12 +542,57 @@ impl Catalog {
                 files: stored_files(&self.connection, id)?,
             };
             match self.stage.reobserve(&_guard, &self.root, &stage) {
-                Ok(()) => retained.push(id),
-                Err(ImportError::StageChanged) | Err(ImportError::StageUnavailable) => {}
+                Ok(()) => report.prepared.push(id),
+                Err(ImportError::StageChanged) => {
+                    report.quarantine(id, QuarantineReason::StageChanged)
+                }
+                Err(ImportError::StageUnavailable) => {
+                    report.quarantine(id, QuarantineReason::StageUnavailable)
+                }
                 Err(error) => return Err(error),
             }
         }
-        Ok(retained)
+        Ok(report)
+    }
+
+    /// Tombstone a still-`writing` reservation before its bytes are reclaimed.
+    fn tombstone(&mut self, id: ImportId) -> Result<(), ImportError> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE imports SET state = 'discarded' \
+                 WHERE id = ?1 AND state = 'writing'",
+                [sql_import_id(id)?],
+            )
+            .map_err(storage_error)?;
+        if changed != 1 {
+            return Err(ImportError::Storage);
+        }
+        Ok(())
+    }
+
+    /// Reclaim one abandoned import. A complete receipt re-observes the exact
+    /// staged files; a partial reservation proves only its directory identity.
+    /// Returns whether a directory was actually removed.
+    fn reclaim_abandoned(
+        &mut self,
+        guard: &WriterGuard,
+        record: &ImportRecord,
+    ) -> Result<bool, ImportError> {
+        match (record.archive_sha256, record.owner.as_deref()) {
+            (Some(archive_sha256), Some(owner)) => {
+                let stage = StageRecord {
+                    id: record.id,
+                    archive_sha256: Some(archive_sha256),
+                    owner: Some(owner.to_vec()),
+                    files: stored_files(&self.connection, record.id)?,
+                };
+                self.stage.reclaim(guard, &self.root, &stage)
+            }
+            (_, owner) => self
+                .stage
+                .reclaim_reservation(guard, &self.root, record.id, owner),
+        }
     }
 
     pub fn reorder(
@@ -763,7 +895,7 @@ impl StageAdapter {
         guard: &WriterGuard,
         _root: &Path,
         stage: &StageRecord,
-    ) -> Result<(), ImportError> {
+    ) -> Result<bool, ImportError> {
         match self {
             Self::Unavailable(adapter) => adapter.reclaim(),
             Self::Native(adapter) => {
@@ -772,6 +904,33 @@ impl StageAdapter {
             }
             #[cfg(test)]
             Self::Fixture(adapter) => adapter.reclaim(_root, stage),
+        }
+    }
+
+    /// Reclaim a reservation that has no complete stage receipt. The recorded
+    /// owner (when present) is the only accepted proof; without it the adapter
+    /// removes the directory only if it is empty.
+    fn reclaim_reservation(
+        &mut self,
+        guard: &WriterGuard,
+        _root: &Path,
+        id: ImportId,
+        owner: Option<&[u8]>,
+    ) -> Result<bool, ImportError> {
+        match self {
+            Self::Unavailable(adapter) => adapter.reclaim_reservation(),
+            Self::Native(adapter) => {
+                let owner = match owner {
+                    Some(blob) => Some(
+                        crate::operation_journal::decode_root(blob)
+                            .map_err(|_| ImportError::StageChanged)?,
+                    ),
+                    None => None,
+                };
+                adapter.reclaim_reservation(guard, id, owner.as_ref())
+            }
+            #[cfg(test)]
+            Self::Fixture(adapter) => adapter.reclaim_reservation(_root, id, owner),
         }
     }
 }
@@ -790,7 +949,11 @@ impl UnavailableStage {
         Err(ImportError::StageUnavailable)
     }
 
-    fn reclaim(&mut self) -> Result<(), ImportError> {
+    fn reclaim(&mut self) -> Result<bool, ImportError> {
+        Err(ImportError::StageUnavailable)
+    }
+
+    fn reclaim_reservation(&mut self) -> Result<bool, ImportError> {
         Err(ImportError::StageUnavailable)
     }
 }
@@ -929,10 +1092,10 @@ impl FixtureStage {
         )
     }
 
-    fn reclaim(&mut self, root: &Path, stage: &StageRecord) -> Result<(), ImportError> {
+    fn reclaim(&mut self, root: &Path, stage: &StageRecord) -> Result<bool, ImportError> {
         let directory = revision_dir(root, stage.id);
         if !directory.exists() {
-            return Ok(());
+            return Ok(false);
         }
 
         verified_owner(stage)?;
@@ -945,7 +1108,36 @@ impl FixtureStage {
         if directory.exists() {
             return Err(ImportError::StageChanged);
         }
-        Ok(())
+        Ok(true)
+    }
+
+    /// Fixture counterpart of the native reservation reclaim. The synthetic
+    /// owner has no live identity to compare, so a recorded owner is the whole
+    /// proof; without one the directory is removed only while empty.
+    fn reclaim_reservation(
+        &mut self,
+        root: &Path,
+        id: ImportId,
+        owner: Option<&[u8]>,
+    ) -> Result<bool, ImportError> {
+        let directory = revision_dir(root, id);
+        if !directory.exists() {
+            return Ok(false);
+        }
+        if owner.is_none() {
+            let empty = fs::read_dir(&directory)
+                .map_err(|_| ImportError::Storage)?
+                .next()
+                .is_none();
+            if !empty {
+                return Err(ImportError::StageChanged);
+            }
+        }
+        fs::remove_dir_all(&directory).map_err(|_| ImportError::Storage)?;
+        if directory.exists() {
+            return Err(ImportError::StageChanged);
+        }
+        Ok(true)
     }
 }
 
@@ -1012,6 +1204,10 @@ fn reserve_import(
         }
     }
 
+    // The reserved id is the ownership authority for `revisions/<id>`. The
+    // adapter records the native directory identity before it writes the first
+    // archive byte, so every state after this commit is either reclaimable from
+    // a recorded receipt or provably empty.
     transaction
         .execute(
             "INSERT INTO imports \
