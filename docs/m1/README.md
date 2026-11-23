@@ -44,7 +44,7 @@ end-to-end desktop write run.
 |---|---|
 | Sol whole-packet review at `15e885b` | blocked; findings fixed |
 | DeepSeek whole-packet review at `7edccc8` | blocked; finding fixed |
-| Sol whole-packet review at `6df9342` | blocked; fixes in progress, desktop workflow recorded as a gap |
+| Sol whole-packet review at `6df9342` | blocked; findings fixed, desktop workflow accepted as a gap; re-review pending |
 
 The project's rule is that the final whole-packet review is a Sol pass. That pass is running against
 the current commit; until it returns a verdict, no document or reply may call M1 accepted.

@@ -29,6 +29,7 @@ Nothing in the task list is left to implement.
 | ext4 | excluded | no, if declared out of scope |
 | Btrfs cross-subvolume | not run | no, if declared out of scope |
 | Windows launched-shell smoke | environment-bound | no, but it is a named gap |
+| Desktop import/deploy/restore end to end | accepted gap | no — recorded in limitations |
 
 ## Next actions
 
