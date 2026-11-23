@@ -9,10 +9,10 @@ use std::fmt;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeIdentity {
     Linux {
+        /// Durable object identity. The mount view (`STATX_MNT_ID`) is a
+        /// session property and stays out of the token; see ADR 0006.
         fs_magic: u64,
         fs_id: [u8; 16],
-        /// Mount view reported by Linux `statx`, not a filesystem identifier.
-        view_id: u64,
         tree_id: Option<u64>,
         ino: u64,
         birth: (i64, u32),

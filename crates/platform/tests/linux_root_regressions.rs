@@ -18,37 +18,22 @@ const LAYOUT: GameLayout = GameLayout {
 
 #[test]
 #[ignore = "requires two mount views exposing the same filesystem and objects"]
-fn same_objects_on_another_mount_view_cannot_reopen() {
+fn same_objects_on_another_mount_view_keep_identity() {
     let first = std::env::var_os("MARDUK_M1_VIEW_A").expect("first bind mount");
     let second = std::env::var_os("MARDUK_M1_VIEW_B").expect("second bind mount");
     let first = Path::new(&first);
     let second = Path::new(&second);
+    assert_ne!(first, second, "the two views must be distinct paths");
     let original = bind_installation(first, &LAYOUT).unwrap();
     let alternate = bind_installation(second, &LAYOUT).unwrap();
     let (root, data) = original.identities();
     let (other_root, other_data) = alternate.identities();
-    for (left, right) in [(root, other_root), (data, other_data)] {
-        let NativeIdentity::Linux { view_id, .. } = *left.evidence() else {
-            panic!("expected Linux identity");
-        };
-        let mut otherwise_same = *right.evidence();
-        let NativeIdentity::Linux {
-            view_id: other_view_id,
-            ..
-        } = &mut otherwise_same
-        else {
-            panic!("expected Linux identity");
-        };
-        assert_ne!(view_id, *other_view_id);
-        *other_view_id = view_id;
-        assert_eq!(*left.evidence(), otherwise_same);
-        assert_ne!(left, right);
-    }
-    let actual = reopen_installation(second, &LAYOUT, root, data);
-    assert!(
-        matches!(actual, Err(RootError::TargetUnavailable)),
-        "same inode through another mount must refuse reopen: {actual:?}"
-    );
+    // Same filesystem objects reached through different mount views: the
+    // durable evidence is identical and a different view does not invalidate
+    // the recorded installation.
+    assert_eq!((other_root, other_data), (root, data));
+    let reopened = reopen_installation(second, &LAYOUT, root, data).unwrap();
+    assert_eq!(reopened.identities(), (root, data));
     assert_eq!(
         reopen_installation(first, &LAYOUT, root, data)
             .unwrap()
@@ -63,28 +48,53 @@ fn layout(install: &Path) {
 }
 
 #[test]
-fn reopen_requires_exact_view_id_for_each_root() {
+fn linux_identity_is_exactly_the_durable_object_fields() {
+    let temp = tempfile::tempdir_in("/var/tmp").unwrap();
+    layout(temp.path());
+    let bound = bind_installation(temp.path(), &LAYOUT).unwrap();
+    for identity in [bound.identities().0, bound.identities().1] {
+        // Exhaustive destructuring: a session field in the token would fail to
+        // compile here.
+        let NativeIdentity::Linux {
+            fs_magic,
+            fs_id,
+            tree_id,
+            ino,
+            birth,
+        } = *identity.evidence()
+        else {
+            panic!("expected Linux identity");
+        };
+        assert_ne!(fs_magic, 0);
+        assert_ne!(fs_id, [0; 16]);
+        assert_ne!(ino, 0);
+        assert_ne!(birth, (0, 0));
+        let _ = tree_id;
+    }
+}
+
+#[test]
+fn reopen_requires_exact_object_identity_for_each_root() {
     let temp = tempfile::tempdir_in("/var/tmp").unwrap();
     layout(temp.path());
     let bound = bind_installation(temp.path(), &LAYOUT).unwrap();
     let (root, data) = bound.identities();
-    let other_view = |identity: &RootIdentity| {
+    let other_object = |identity: &RootIdentity| {
         let mut native = *identity.evidence();
-        let NativeIdentity::Linux { view_id, .. } = &mut native else {
+        let NativeIdentity::Linux { ino, .. } = &mut native else {
             panic!("expected Linux identity");
         };
-        assert_ne!(*view_id, 0);
-        *view_id ^= 1_u64 << 63;
+        *ino = ino.wrapping_add(1);
         let other = RootIdentity::from_adapter_evidence(native);
         assert_ne!(&other, identity);
         other
     };
     assert!(matches!(
-        reopen_installation(temp.path(), &LAYOUT, &other_view(root), data),
+        reopen_installation(temp.path(), &LAYOUT, &other_object(root), data),
         Err(RootError::TargetUnavailable)
     ));
     assert!(matches!(
-        reopen_installation(temp.path(), &LAYOUT, root, &other_view(data)),
+        reopen_installation(temp.path(), &LAYOUT, root, &other_object(data)),
         Err(RootError::TargetUnavailable)
     ));
     assert_eq!(

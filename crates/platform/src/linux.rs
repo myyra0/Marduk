@@ -743,7 +743,6 @@ fn identity_from(file: &File, stx: &libc::statx) -> Result<NativeIdentity, RootE
     Ok(NativeIdentity::Linux {
         fs_magic: magic,
         fs_id,
-        view_id: mount_id(stx)?,
         tree_id,
         ino: stx.stx_ino,
         birth: (stx.stx_btime.tv_sec, stx.stx_btime.tv_nsec),

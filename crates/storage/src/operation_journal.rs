@@ -2299,11 +2299,13 @@ pub(crate) fn decode_locator(location: &[u8]) -> Option<PathBuf> {
     }
 }
 
-// Portable evidence encoding v1. Every blob is length-prefixed and rejected on
-// a short read, unknown tag or trailing bytes.
+// Portable evidence encoding v2. Every blob is length-prefixed and rejected on
+// a short read, unknown tag or trailing bytes. Version 1 encoded a Linux mount
+// view in the identity; it is refused rather than misread. There is no
+// installed base to migrate.
 
 pub(crate) fn encode_root(root: &RootIdentity) -> Vec<u8> {
-    let mut out = vec![1u8];
+    let mut out = vec![2u8];
     encode_identity(&mut out, root.evidence());
     out
 }
@@ -2313,7 +2315,6 @@ fn encode_identity(out: &mut Vec<u8>, identity: &NativeIdentity) {
         NativeIdentity::Linux {
             fs_magic,
             fs_id,
-            view_id,
             tree_id,
             ino,
             birth,
@@ -2321,7 +2322,6 @@ fn encode_identity(out: &mut Vec<u8>, identity: &NativeIdentity) {
             out.push(0);
             out.extend_from_slice(&fs_magic.to_le_bytes());
             out.extend_from_slice(fs_id);
-            out.extend_from_slice(&view_id.to_le_bytes());
             match tree_id {
                 Some(tree_id) => {
                     out.push(1);
@@ -2348,8 +2348,10 @@ fn encode_identity(out: &mut Vec<u8>, identity: &NativeIdentity) {
 
 pub(crate) fn decode_root(blob: &[u8]) -> Result<RootIdentity, DeployError> {
     let mut reader = Reader::new(blob);
-    if reader.u8()? != 1 {
-        return Err(DeployError::Io);
+    match reader.u8()? {
+        2 => {}
+        1 => return Err(DeployError::UnsupportedEvidenceVersion),
+        _ => return Err(DeployError::Io),
     }
     let identity = decode_identity(&mut reader)?;
     reader.finish()?;
@@ -2361,7 +2363,6 @@ fn decode_identity(reader: &mut Reader<'_>) -> Result<NativeIdentity, DeployErro
         0 => Ok(NativeIdentity::Linux {
             fs_magic: reader.u64()?,
             fs_id: reader.array()?,
-            view_id: reader.u64()?,
             tree_id: match reader.u8()? {
                 0 => None,
                 1 => Some(reader.u64()?),
@@ -2914,7 +2915,6 @@ mod identity_codec_tests {
         RootIdentity::from_adapter_evidence(NativeIdentity::Linux {
             fs_magic: 0x9123_4567_89ab_cdef,
             fs_id: [7u8; 16],
-            view_id: 42,
             tree_id: tree,
             ino: 9_000_000_001,
             birth: (-1234, 5678),
@@ -2943,16 +2943,40 @@ mod identity_codec_tests {
         asserts_io_err(&[]);
         asserts_io_err(&[0]);
         asserts_io_err(&[2]);
+        asserts_io_err(&[3]);
         asserts_io_err(&valid[..valid.len() - 1]);
         // Unknown tree marker.
         let mut unknown_tree = valid.clone();
-        let marker = 1 + 1 + 8 + 16 + 8;
+        let marker = 1 + 1 + 8 + 16;
         unknown_tree[marker] = 2;
         asserts_io_err(&unknown_tree);
         // Unknown identity tag.
         let mut unknown_tag = valid;
         unknown_tag[1] = 2;
         asserts_io_err(&unknown_tag);
+    }
+
+    #[test]
+    fn identity_codec_refuses_the_v1_mount_view_layout() {
+        let mut v1_linux = vec![1u8, 0];
+        v1_linux.extend_from_slice(&0x9123_4567_89ab_cdef_u64.to_le_bytes());
+        v1_linux.extend_from_slice(&[7u8; 16]);
+        v1_linux.extend_from_slice(&42_u64.to_le_bytes());
+        v1_linux.push(0);
+        v1_linux.extend_from_slice(&9_000_000_001_u64.to_le_bytes());
+        v1_linux.extend_from_slice(&(-1234_i64).to_le_bytes());
+        v1_linux.extend_from_slice(&5678_u32.to_le_bytes());
+        let mut v1_windows = vec![1u8, 1];
+        v1_windows.extend_from_slice(&0xfeed_face_u64.to_le_bytes());
+        v1_windows.extend_from_slice(&[3u8; 16]);
+        v1_windows.extend_from_slice(&132_000_000_000_i64.to_le_bytes());
+        for blob in [v1_linux, v1_windows] {
+            assert_eq!(
+                decode_root(&blob),
+                Err(DeployError::UnsupportedEvidenceVersion),
+                "{blob:?}"
+            );
+        }
     }
 
     #[test]

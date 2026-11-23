@@ -1495,23 +1495,16 @@ fn same_rename_domain(left: &RootIdentity, right: &RootIdentity) -> bool {
             NativeIdentity::Linux {
                 fs_magic: left_magic,
                 fs_id: left_id,
-                view_id: left_view,
                 tree_id: left_tree,
                 ..
             },
             NativeIdentity::Linux {
                 fs_magic: right_magic,
                 fs_id: right_id,
-                view_id: right_view,
                 tree_id: right_tree,
                 ..
             },
-        ) => {
-            left_magic == right_magic
-                && left_id == right_id
-                && left_view == right_view
-                && left_tree == right_tree
-        }
+        ) => left_magic == right_magic && left_id == right_id && left_tree == right_tree,
         (
             NativeIdentity::Windows {
                 volume_serial: left_volume,
@@ -1564,7 +1557,6 @@ mod tests {
             identity: NativeIdentity::Linux {
                 fs_magic: 0x0102_1994,
                 fs_id: [0; 16],
-                view_id: 0,
                 tree_id: None,
                 ino: u64::from(byte),
                 birth: (0, 0),

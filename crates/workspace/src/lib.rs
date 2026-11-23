@@ -1512,29 +1512,27 @@ fn phase(phase: Phase) -> &'static str {
 }
 
 /// The same rename-domain comparison the effect adapter applies to its stage
-/// and target parents: matching filesystem magic, id and mount view, plus the
-/// Btrfs tree when present. Windows compares the volume serial.
+/// and target parents: matching filesystem magic and id, plus the Btrfs tree
+/// when present. Windows compares the volume serial. The mount view is a
+/// session property and is not part of the comparison.
 fn same_rename_domain(app: &RootIdentity, installation: &RootIdentity) -> bool {
     match (app.evidence(), installation.evidence()) {
         (
             NativeIdentity::Linux {
                 fs_magic: app_magic,
                 fs_id: app_id,
-                view_id: app_view,
                 tree_id: app_tree,
                 ..
             },
             NativeIdentity::Linux {
                 fs_magic: installation_magic,
                 fs_id: installation_id,
-                view_id: installation_view,
                 tree_id: installation_tree,
                 ..
             },
         ) => {
             app_magic == installation_magic
                 && app_id == installation_id
-                && app_view == installation_view
                 && app_tree == installation_tree
         }
         (
@@ -1627,6 +1625,7 @@ fn deploy_error(error: DeployError) -> WireError {
         DeployError::RecoveryConflict => WireError::new(Code::RecoveryConflict),
         DeployError::UnknownOperation => WireError::new(Code::UnknownOperation),
         DeployError::NoActiveDeployment => WireError::new(Code::NoActiveDeployment),
+        DeployError::UnsupportedEvidenceVersion => WireError::new(Code::Storage),
         DeployError::Io => WireError::new(Code::Io),
     }
 }

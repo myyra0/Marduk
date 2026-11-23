@@ -43,7 +43,6 @@ fn identity(volume: u8, ino: u64) -> NativeIdentity {
     NativeIdentity::Linux {
         fs_magic: 0xef53,
         fs_id: [volume; 16],
-        view_id: u64::from(volume),
         tree_id: None,
         ino,
         birth: (100, 0),

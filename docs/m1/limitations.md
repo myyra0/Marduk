@@ -22,19 +22,6 @@ refuses to retry automatically for deployment file effects. It does not claim pr
 operations pin the root on Linux; Windows marker calls use its verified final pathname. Neither
 platform excludes deliberate marker-leaf replacement between inspection and use.
 
-### Linux remount lockout
-
-An unmount/remount or reboot that changes the recorded mount-view ID makes the
-installation unavailable, even when the same filesystem objects are present.
-Restore and Recover cannot reopen that view; Setup refuses to switch views
-while work is pending (`Busy`) or a generation is active (`ActiveDeployment`).
-If the recorded view is still accessible at its recorded path, return to it
-and finish Recover or Restore there. If it is gone, preserve the catalog and
-retained originals and recover the installation manually from a known-clean
-backup before setting it up afresh. Do not clear the marker or discard the
-catalog to bypass a refused Restore. When no work is pending or active, rerun
-Setup for the current view.
-
 ## Unproven claims
 
 - **Crash and power-cut recovery.** Recovery is proven across process restarts, and the interrupted

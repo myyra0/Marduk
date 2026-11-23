@@ -105,9 +105,9 @@ fn prove(game: &Path, library: &Path, substitute: &Path, old_game: &Path) {
                     matches!(
                         (from.evidence(), to.evidence()),
                         (
-                            NativeIdentity::Linux { fs_id: a, view_id: av, tree_id: Some(at), .. },
-                            NativeIdentity::Linux { fs_id: b, view_id: bv, tree_id: Some(bt), .. },
-                        ) if a == b && av == bv && at == bt
+                            NativeIdentity::Linux { fs_id: a, tree_id: Some(at), .. },
+                            NativeIdentity::Linux { fs_id: b, tree_id: Some(bt), .. },
+                        ) if a == b && at == bt
                     ),
                     "port attempted a rename across Btrfs domains"
                 );

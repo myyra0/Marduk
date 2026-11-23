@@ -2022,7 +2022,6 @@ fn synthetic_owner(id: ImportId, archive_sha256: &[u8; 32]) -> RootIdentity {
         RootIdentity::from_adapter_evidence(NativeIdentity::Linux {
             fs_magic: 0x4d31_0001, // synthetic fixture marker, not a native filesystem
             fs_id,
-            view_id: id.get(),
             tree_id: Some(id.get()),
             ino: id.get(),
             birth: (birth, 0),
