@@ -14,11 +14,6 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use zip_fixture::{ClassicZip, Record};
 
-/// The installation lease directory for one witness.
-fn state_root(temp: &Path) -> PathBuf {
-    temp.join("marduk").join("leases")
-}
-
 struct Fixture {
     temp: TempDir,
     app: PathBuf,
@@ -33,7 +28,7 @@ impl Fixture {
         let game = temp.path().join("Skyrim Special Edition");
         fs::create_dir_all(game.join("Data")).unwrap();
         fs::write(game.join("SkyrimSE.exe"), b"").unwrap();
-        let workspace = Workspace::open_at(&app, &state_root(temp.path())).unwrap();
+        let workspace = Workspace::open(&app).unwrap();
         Self {
             temp,
             app,
@@ -43,7 +38,7 @@ impl Fixture {
     }
 
     fn reopen(&self) -> Workspace {
-        Workspace::open_at(&self.app, &state_root(self.temp.path())).unwrap()
+        Workspace::open(&self.app).unwrap()
     }
 
     fn dispatch(&mut self, request: Request) -> Envelope<Value> {
@@ -581,7 +576,7 @@ fn ids_and_revisions_serialize_as_exact_decimal_strings() {
         },
         pending: None,
         active_generation_id: Some(large_id.to_owned()),
-        lease: None,
+        deployment: None,
         reconciliation: marduk_workspace::Reconciliation::default(),
     })
     .unwrap();

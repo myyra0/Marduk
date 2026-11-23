@@ -57,7 +57,6 @@ use windows as native;
 
 pub mod effects;
 mod instance;
-pub mod lease;
 pub mod library_stage;
 #[doc(hidden)]
 pub mod native_proof;
@@ -70,37 +69,6 @@ pub mod native_proof;
 /// caller cannot be redirected into another tree before its first write.
 pub fn open_private_directory(path: &Path) -> Result<std::fs::File, RootError> {
     native::open_private_directory(path)
-}
-
-/// Open an application-owned directory only when it already exists. A missing
-/// component is `TargetUnavailable` and creates nothing.
-pub fn open_existing_private_directory(path: &Path) -> Result<std::fs::File, RootError> {
-    native::open_existing_private_directory(path)
-}
-
-/// Read a regular file beneath a pinned application-owned directory without
-/// following a link. `Ok(None)` means the leaf is absent.
-pub fn read_private_file(parent: &std::fs::File, name: &str) -> Result<Option<Vec<u8>>, RootError> {
-    native::read_private_file(parent, name)
-}
-
-/// Create or replace a regular file beneath a pinned application-owned
-/// directory, with no link at the leaf, then make the bytes durable.
-pub fn write_private_file(
-    parent: &std::fs::File,
-    name: &str,
-    bytes: &[u8],
-) -> Result<(), RootError> {
-    native::write_private_file(parent, name, bytes)
-}
-
-/// Whether the pinned directory is owned by the effective user and grants no
-/// group or other access (the POSIX mode-`0700` posture). Windows private
-/// directories carry the ACL assigned when the application tree is created; a
-/// POSIX owner bit has no equivalent there.
-#[cfg(target_os = "linux")]
-pub fn private_directory_is_owner_only(directory: &std::fs::File) -> Result<bool, RootError> {
-    native::private_directory_is_owner_only(directory)
 }
 
 /// Whether the availability record proves private-library staging on the volume

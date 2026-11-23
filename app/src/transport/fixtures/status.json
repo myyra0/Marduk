@@ -31,12 +31,12 @@
         "available": true
       }
     },
+    "deployment": {
+      "owner": "/home/user/.local/share/com.marduk.desktop"
+    },
     "installation": {
       "id": "9007199254740993",
       "label": "Skyrim Special Edition"
-    },
-    "lease": {
-      "path": "/home/user/.local/state/marduk/leases/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.lease"
     },
     "pending": {
       "blocker": {

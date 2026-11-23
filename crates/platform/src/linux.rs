@@ -157,7 +157,7 @@ use marduk_core::root_identity::{
 };
 use marduk_core::targets::RelativePath;
 use sha2::{Digest, Sha256};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::fd::RawFd;
 
 const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
@@ -1357,126 +1357,6 @@ pub(crate) fn open_private_directory(path: &Path) -> Result<File, RootError> {
         current = open_or_create_directory(&current, name)?;
     }
     Ok(current)
-}
-
-pub(crate) fn open_existing_private_directory(path: &Path) -> Result<File, RootError> {
-    let path = std::path::absolute(path).map_err(|_| RootError::TargetUnavailable)?;
-    let mut current = File::open("/").map_err(|_| RootError::Io)?;
-    for component in path.components().skip(1) {
-        let Component::Normal(name) = component else {
-            return Err(RootError::TargetUnavailable);
-        };
-        if name.to_str().is_none_or(|name| !ordinary_component(name)) {
-            return Err(RootError::TargetUnavailable);
-        }
-        current = openat2(
-            current.as_raw_fd(),
-            name,
-            DIRECTORY_FLAGS,
-            libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_NO_SYMLINKS,
-        )
-        .map_err(|error| match error.raw_os_error() {
-            // Only a genuinely missing component means "no lease directory".
-            Some(libc::ENOENT) | Some(libc::ENOTDIR) => RootError::TargetUnavailable,
-            Some(libc::ELOOP) => RootError::OutsideBoundary,
-            _ => RootError::Io,
-        })?;
-    }
-    Ok(current)
-}
-
-pub(crate) fn read_private_file(parent: &File, name: &str) -> Result<Option<Vec<u8>>, RootError> {
-    if !ordinary_component(name) {
-        return Err(RootError::TargetUnavailable);
-    }
-    let flags = (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
-    let file = match openat2(parent.as_raw_fd(), OsStr::new(name), flags, NO_LINKS) {
-        Ok(file) => file,
-        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
-        Err(_) => return Err(RootError::Io),
-    };
-    private_regular_file(&file)?;
-    let mut bytes = Vec::new();
-    (&file).read_to_end(&mut bytes).map_err(|_| RootError::Io)?;
-    Ok(Some(bytes))
-}
-
-pub(crate) fn write_private_file(parent: &File, name: &str, bytes: &[u8]) -> Result<(), RootError> {
-    if !ordinary_component(name) {
-        return Err(RootError::TargetUnavailable);
-    }
-    let flags = (libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
-    let file = openat2_mode(parent.as_raw_fd(), OsStr::new(name), flags, 0o600, NO_LINKS)
-        .map_err(|_| RootError::Io)?;
-    private_regular_file(&file)?;
-    (&file).set_len(0).map_err(|_| RootError::Io)?;
-    (&file).write_all(bytes).map_err(|_| RootError::Io)?;
-    (&file).sync_all().map_err(|_| RootError::Io)
-}
-
-/// Create `parent/name` when and only when the name is absent, write `bytes`,
-/// and make them durable. An existing name is never truncated.
-pub(crate) fn create_private_file(
-    parent: &File,
-    name: &str,
-    bytes: &[u8],
-) -> Result<(), RootError> {
-    if !ordinary_component(name) {
-        return Err(RootError::TargetUnavailable);
-    }
-    let flags =
-        (libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
-    let file = openat2_mode(parent.as_raw_fd(), OsStr::new(name), flags, 0o600, NO_LINKS)
-        .map_err(|_| RootError::Io)?;
-    private_regular_file(&file)?;
-    (&file).write_all(bytes).map_err(|_| RootError::Io)?;
-    (&file).sync_all().map_err(|_| RootError::Io)
-}
-
-/// Replace `parent/to` with `parent/from` in one namespace operation. Both
-/// names share the pinned directory, so this never crosses a mount and a reader
-/// sees either the old object or the new one, never a truncated file.
-pub(crate) fn replace_private_file(parent: &File, from: &str, to: &str) -> Result<(), RootError> {
-    if !ordinary_component(from) || !ordinary_component(to) {
-        return Err(RootError::TargetUnavailable);
-    }
-    renameat2(parent, from, parent, to, 0).map_err(|_| RootError::Io)
-}
-
-/// Remove `parent/name`. `Ok(false)` means it was already absent.
-pub(crate) fn remove_private_file(parent: &File, name: &str) -> Result<bool, RootError> {
-    if !ordinary_component(name) {
-        return Err(RootError::TargetUnavailable);
-    }
-    let name = CString::new(name).map_err(|_| RootError::TargetUnavailable)?;
-    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } == 0 {
-        return Ok(true);
-    }
-    let error = io::Error::last_os_error();
-    match error.raw_os_error() {
-        Some(libc::ENOENT) => Ok(false),
-        _ => Err(RootError::Io),
-    }
-}
-
-fn private_regular_file(file: &File) -> Result<(), RootError> {
-    let stx = statx_fd(file)?;
-    if stx.stx_mode as u32 & libc::S_IFMT != libc::S_IFREG
-        || stx.stx_uid != unsafe { libc::geteuid() } as u32
-        || stx.stx_nlink != 1
-        || stx.stx_mode as u32 & 0o077 != 0
-    {
-        return Err(RootError::UnsupportedTarget(UnsupportedReason::ObjectKind));
-    }
-    Ok(())
-}
-
-pub(crate) fn private_directory_is_owner_only(directory: &File) -> Result<bool, RootError> {
-    let stx = statx_fd(directory)?;
-    let mode = stx.stx_mode as u32;
-    Ok(mode & libc::S_IFMT == libc::S_IFDIR
-        && stx.stx_uid == unsafe { libc::geteuid() } as u32
-        && mode & 0o077 == 0)
 }
 
 pub(crate) fn open_private_child_directory(parent: &File, name: &str) -> Result<File, RootError> {

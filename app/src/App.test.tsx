@@ -123,14 +123,10 @@ describe('workspace shell', () => {
     expect(screen.getByText('9007199254740997 (stage_changed)')).toBeInTheDocument();
   });
 
-  it('shows the lease record path from status', async () => {
+  it('shows the deployment owner from status', async () => {
     await renderReady();
 
-    expect(
-      screen.getByText(
-        /0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\.lease/,
-      ),
-    ).toBeInTheDocument();
+    expect(screen.getByText('/home/user/.local/share/com.marduk.desktop')).toBeInTheDocument();
   });
 
   it('shows the typed effects blocker in the operations hint when deploy is blocked', async () => {
@@ -1119,8 +1115,11 @@ describe('workspace shell', () => {
     expect(describeBlocker(operationFixture.result.blocker ?? { code: 'Busy' })).toBe(
       'Busy',
     );
-    expect(describeBlocker({ code: 'LeaseUnreadable', message: 'the lease record is torn' })).toBe(
-      'LeaseUnreadable: the lease record is torn',
-    );
+    expect(
+      describeBlocker({
+        code: 'ActiveDeployment',
+        message: 'this installation is deployed by another configuration: /catalog',
+      }),
+    ).toBe('ActiveDeployment: this installation is deployed by another configuration: /catalog');
   });
 });

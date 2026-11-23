@@ -6,22 +6,20 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_LOCK_VIOLATION, ERROR_PATH_NOT_FOUND,
-    ERROR_SHARING_VIOLATION, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
-    INVALID_HANDLE_VALUE, WIN32_ERROR,
+    ERROR_ALREADY_EXISTS, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, GENERIC_READ,
+    GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WIN32_ERROR,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, LOCKFILE_EXCLUSIVE_LOCK,
-    LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, UnlockFileEx,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    GetFileInformationByHandle, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    OPEN_ALWAYS, OPEN_EXISTING, UnlockFileEx,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use crate::GateError;
 use marduk_core::qualification::{Capability, Os, Route, VolumeClass, available};
-use marduk_core::root_identity::{RootError, UnsupportedReason};
+use marduk_core::root_identity::RootError;
 
 /// Stable lock object for one application-owned root.
 #[derive(Debug)]
@@ -168,120 +166,6 @@ fn open_error(code: WIN32_ERROR) -> GateError {
     match code {
         ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION => GateError::Busy,
         _ => GateError::Io,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Private file primitives for the cross-catalog installation lease.
-// ---------------------------------------------------------------------------
-
-pub(crate) fn open_existing_private_directory(path: &Path) -> Result<File, RootError> {
-    root::open_existing_private_directory(path)
-}
-
-pub(crate) fn read_private_file(parent: &File, name: &str) -> Result<Option<Vec<u8>>, RootError> {
-    let path = root::private_child_path(parent, name)?;
-    let file = match open_lease_file(&path, GENERIC_READ, OPEN_EXISTING) {
-        Ok(file) => file,
-        Err(code) if code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND => {
-            return Ok(None);
-        }
-        Err(_) => return Err(RootError::Io),
-    };
-    check_lease_file(&file)?;
-    let mut bytes = Vec::new();
-    use std::io::Read;
-    (&file).read_to_end(&mut bytes).map_err(|_| RootError::Io)?;
-    Ok(Some(bytes))
-}
-
-pub(crate) fn write_private_file(parent: &File, name: &str, bytes: &[u8]) -> Result<(), RootError> {
-    let path = root::private_child_path(parent, name)?;
-    let file = open_lease_file(&path, GENERIC_READ | GENERIC_WRITE, OPEN_ALWAYS)
-        .map_err(|_| RootError::Io)?;
-    check_lease_file(&file)?;
-    file.set_len(0).map_err(|_| RootError::Io)?;
-    use std::io::Write;
-    (&file).write_all(bytes).map_err(|_| RootError::Io)?;
-    file.sync_all().map_err(|_| RootError::Io)
-}
-
-/// Create `parent/name` when and only when the name is absent, write `bytes`,
-/// and make them durable. An existing name is never truncated.
-pub(crate) fn create_private_file(
-    parent: &File,
-    name: &str,
-    bytes: &[u8],
-) -> Result<(), RootError> {
-    let path = root::private_child_path(parent, name)?;
-    let file = open_lease_file(&path, GENERIC_WRITE, CREATE_NEW).map_err(|_| RootError::Io)?;
-    check_lease_file(&file)?;
-    use std::io::Write;
-    (&file).write_all(bytes).map_err(|_| RootError::Io)?;
-    file.sync_all().map_err(|_| RootError::Io)
-}
-
-/// Replace `parent/to` with `parent/from`, flushing both the object and the
-/// namespace entry. The destination is an app-owned lease record, so replacing
-/// it is permitted here; game-file publication keeps its no-clobber rule.
-pub(crate) fn replace_private_file(parent: &File, from: &str, to: &str) -> Result<(), RootError> {
-    let from = root::private_child_path(parent, from)?;
-    let to = root::private_child_path(parent, to)?;
-    let from = wide(&from);
-    let to = wide(&to);
-    if unsafe {
-        MoveFileExW(
-            from.as_ptr(),
-            to.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    } != 0
-    {
-        return Ok(());
-    }
-    Err(RootError::Io)
-}
-
-/// Remove `parent/name`. `Ok(false)` means it was already absent.
-pub(crate) fn remove_private_file(parent: &File, name: &str) -> Result<bool, RootError> {
-    let path = root::private_child_path(parent, name)?;
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(_) => Err(RootError::Io),
-    }
-}
-
-fn wide(path: &Path) -> Vec<u16> {
-    path.as_os_str().encode_wide().chain([0]).collect()
-}
-
-fn open_lease_file(path: &Path, access: u32, disposition: u32) -> Result<File, u32> {
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-    let handle = unsafe {
-        CreateFileW(
-            wide.as_ptr(),
-            access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            std::ptr::null(),
-            disposition,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
-            std::ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(unsafe { GetLastError() });
-    }
-    Ok(unsafe { File::from_raw_handle(handle) })
-}
-
-fn check_lease_file(file: &File) -> Result<(), RootError> {
-    match identify(file) {
-        Ok(_) => Ok(()),
-        Err(GateError::Unavailable) => {
-            Err(RootError::UnsupportedTarget(UnsupportedReason::ObjectKind))
-        }
-        Err(_) => Err(RootError::Io),
     }
 }
 
@@ -1751,10 +1635,6 @@ mod root {
 
     pub(crate) fn open_private_directory(path: &Path) -> Result<File, RootError> {
         open_selection(path, true).map(|mut chain| chain.pop().expect("pinned root").file)
-    }
-
-    pub(crate) fn open_existing_private_directory(path: &Path) -> Result<File, RootError> {
-        open_selection(path, false).map(|mut chain| chain.pop().expect("pinned root").file)
     }
 
     pub(crate) fn open_private_child_directory(

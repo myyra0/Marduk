@@ -42,8 +42,8 @@ describe('Rust-generated wire fixtures', () => {
     expect(BigInt(status.profile.members[0].id)).toBeGreaterThan(MAX_SAFE);
     expect(status.installation?.id).toBe('9007199254740993');
     expect(status.activeGenerationId).toBe('9223372036854775804');
-    expect(status.lease?.path).toBe(
-      '/home/user/.local/state/marduk/leases/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.lease',
+    expect(status.deployment?.owner).toBe(
+      '/home/user/.local/share/com.marduk.desktop',
     );
 
     // A JSON round trip must not turn the decimal text into a number.
@@ -110,17 +110,6 @@ describe('Rust-generated wire fixtures', () => {
         detail: { reason: 'MissingParent' },
         message: 'The selected folder is not usable on this device.',
       },
-    });
-  });
-
-  it('parses LeaseUnreadable with its message instead of failing the transport', () => {
-    const tornLease = draft(errorStalePlan, (value) => {
-      value.error.code = 'LeaseUnreadable';
-      value.error.message = 'the lease record is torn';
-    });
-    expect(parseEnvelope(tornLease, () => null)).toEqual({
-      ok: false,
-      error: { code: 'LeaseUnreadable', message: 'the lease record is torn' },
     });
   });
 
@@ -195,16 +184,16 @@ describe('Rust-generated wire fixtures', () => {
         parseWorkspaceStatus,
       ],
       [
-        'missing lease',
+        'missing deployment',
         draft(statusFixture, (value) => {
-          delete value.result.lease;
+          delete value.result.deployment;
         }),
         parseWorkspaceStatus,
       ],
       [
-        'lease without a path',
+        'deployment without an owner',
         draft(statusFixture, (value) => {
-          delete value.result.lease.path;
+          delete value.result.deployment.owner;
         }),
         parseWorkspaceStatus,
       ],

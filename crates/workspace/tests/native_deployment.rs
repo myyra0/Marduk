@@ -46,12 +46,6 @@ const STAGED_MODE: u32 = 0o600;
 const ORIGINAL_MTIME: (u64, u32) = (1_500_000_000, 123_456_789);
 const STAGED_MTIME: (u64, u32) = (1_600_000_000, 987_654_321);
 
-/// The installation lease directory for one witness, kept beside its app root
-/// and never in the user's state directory.
-fn state_root(temp: &Path) -> PathBuf {
-    temp.join("marduk").join("leases")
-}
-
 fn stamped((seconds, nanos): (u64, u32)) -> SystemTime {
     UNIX_EPOCH + Duration::new(seconds, nanos)
 }
@@ -201,7 +195,7 @@ impl Fixture {
         set_mode(&winner, ORIGINAL_MODE);
         set_mtime(&winner, stamped(ORIGINAL_MTIME));
         let initial = tree(&game);
-        let workspace = Workspace::open_at(&app, &state_root(temp.path())).unwrap();
+        let workspace = Workspace::open(&app).unwrap();
         Self {
             temp,
             app,
@@ -754,7 +748,7 @@ fn qualified_native_round_trip_retains_backups_and_restores_the_original_tree() 
 
     // Restart: the committed generation is durable and no pending work re-runs.
     drop(fixture.workspace);
-    fixture.workspace = Workspace::open_at(&fixture.app, &state_root(fixture.temp.path())).unwrap();
+    fixture.workspace = Workspace::open(&fixture.app).unwrap();
     let status: WorkspaceStatus = serde_json::from_value(expect_ok(fixture.send(json!({
         "op": "status",
         "args": {},
@@ -1068,7 +1062,10 @@ fn clean_unqualified_root_answers_before_opening_a_native_port() {
         restore,
         RestoreResult::NoActiveDeployment { code } if code == Code::NoActiveDeployment
     ));
-    assert!(fixture.workspace.proof_recover_pending().unwrap().is_none());
+    // Recovery must read the marker, so an unqualified root is a typed refusal
+    // rather than a clean answer.
+    let recover = fixture.workspace.proof_recover_pending().unwrap_err();
+    assert_eq!(recover.code, Code::UnsupportedTarget);
 }
 
 #[cfg(unix)]
@@ -1154,7 +1151,7 @@ fn dispatch_deploy_and_restore_through_the_whole_composition() {
     // The committed generation survives a restart and is what a client reads
     // before enabling Restore.
     drop(fixture.workspace);
-    fixture.workspace = Workspace::open_at(&fixture.app, &state_root(fixture.temp.path())).unwrap();
+    fixture.workspace = Workspace::open(&fixture.app).unwrap();
     let status: WorkspaceStatus = serde_json::from_value(expect_ok(fixture.send(json!({
         "op": "status",
         "args": {},

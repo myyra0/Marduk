@@ -19,8 +19,7 @@ use marduk_core::recovery::{
     Claim, CopyEffects, Journal, PreImage, StepDirection, StepOutput, StepPhase, StepSpec,
 };
 use marduk_games::skyrim_se;
-use marduk_platform::lease::{InstallationLease, LeaseRecord};
-use marduk_storage::native_effects::NativeEffects;
+use marduk_storage::native_effects::{DEPLOYMENT_MARKER, NativeEffects};
 use marduk_storage::operation_journal::OperationJournal;
 use marduk_workspace::{Envelope, Op, Request, Workspace};
 use serde_json::{Value, json};
@@ -41,19 +40,6 @@ fn expect_error(envelope: Envelope<Value>) -> Value {
     }
 }
 
-/// The installation lease directory for one witness.
-fn state_root(temp: &Path) -> PathBuf {
-    temp.join("marduk").join("leases")
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut text = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        text.push_str(&format!("{byte:02x}"));
-    }
-    text
-}
-
 struct Fixture {
     temp: TempDir,
     app: PathBuf,
@@ -69,7 +55,7 @@ impl Fixture {
         fs::create_dir_all(game.join("Data/textures")).unwrap();
         fs::write(game.join("SkyrimSE.exe"), b"").unwrap();
         fs::write(game.join("Data/textures/winner.dds"), b"base\n").unwrap();
-        let workspace = Workspace::open_at(&app, &state_root(temp.path())).unwrap();
+        let workspace = Workspace::open(&app).unwrap();
         Self {
             temp,
             app,
@@ -133,40 +119,50 @@ impl Fixture {
         fs::read(self.game.join("Data/textures/winner.dds")).unwrap()
     }
 
-    fn lease(&self) -> InstallationLease {
-        let identity = marduk_platform::effects::directory_identity(&self.game).unwrap();
-        InstallationLease::open(
-            &state_root(self.temp.path()),
-            &hex(&identity.installation_key()),
-        )
-        .unwrap()
+    fn marker(&self) -> PathBuf {
+        self.game.join(DEPLOYMENT_MARKER)
+    }
+
+    fn claim_marker(&self, owner: &Path) {
+        fs::write(self.marker(), owner.to_string_lossy().as_bytes()).unwrap();
     }
 }
 
 #[test]
-fn clean_root_answers_none_without_opening_a_native_port() {
+fn clean_root_on_an_unqualified_volume_is_a_typed_refusal() {
     let mut fixture = Fixture::new();
     fixture.setup();
-    // An unqualified app root would fail a port open; `None` proves the route
-    // answered from the journal before any native work.
-    let _real = fixture.make_root_unqualified();
+    // Recovery must read the marker before it can answer `None`; an
+    // unqualified app root cannot open the adapter, so it is a typed refusal
+    // rather than a simulated clean answer.
+    let real = fixture.make_root_unqualified();
 
-    assert_eq!(expect_ok(fixture.recover()), Value::Null);
-    assert_eq!(fixture.pending_in(&_real), None);
+    let error = expect_error(fixture.recover());
+    assert_eq!(error["code"], json!("UnsupportedTarget"));
+    assert_eq!(fixture.pending_in(&real), None);
 }
 
 #[test]
-fn nothing_pending_but_a_foreign_record_refuses_and_names_the_owner() {
+fn moved_installation_is_target_unavailable() {
+    let mut fixture = Fixture::new();
+    fixture.setup();
+    fs::rename(
+        &fixture.game,
+        fixture.temp.path().join("Skyrim Special Edition-moved"),
+    )
+    .unwrap();
+
+    let error = expect_error(fixture.recover());
+    assert_eq!(error["code"], json!("TargetUnavailable"));
+}
+
+#[test]
+fn nothing_pending_but_a_foreign_marker_refuses_and_names_the_owner() {
     let mut fixture = Fixture::new();
     fixture.setup();
     let owner = fixture.temp.path().join("other-catalog");
-    let lease = fixture.lease();
-    lease
-        .claim(&LeaseRecord {
-            app_data: owner.clone(),
-            reference: Some("plan:9".to_owned()),
-        })
-        .unwrap();
+    fixture.claim_marker(&owner);
+    let before = fixture.game_bytes();
 
     let error = expect_error(fixture.recover());
     assert_eq!(error["code"], json!("ActiveDeployment"));
@@ -178,30 +174,29 @@ fn nothing_pending_but_a_foreign_record_refuses_and_names_the_owner() {
         "the refusal names the owning catalog root: {message}"
     );
     assert_eq!(
-        lease.read().unwrap().unwrap().app_data,
-        owner,
-        "a foreign record is never cleared"
+        fs::read(fixture.marker()).unwrap(),
+        owner.to_string_lossy().as_bytes(),
+        "a foreign marker is never cleared"
+    );
+    assert_eq!(
+        fixture.game_bytes(),
+        before,
+        "a refused recover writes nothing"
     );
 }
 
 #[test]
-fn idle_owned_record_is_cleared_when_nothing_is_pending() {
+fn idle_owned_marker_is_cleared_when_nothing_is_pending() {
     let mut fixture = Fixture::new();
     fixture.setup();
-    let lease = fixture.lease();
-    lease
-        .claim(&LeaseRecord {
-            app_data: fixture.app.clone(),
-            reference: Some("recovery:1-2".to_owned()),
-        })
-        .unwrap();
+    fixture.claim_marker(&fixture.app.clone());
 
-    // The crash window: the lease was claimed, then the process exited before
+    // The crash window: the marker was claimed, then the process exited before
     // recording any operation. The journal has nothing pending, so only the
-    // lease can tell recovery to unblock the installation.
+    // marker can tell recovery to unblock the installation.
     assert_eq!(expect_ok(fixture.recover()), Value::Null);
     assert!(
-        lease.read().unwrap().is_none(),
+        !fixture.marker().exists(),
         "the claim without journal work is cleared"
     );
 }

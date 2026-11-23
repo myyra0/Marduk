@@ -6,8 +6,6 @@
 
 use std::fmt;
 
-use sha2::{Digest, Sha256};
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeIdentity {
     Linux {
@@ -36,53 +34,6 @@ impl RootIdentity {
 
     pub fn evidence(&self) -> &NativeIdentity {
         &self.0
-    }
-
-    /// Deterministic key for the physical object this evidence describes.
-    ///
-    /// Used as the file name of the cross-catalog installation lease, so it is
-    /// stable across reopen and distinct for sibling directories. The Linux
-    /// mount view is excluded: another view of the same filesystem object is
-    /// the same installation, and a lease must follow the object rather than
-    /// the path it was reached through.
-    pub fn installation_key(&self) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(b"marduk-installation-lease/1");
-        match self.0 {
-            NativeIdentity::Linux {
-                fs_magic,
-                fs_id,
-                tree_id,
-                ino,
-                birth,
-                ..
-            } => {
-                hasher.update([0u8]);
-                hasher.update(fs_magic.to_le_bytes());
-                hasher.update(fs_id);
-                match tree_id {
-                    Some(id) => {
-                        hasher.update([1u8]);
-                        hasher.update(id.to_le_bytes());
-                    }
-                    None => hasher.update([0u8]),
-                }
-                hasher.update(ino.to_le_bytes());
-                hasher.update(birth.0.to_le_bytes());
-                hasher.update(birth.1.to_le_bytes());
-            }
-            NativeIdentity::Windows {
-                volume_serial,
-                file_id,
-                creation_100ns,
-            } => {
-                hasher.update([1u8]);
-                hasher.update(volume_serial.to_le_bytes());
-                hasher.update(file_id);
-                hasher.update(creation_100ns.to_le_bytes());
-            }
-        }
-        hasher.finalize().into()
     }
 }
 
@@ -172,68 +123,4 @@ pub enum TargetObservation {
 pub struct GameLayout {
     pub data: &'static str,
     pub markers: &'static [&'static str],
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn linux(ino: u64, view_id: u64, birth: (i64, u32)) -> RootIdentity {
-        RootIdentity::from_adapter_evidence(NativeIdentity::Linux {
-            fs_magic: 0x0102_1994,
-            fs_id: [7u8; 16],
-            view_id,
-            tree_id: Some(256),
-            ino,
-            birth,
-        })
-    }
-
-    fn windows(file_id: [u8; 16]) -> RootIdentity {
-        RootIdentity::from_adapter_evidence(NativeIdentity::Windows {
-            volume_serial: 0x1234_5678,
-            file_id,
-            creation_100ns: 133_000_000_000_000_000,
-        })
-    }
-
-    #[test]
-    fn the_same_evidence_gives_the_same_key() {
-        assert_eq!(
-            linux(42, 9, (1, 2)).installation_key(),
-            linux(42, 9, (1, 2)).installation_key()
-        );
-        assert_eq!(
-            windows([3u8; 16]).installation_key(),
-            windows([3u8; 16]).installation_key()
-        );
-    }
-
-    #[test]
-    fn sibling_directories_get_different_keys() {
-        assert_ne!(
-            linux(42, 9, (1, 0)).installation_key(),
-            linux(43, 9, (1, 0)).installation_key()
-        );
-        assert_ne!(
-            windows([3u8; 16]).installation_key(),
-            windows([4u8; 16]).installation_key()
-        );
-    }
-
-    #[test]
-    fn the_mount_view_does_not_change_the_key() {
-        assert_eq!(
-            linux(42, 9, (1, 0)).installation_key(),
-            linux(42, 11, (1, 0)).installation_key()
-        );
-    }
-
-    #[test]
-    fn a_recreated_object_with_a_new_birth_gets_a_new_key() {
-        assert_ne!(
-            linux(42, 9, (1, 0)).installation_key(),
-            linux(42, 9, (2, 0)).installation_key()
-        );
-    }
 }

@@ -35,7 +35,6 @@ export const CODES = [
   'RecoveryConflict',
   'UnknownOperation',
   'NoActiveDeployment',
-  'LeaseUnreadable',
   'Io',
 ] as const;
 
@@ -158,11 +157,10 @@ export type Reconciliation = {
 };
 
 /**
- * The installation lease record a status observed, naming the exact file an
- * owner must remove when a crashed deploy left a claim that cannot be cleared
- * safely.
+ * The catalog root the installation's deployment marker records. Present
+ * exactly when a marker exists, whether this catalog or another one wrote it.
  */
-export type LeaseInfo = { path: string };
+export type DeploymentInfo = { owner: string };
 
 export type WorkspaceStatus = {
   installation: Installation | null;
@@ -170,7 +168,7 @@ export type WorkspaceStatus = {
   availability: AvailabilitySet;
   pending: Operation | null;
   activeGenerationId: Id | null;
-  lease: LeaseInfo | null;
+  deployment: DeploymentInfo | null;
   reconciliation: Reconciliation;
 };
 
@@ -478,7 +476,7 @@ export function parseWorkspaceStatus(value: unknown, field = 'status'): Workspac
     'installation',
     'pending',
     'activeGenerationId',
-    'lease',
+    'deployment',
     'reconciliation',
   ]) {
     if (!(key in status)) {
@@ -488,7 +486,7 @@ export function parseWorkspaceStatus(value: unknown, field = 'status'): Workspac
   const installation = status.installation;
   const pending = status.pending;
   const activeGenerationId = status.activeGenerationId;
-  const lease = status.lease;
+  const deployment = status.deployment;
   const availability = record(status.availability, `${field}.availability`);
   const installed =
     installation === null || installation === undefined
@@ -518,11 +516,14 @@ export function parseWorkspaceStatus(value: unknown, field = 'status'): Workspac
       activeGenerationId === null || activeGenerationId === undefined
         ? null
         : parseId(activeGenerationId, `${field}.activeGenerationId`),
-    lease:
-      lease === null || lease === undefined
+    deployment:
+      deployment === null || deployment === undefined
         ? null
         : {
-            path: text(record(lease, `${field}.lease`).path, `${field}.lease.path`),
+            owner: text(
+              record(deployment, `${field}.deployment`).owner,
+              `${field}.deployment.owner`,
+            ),
           },
     reconciliation: parseReconciliation(status.reconciliation, `${field}.reconciliation`),
   };

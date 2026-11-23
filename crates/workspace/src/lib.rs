@@ -12,7 +12,6 @@
 use std::fmt::Write as _;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 mod selection;
 
@@ -31,10 +30,9 @@ use marduk_core::recovery::{BackupRef, BackupSlot, Journal, StepDirection};
 use marduk_core::root_identity::{NativeIdentity, RootError, RootIdentity, UnsupportedReason};
 use marduk_games::skyrim_se;
 use marduk_platform::InstallationBinding;
-use marduk_platform::lease::{InstallationLease, LeaseClaim, LeaseError, LeaseRecord};
 use marduk_storage::Catalog;
 use marduk_storage::library::{QuarantineReason, ReconcileReport};
-use marduk_storage::native_effects::NativeEffects;
+use marduk_storage::native_effects::{DeploymentOwner, NativeEffects};
 use marduk_storage::operation_journal::OperationJournal;
 use marduk_storage::operation_journal::SelectedInstallation;
 use serde::ser::SerializeMap;
@@ -174,7 +172,6 @@ pub enum Code {
     RecoveryConflict,
     UnknownOperation,
     NoActiveDeployment,
-    LeaseUnreadable,
     Io,
 }
 
@@ -208,7 +205,6 @@ impl Code {
             Self::RecoveryConflict => "RecoveryConflict",
             Self::UnknownOperation => "UnknownOperation",
             Self::NoActiveDeployment => "NoActiveDeployment",
-            Self::LeaseUnreadable => "LeaseUnreadable",
             Self::Io => "Io",
         }
     }
@@ -256,7 +252,7 @@ pub struct WireError {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<Detail>,
     /// Human-readable context for the typed refusal, such as the owning
-    /// catalog root of a foreign installation lease. Clients show it beside
+    /// catalog root of a foreign deployment marker. Clients show it beside
     /// the stable code; they never branch on its wording.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -398,12 +394,12 @@ pub struct QuarantinedLeftover {
     pub reason: String,
 }
 
-/// The installation lease record a status observed. The path is the exact file
-/// an owner must remove by hand when a crashed deploy left a claim that cannot
-/// be cleared safely.
+/// The catalog root the installation's deployment marker records. Present
+/// exactly when a marker exists, whether this catalog or another one wrote it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LeaseInfo {
-    pub path: String,
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentInfo {
+    pub owner: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -414,8 +410,8 @@ pub struct WorkspaceStatus {
     pub availability: AvailabilitySet,
     pub pending: Option<Operation>,
     pub active_generation_id: Option<String>,
-    /// Present exactly when an installation lease record exists.
-    pub lease: Option<LeaseInfo>,
+    /// The marker owner, or `null` when the installation is not claimed.
+    pub deployment: Option<DeploymentInfo>,
     pub reconciliation: Reconciliation,
 }
 
@@ -538,10 +534,9 @@ impl<S: FnMut(Progress)> ProgressFeed<S> {
 
 /// One shared client service over the authoritative catalog and journal.
 pub struct Workspace {
-    /// Absolute catalog root. Also the owner named in the cross-catalog
-    /// installation lease.
+    /// Absolute catalog root. Also the owner recorded in the installation's
+    /// deployment marker.
     app_data: PathBuf,
-    lease_root: PathBuf,
     catalog: Catalog,
     journal: OperationJournal,
     selections: SelectionStore,
@@ -551,19 +546,10 @@ pub struct Workspace {
 impl Workspace {
     /// Open the shared state under the application data root.
     ///
-    /// The cross-catalog installation lease lives in the user's state
-    /// directory, outside every app-data root, so a second catalog of the same
-    /// user still sees who owns an installation.
+    /// M1 is one client and one catalog per installation, so nothing outside
+    /// this root participates in ownership; the installation marker names the
+    /// catalog that deployed there.
     pub fn open(app_data: &Path) -> Result<Self, WireError> {
-        let lease_root = marduk_platform::lease::installation_lease_dir().map_err(root_error)?;
-        Self::open_at(app_data, &lease_root)
-    }
-
-    /// Open the shared state with an explicit lease directory.
-    ///
-    /// Embedded clients and tests use this to keep the user's state directory
-    /// untouched; production clients call [`Workspace::open`].
-    pub fn open_at(app_data: &Path, lease_root: &Path) -> Result<Self, WireError> {
         let app_data =
             std::path::absolute(app_data).map_err(|_| WireError::new(Code::InvalidPath))?;
         let mut catalog = Catalog::open(&app_data).map_err(import_error)?;
@@ -575,7 +561,6 @@ impl Workspace {
         let journal = OperationJournal::open(&app_data).map_err(deploy_error)?;
         Ok(Self {
             app_data,
-            lease_root: lease_root.to_path_buf(),
             catalog,
             journal,
             selections: SelectionStore::new(),
@@ -746,7 +731,7 @@ impl Workspace {
         };
         let mut pending = None;
         let mut active_generation_id = None;
-        let mut lease = None;
+        let mut deployment = None;
         // Client deploy/restore is available only where the recorded pair still
         // reopens, both roots sit on a volume the record proves, and the app and
         // game roots share a rename domain. The locator's volume class alone is
@@ -757,16 +742,10 @@ impl Workspace {
         };
 
         if let Some(selected) = selected {
-            // A record owned by another catalog is the dominant fact: this
+            // A marker owned by another catalog is the dominant fact: this
             // client may neither deploy nor restore, and the blocker names the
             // owner rather than reporting a bare Busy.
-            effects = match self.foreign_owner(&selected)? {
-                Some(owner) => Availability {
-                    available: false,
-                    blocker: Some(foreign_deployment(&owner)),
-                },
-                None => effect_availability(self.require_native_effects(&selected)),
-            };
+            (effects, deployment) = self.deployment_state(&selected);
             let SelectedInstallation {
                 id,
                 locator,
@@ -775,12 +754,6 @@ impl Workspace {
                 pending: pending_status,
                 active_generation,
             } = selected;
-
-            lease = self
-                .lease_record(&expected_installation)?
-                .map(|_| LeaseInfo {
-                    path: self.lease_path(&expected_installation),
-                });
 
             installation = Some(Installation {
                 id: decimal(id),
@@ -828,7 +801,7 @@ impl Workspace {
             },
             pending,
             active_generation_id,
-            lease,
+            deployment,
             reconciliation: self.reconciliation.clone(),
         })
     }
@@ -891,12 +864,13 @@ impl Workspace {
         // A preview must not be applyable on a root that would refuse the
         // write, so the native gate runs before the catalog is read.
         let selected = self.selected_pair()?;
+        self.require_native_effects(&selected)?;
+        let mut port = self.native_effects(&selected)?;
         // A preview on an installation another catalog owns would save a plan
         // this client cannot apply. Refuse before any plan is persisted.
-        if let Some(owner) = self.foreign_owner(&selected)? {
+        if let DeploymentOwner::Foreign(owner) = port.deployment_owner().map_err(deploy_error)? {
             return Err(foreign_deployment(&owner));
         }
-        self.require_native_effects(&selected)?;
         let named = self
             .catalog
             .named_profile(profile())
@@ -908,7 +882,6 @@ impl Workspace {
             .catalog
             .resolved_inputs(profile())
             .map_err(import_error)?;
-        let mut port = self.native_effects(&selected)?;
         let plan = marduk_core::deployment::preview_deployment(
             &mut self.journal,
             &mut port,
@@ -990,12 +963,23 @@ impl Workspace {
         let selected = self.selected_pair()?;
         self.require_native_effects(&selected)?;
         let mut port = self.native_effects(&selected)?;
-        // Cross-catalog ownership is claimed after the port is open (no public
-        // write yet) and before the first effect; the record is held only
-        // while it changes. A record naming another catalog root is refused
-        // here, whatever this journal says.
-        let reference = format!("plan:{}", plan.get());
-        self.claim_installation(&selected, reference.clone())?;
+        // A marker naming another catalog root is refused before the plan is
+        // examined or any public effect runs, whatever this journal says.
+        if let DeploymentOwner::Foreign(owner) = port.deployment_owner().map_err(deploy_error)? {
+            return Err(foreign_deployment(&owner));
+        }
+        // The marker is claimed after the plan exists and names this
+        // installation, but before the first public effect.
+        let stored = self
+            .journal
+            .plan(plan)
+            .map_err(deploy_error)?
+            .ok_or_else(|| WireError::new(Code::StalePlan))?;
+        if stored.installation != selected.installation || stored.data != selected.data {
+            return Err(WireError::new(Code::TargetUnavailable));
+        }
+        port.claim_deployment(&self.app_data)
+            .map_err(deploy_error)?;
         let committed = marduk_core::deployment::commit_deployment_with_progress(
             &mut self.journal,
             &mut port,
@@ -1007,15 +991,12 @@ impl Workspace {
             Ok(status) => status,
             Err(error) => {
                 // A failure that ended with no pending work and no active
-                // generation left nothing deployed. Anything else keeps the
-                // claim so an interrupted deployment cannot hide ownership.
-                self.release_if_idle(&selected, Some(&reference));
+                // generation left nothing deployed; anything else keeps the
+                // marker so an interrupted deployment cannot hide ownership.
+                self.clear_marker_if_idle(&port, &selected);
                 return Err(deploy_error(error));
             }
         };
-        if let Some(generation) = status.generation {
-            self.reference_installation(&selected, format!("generation:{}", generation.get()));
-        }
         Ok(operation(status))
     }
 
@@ -1029,14 +1010,19 @@ impl Workspace {
     ) -> Result<RestoreResult, WireError> {
         let mut feed = ProgressFeed::new(progress);
         let selected = self.selected_pair()?;
-        // Only the recorded owner may restore. A foreign record refuses even a
-        // restore this catalog would answer as a no-op: the installation is
-        // not this catalog's to change.
-        if let Some(owner) = self.foreign_owner(&selected)? {
+        // Ownership is examined before the no-work answers when this catalog
+        // can open the adapter: a foreign marker refuses even a restore this
+        // catalog would answer as a no-op. A moved or unqualified root cannot be
+        // observed here and still falls through to the journal answer.
+        let port = self.native_effects(&selected).ok();
+        if let Some(port) = &port
+            && let DeploymentOwner::Foreign(owner) =
+                port.deployment_owner().map_err(deploy_error)?
+        {
             return Err(foreign_deployment(&owner));
         }
-        // Answer the no-work and pending cases from the journal before opening
-        // the port. A clean root is `NoActiveDeployment`, not an unavailable
+        // Answer the no-work and pending cases from the journal before the
+        // effects gate. A clean root is `NoActiveDeployment`, not an unavailable
         // volume, and a pending Restore reports its tracked status.
         let state = self
             .journal
@@ -1062,22 +1048,20 @@ impl Workspace {
             return Err(deploy_error(DeployError::Busy));
         }
         if state.active.is_none() {
-            // Do not clear the record here. A deploy in this same catalog can
-            // sit between its lease claim and its journal claim with the same
-            // idle journal, and clearing "the reference on disk" would delete
-            // that live claim. A stale record stays and is reported; it only
-            // blocks other catalogs, never this one's own next claim.
             return Ok(RestoreResult::NoActiveDeployment {
                 code: Code::NoActiveDeployment,
             });
         }
         self.require_native_effects(&selected)?;
-        let mut port = self.native_effects(&selected)?;
-        // Claim before the first restore effect; the record is held only while
-        // it changes, and only the recorded owner may perform this restore.
-        let generation = state.active.expect("checked above");
-        let reference = format!("restore:generation:{}:{}", generation.get(), claim_nonce());
-        self.claim_installation(&selected, reference.clone())?;
+        let mut port = match port {
+            Some(port) => port,
+            None => self.native_effects(&selected)?,
+        };
+        // Recheck on the port that will perform the effects, so a missed early
+        // observation can never clear another catalog's marker afterwards.
+        if let DeploymentOwner::Foreign(owner) = port.deployment_owner().map_err(deploy_error)? {
+            return Err(foreign_deployment(&owner));
+        }
         match marduk_core::deployment::restore_with_progress(
             &mut self.journal,
             &mut port,
@@ -1086,23 +1070,19 @@ impl Workspace {
             |event| feed.emit(event),
         ) {
             Ok(status) => {
-                // A restore call can be served another restore's recorded
-                // pending status. Only a completed outcome with an idle journal
-                // proves the work is done; a pending or failed status keeps the
-                // record so ownership cannot be cleared under live work.
+                // Only a completed outcome proves the marker can be removed. A
+                // pending or failed status keeps it so ownership cannot be
+                // cleared under live or unfinished work.
                 if status.phase == Phase::Completed {
-                    self.release_if_idle(&selected, Some(&reference));
+                    let _ = port.clear_deployment();
                 }
                 Ok(RestoreResult::Operation {
                     operation: operation(status),
                 })
             }
-            Err(DeployError::NoActiveDeployment) => {
-                self.release_if_idle(&selected, Some(&reference));
-                Ok(RestoreResult::NoActiveDeployment {
-                    code: Code::NoActiveDeployment,
-                })
-            }
+            Err(DeployError::NoActiveDeployment) => Ok(RestoreResult::NoActiveDeployment {
+                code: Code::NoActiveDeployment,
+            }),
             Err(error) => Err(deploy_error(error)),
         }
     }
@@ -1114,100 +1094,60 @@ impl Workspace {
             .ok_or_else(|| WireError::new(Code::TargetUnavailable))
     }
 
-    /// The lease object for one physical installation. The key is derived from
-    /// the recorded root identity, not from any path.
-    fn lease(&self, installation: &RootIdentity) -> Result<InstallationLease, WireError> {
-        let key = hex(&installation.installation_key());
-        InstallationLease::open(&self.lease_root, &key).map_err(lease_error)
-    }
-
-    /// The record as written, when one exists. Unlike [`Self::lease_owner`]
-    /// this keeps the reference, so a caller can clear exactly what it read.
-    fn lease_record(&self, installation: &RootIdentity) -> Result<Option<LeaseRecord>, WireError> {
-        let key = hex(&installation.installation_key());
-        let Some(lease) =
-            InstallationLease::open_existing(&self.lease_root, &key).map_err(lease_error)?
-        else {
-            return Ok(None);
-        };
-        lease.read().map_err(lease_error)
-    }
-
-    /// The exact record file [`InstallationLease`] writes for this installation.
-    /// Display only: the lease object still owns every containment check.
-    fn lease_path(&self, installation: &RootIdentity) -> String {
-        let key = hex(&installation.installation_key());
-        self.lease_root
-            .join(format!("{key}.lease"))
-            .display()
-            .to_string()
-    }
-
-    /// The recorded owner of this installation, when a record exists.
-    fn lease_owner(&self, installation: &RootIdentity) -> Result<Option<PathBuf>, WireError> {
-        let key = hex(&installation.installation_key());
-        let Some(lease) =
-            InstallationLease::open_existing(&self.lease_root, &key).map_err(lease_error)?
-        else {
-            return Ok(None);
-        };
-        Ok(lease
-            .read()
-            .map_err(lease_error)?
-            .map(|record| record.app_data))
-    }
-
-    /// The owning catalog root when it is not this catalog.
-    fn foreign_owner(&self, selected: &SelectedInstallation) -> Result<Option<PathBuf>, WireError> {
-        Ok(self
-            .lease_owner(&selected.installation)?
-            .filter(|owner| *owner != self.app_data))
-    }
-
-    /// Claim the installation for this catalog before its first public write.
-    fn claim_installation(
+    /// The effects availability and the marker owner for one installation.
+    ///
+    /// A marker owned by another catalog is the dominant fact: this client may
+    /// neither deploy nor restore, and the blocker names the owner.
+    fn deployment_state(
         &self,
         selected: &SelectedInstallation,
-        reference: String,
-    ) -> Result<(), WireError> {
-        let record = LeaseRecord {
-            app_data: self.app_data.clone(),
-            reference: Some(reference),
-        };
-        match self
-            .lease(&selected.installation)?
-            .claim(&record)
-            .map_err(lease_error)?
-        {
-            LeaseClaim::Acquired => Ok(()),
-            LeaseClaim::Foreign(owner) => Err(foreign_deployment(&owner)),
+    ) -> (Availability, Option<DeploymentInfo>) {
+        if let Err(blocker) = self.require_native_effects(selected) {
+            return (
+                Availability {
+                    available: false,
+                    blocker: Some(blocker),
+                },
+                None,
+            );
+        }
+        let owner = self
+            .native_effects(selected)
+            .and_then(|port| port.deployment_owner().map_err(deploy_error));
+        match owner {
+            Ok(DeploymentOwner::Foreign(owner)) => (
+                Availability {
+                    available: false,
+                    blocker: Some(foreign_deployment(&owner)),
+                },
+                Some(deployment_info(&owner)),
+            ),
+            Ok(owner) => (
+                Availability {
+                    available: true,
+                    blocker: None,
+                },
+                marker_owner(owner),
+            ),
+            Err(error) => (
+                Availability {
+                    available: false,
+                    blocker: Some(error),
+                },
+                None,
+            ),
         }
     }
 
-    /// Point this catalog's record at the committed generation. A failure
-    /// leaves the earlier reference, which still names this catalog and so
-    /// still arbitrates correctly.
-    fn reference_installation(&self, selected: &SelectedInstallation, reference: String) {
-        let record = LeaseRecord {
-            app_data: self.app_data.clone(),
-            reference: Some(reference),
-        };
-        if let Ok(lease) = self.lease(&selected.installation) {
-            let _ = lease.claim(&record);
-        }
-    }
-
-    /// Clear this catalog's record once its journal records neither pending
-    /// work nor an active generation for the installation, and only when the
-    /// record still carries `reference`. A record a newer operation wrote is
-    /// left intact.
-    fn release_if_idle(&mut self, selected: &SelectedInstallation, reference: Option<&str>) {
+    /// Clear the marker once this catalog's journal records neither pending
+    /// work nor an active generation for the installation.
+    fn clear_marker_if_idle(&mut self, port: &NativeEffects, selected: &SelectedInstallation) {
         let idle = match self.journal.root_state(&selected.data) {
             Ok(state) => state.pending.is_none() && state.active.is_none(),
             Err(_) => false,
         };
-        if idle && let Ok(lease) = self.lease(&selected.installation) {
-            let _ = lease.clear_if(&self.app_data, reference);
+        if idle {
+            let _ = port.clear_deployment();
         }
     }
 
@@ -1283,42 +1223,31 @@ impl Workspace {
     /// work; the availability rule is owned by `docs/contracts/m1-clients.md`.
     fn recover_pending(&mut self) -> Result<Option<Operation>, WireError> {
         let selected = self.selected_pair()?;
+        // Identity first: a moved installation is a lost target, not a verdict
+        // on its volume.
+        self.reopen(&selected)?;
         let state = self
             .journal
             .root_state(&selected.data)
             .map_err(deploy_error)?;
-        // Examine the lease before answering. A process can exit between
-        // claiming the lease and recording an operation, leaving a record and
-        // an idle journal; returning `None` without looking would block the
+        // Examine the marker before answering. A process can exit between
+        // claiming the installation and recording an operation, leaving a marker
+        // and an idle journal; returning `None` without looking would block the
         // installation forever.
-        let record = self.lease_record(&selected.installation)?;
-        if let Some(record) = &record
-            && record.app_data != self.app_data
-        {
-            return Err(foreign_deployment(&record.app_data));
+        let mut port = self.native_effects(&selected)?;
+        match port.deployment_owner().map_err(deploy_error)? {
+            DeploymentOwner::Foreign(owner) => return Err(foreign_deployment(&owner)),
+            DeploymentOwner::Owned(_) if state.pending.is_none() && state.active.is_none() => {
+                // The crash leftover: this catalog claimed the installation but
+                // recorded no pending work and no generation.
+                let _ = port.clear_deployment();
+                return Ok(None);
+            }
+            DeploymentOwner::Owned(_) | DeploymentOwner::Vacant => {}
         }
         if state.pending.is_none() {
-            // No native work. Only a reference this command family writes can
-            // be attributed to a dead claim: `recovery:` and `restore:` with an
-            // idle journal. A restore claims only after seeing an active
-            // generation, so an idle journal cannot hide a live restore. A
-            // `plan:` or `generation:` record is left alone — a deploy can sit
-            // between its lease claim and its journal claim with an idle
-            // journal, and clearing it would delete a live claim.
-            if state.active.is_none()
-                && let Some(record) = record
-                && record.reference.as_deref().is_some_and(|reference| {
-                    reference.starts_with("recovery:") || reference.starts_with("restore:")
-                })
-                && let Ok(lease) = self.lease(&selected.installation)
-            {
-                let _ = lease.clear_if(&self.app_data, record.reference.as_deref());
-            }
             return Ok(None);
         }
-        let mut port = self.native_effects(&selected)?;
-        let reference = format!("recovery:{}", claim_nonce());
-        self.claim_installation(&selected, reference.clone())?;
         let recovered = marduk_core::recovery::recover_pending(
             &mut self.journal,
             &mut port,
@@ -1327,16 +1256,10 @@ impl Workspace {
         );
         match recovered {
             Ok(status) => {
-                match &status {
-                    Some(settled) if settled.generation.is_some() => {
-                        let generation = settled.generation.expect("checked above");
-                        self.reference_installation(
-                            &selected,
-                            format!("generation:{}", generation.get()),
-                        );
-                    }
-                    _ => self.release_if_idle(&selected, Some(&reference)),
-                }
+                // Completed recovery may have rolled the deployment back, so an
+                // idle journal now means nothing is deployed and the marker is
+                // this catalog's leftover.
+                self.clear_marker_if_idle(&port, &selected);
                 Ok(status.map(operation))
             }
             Err(error) => Err(deploy_error(error)),
@@ -1646,19 +1569,6 @@ fn same_rename_domain(app: &RootIdentity, installation: &RootIdentity) -> bool {
     }
 }
 
-fn effect_availability(gate: Result<(), WireError>) -> Availability {
-    match gate {
-        Ok(()) => Availability {
-            available: true,
-            blocker: None,
-        },
-        Err(blocker) => Availability {
-            available: false,
-            blocker: Some(blocker),
-        },
-    }
-}
-
 /// No proven client deploy route exists for this configuration, so no plan can
 /// be bound, no game file can be observed and no restore can run through
 /// `dispatch`.
@@ -1671,7 +1581,7 @@ fn unsupported_effect() -> WireError {
     )
 }
 
-/// The typed refusal for a record owned by another catalog root. The message
+/// The typed refusal for a marker owned by another catalog root. The message
 /// names the owner so a client can say "deployed by another configuration"
 /// instead of showing a bare Busy.
 fn foreign_deployment(owner: &Path) -> WireError {
@@ -1684,11 +1594,18 @@ fn foreign_deployment(owner: &Path) -> WireError {
     )
 }
 
-fn lease_error(error: LeaseError) -> WireError {
-    match error {
-        LeaseError::Busy => WireError::with_message(Code::Busy, error.to_string()),
-        LeaseError::Unreadable => WireError::with_message(Code::LeaseUnreadable, error.to_string()),
-        LeaseError::Io => WireError::new(Code::Io),
+fn deployment_info(owner: &Path) -> DeploymentInfo {
+    DeploymentInfo {
+        owner: owner.display().to_string(),
+    }
+}
+
+fn marker_owner(owner: DeploymentOwner) -> Option<DeploymentInfo> {
+    match owner {
+        DeploymentOwner::Vacant => None,
+        DeploymentOwner::Owned(owner) | DeploymentOwner::Foreign(owner) => {
+            Some(deployment_info(&owner))
+        }
     }
 }
 
@@ -1814,18 +1731,6 @@ fn hex(bytes: &[u8]) -> String {
         write!(&mut output, "{byte:02x}").expect("writing to a string cannot fail");
     }
     output
-}
-
-/// A reference unique to one operation call, so clearing it cannot remove a
-/// record a newer call wrote. The process id separates catalogs, and the
-/// counter keeps two calls in one process distinct even within one clock tick.
-fn claim_nonce() -> String {
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("{}-{nanos}-{sequence}", std::process::id())
 }
 
 #[cfg(test)]
@@ -1954,7 +1859,6 @@ mod tests {
             Code::RecoveryConflict,
             Code::UnknownOperation,
             Code::NoActiveDeployment,
-            Code::LeaseUnreadable,
             Code::Io,
         ];
         for code in codes {
@@ -2233,8 +2137,8 @@ mod wire_fixture {
                 }],
             }),
             active_generation_id: Some("9223372036854775804".to_owned()),
-            lease: Some(LeaseInfo {
-                path: "/home/user/.local/state/marduk/leases/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.lease".to_owned(),
+            deployment: Some(DeploymentInfo {
+                owner: "/home/user/.local/share/com.marduk.desktop".to_owned(),
             }),
             reconciliation: Reconciliation {
                 reclaimed: vec![LARGE_B.to_owned()],
