@@ -19,6 +19,7 @@ use marduk_core::recovery::{
     Claim, CopyEffects, Journal, PreImage, StepDirection, StepOutput, StepPhase, StepSpec,
 };
 use marduk_games::skyrim_se;
+use marduk_platform::lease::{InstallationLease, LeaseRecord};
 use marduk_storage::native_effects::NativeEffects;
 use marduk_storage::operation_journal::OperationJournal;
 use marduk_workspace::{Envelope, Op, Request, Workspace};
@@ -43,6 +44,14 @@ fn expect_error(envelope: Envelope<Value>) -> Value {
 /// The installation lease directory for one witness.
 fn state_root(temp: &Path) -> PathBuf {
     temp.join("marduk").join("leases")
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        text.push_str(&format!("{byte:02x}"));
+    }
+    text
 }
 
 struct Fixture {
@@ -123,6 +132,15 @@ impl Fixture {
     fn game_bytes(&self) -> Vec<u8> {
         fs::read(self.game.join("Data/textures/winner.dds")).unwrap()
     }
+
+    fn lease(&self) -> InstallationLease {
+        let identity = marduk_platform::effects::directory_identity(&self.game).unwrap();
+        InstallationLease::open(
+            &state_root(self.temp.path()),
+            &hex(&identity.installation_key()),
+        )
+        .unwrap()
+    }
 }
 
 #[test]
@@ -135,6 +153,57 @@ fn clean_root_answers_none_without_opening_a_native_port() {
 
     assert_eq!(expect_ok(fixture.recover()), Value::Null);
     assert_eq!(fixture.pending_in(&_real), None);
+}
+
+#[test]
+fn nothing_pending_but_a_foreign_record_refuses_and_names_the_owner() {
+    let mut fixture = Fixture::new();
+    fixture.setup();
+    let owner = fixture.temp.path().join("other-catalog");
+    let lease = fixture.lease();
+    lease
+        .claim(&LeaseRecord {
+            app_data: owner.clone(),
+            reference: Some("plan:9".to_owned()),
+        })
+        .unwrap();
+
+    let error = expect_error(fixture.recover());
+    assert_eq!(error["code"], json!("ActiveDeployment"));
+    let message = error["message"]
+        .as_str()
+        .expect("the refusal names the owner");
+    assert!(
+        message.contains(&owner.to_string_lossy().into_owned()),
+        "the refusal names the owning catalog root: {message}"
+    );
+    assert_eq!(
+        lease.read().unwrap().unwrap().app_data,
+        owner,
+        "a foreign record is never cleared"
+    );
+}
+
+#[test]
+fn idle_owned_record_is_cleared_when_nothing_is_pending() {
+    let mut fixture = Fixture::new();
+    fixture.setup();
+    let lease = fixture.lease();
+    lease
+        .claim(&LeaseRecord {
+            app_data: fixture.app.clone(),
+            reference: Some("recovery:1-2".to_owned()),
+        })
+        .unwrap();
+
+    // The crash window: the lease was claimed, then the process exited before
+    // recording any operation. The journal has nothing pending, so only the
+    // lease can tell recovery to unblock the installation.
+    assert_eq!(expect_ok(fixture.recover()), Value::Null);
+    assert!(
+        lease.read().unwrap().is_none(),
+        "the claim without journal work is cleared"
+    );
 }
 
 #[test]

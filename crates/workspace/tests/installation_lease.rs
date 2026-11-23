@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use marduk_core::deployment::PlanId;
 use marduk_core::ids::ProfileRevision;
+use marduk_platform::lease::{InstallationLease, LeaseRecord};
 use marduk_workspace::{Code, Envelope, Op, Request, RestoreResult, WireError, Workspace};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -138,6 +139,22 @@ impl Fixture {
     fn lease_path(&self) -> PathBuf {
         let identity = marduk_platform::effects::directory_identity(&self.game).unwrap();
         state_root(self.temp.path()).join(format!("{}.lease", hex(&identity.installation_key())))
+    }
+
+    fn lease(&self) -> InstallationLease {
+        let identity = marduk_platform::effects::directory_identity(&self.game).unwrap();
+        InstallationLease::open(
+            &state_root(self.temp.path()),
+            &hex(&identity.installation_key()),
+        )
+        .unwrap()
+    }
+
+    fn record(&self, reference: &str) -> LeaseRecord {
+        LeaseRecord {
+            app_data: self.app_a.clone(),
+            reference: Some(reference.to_owned()),
+        }
     }
 
     fn deployed(&self) -> Vec<u8> {
@@ -303,4 +320,70 @@ fn a_failed_deploy_that_rolls_back_leaves_no_record() {
     let plan = review_plan(&mut fixture.workspace_b, &fixture.zip);
     let applied = fixture.workspace_b.proof_apply_deployment(plan).unwrap();
     assert_eq!(applied.phase, "completed");
+}
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn a_stale_clear_leaves_a_newer_record_intact() {
+    let fixture = Fixture::new();
+    let lease = fixture.lease();
+
+    // A restore that already finished (or a replay served to a concurrent
+    // call) holds only its own reference. A newer generation was written in
+    // the meantime and must survive.
+    lease
+        .claim(&fixture.record("restore:generation:1:111-222"))
+        .unwrap();
+    lease.claim(&fixture.record("generation:2")).unwrap();
+    assert!(
+        !lease
+            .clear_if(&fixture.app_a, Some("restore:generation:1:111-222"))
+            .unwrap(),
+        "the old restore reference no longer owns the record"
+    );
+    assert_eq!(
+        lease.read().unwrap().unwrap().reference.as_deref(),
+        Some("generation:2")
+    );
+
+    // The rollback path has the same rule for a plan reference.
+    lease.claim(&fixture.record("plan:6")).unwrap();
+    assert!(
+        !lease.clear_if(&fixture.app_a, Some("plan:5")).unwrap(),
+        "the stale plan reference no longer owns the record"
+    );
+    assert_eq!(
+        lease.read().unwrap().unwrap().reference.as_deref(),
+        Some("plan:6")
+    );
+}
+
+#[test]
+#[ignore = "requires TMPDIR on tmpfs or Btrfs"]
+fn recover_keeps_the_record_while_a_generation_is_active() {
+    let mut fixture = Fixture::new();
+    setup(&mut fixture.workspace_a, &fixture.game);
+    let plan = review_plan(&mut fixture.workspace_a, &fixture.zip);
+    fixture.workspace_a.proof_apply_deployment(plan).unwrap();
+
+    let lease = fixture.lease();
+    let record = lease.read().unwrap().expect("the deploy records its claim");
+    assert!(
+        record
+            .reference
+            .as_deref()
+            .is_some_and(|reference| reference.starts_with("generation:")),
+        "a successful deploy names the committed generation: {record:?}"
+    );
+
+    // Nothing is pending, but an active generation is still deployed; recovery
+    // must answer `None` without clearing the record.
+    assert!(
+        fixture
+            .workspace_a
+            .proof_recover_pending()
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(lease.read().unwrap(), Some(record));
 }

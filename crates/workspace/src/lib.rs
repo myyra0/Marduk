@@ -12,6 +12,7 @@
 use std::fmt::Write as _;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 mod selection;
 
@@ -970,7 +971,8 @@ impl Workspace {
         // write yet) and before the first effect; the record is held only
         // while it changes. A record naming another catalog root is refused
         // here, whatever this journal says.
-        self.claim_installation(&selected, format!("plan:{}", plan.get()))?;
+        let reference = format!("plan:{}", plan.get());
+        self.claim_installation(&selected, reference.clone())?;
         let committed = marduk_core::deployment::commit_deployment_with_progress(
             &mut self.journal,
             &mut port,
@@ -984,7 +986,7 @@ impl Workspace {
                 // A failure that ended with no pending work and no active
                 // generation left nothing deployed. Anything else keeps the
                 // claim so an interrupted deployment cannot hide ownership.
-                self.release_if_idle(&selected);
+                self.release_if_idle(&selected, Some(&reference));
                 return Err(deploy_error(error));
             }
         };
@@ -1038,8 +1040,13 @@ impl Workspace {
         }
         if state.active.is_none() {
             // A claim left by an interrupted attempt that rolled back is this
-            // catalog's stale record and nothing is deployed; clear it.
-            self.release_if_idle(&selected);
+            // catalog's stale record and nothing is deployed; clear it, but
+            // only the exact reference that is on disk now.
+            if let Some(record) = self.lease_record(&selected.installation)?
+                && record.app_data == self.app_data
+            {
+                self.release_if_idle(&selected, record.reference.as_deref());
+            }
             return Ok(RestoreResult::NoActiveDeployment {
                 code: Code::NoActiveDeployment,
             });
@@ -1048,7 +1055,9 @@ impl Workspace {
         let mut port = self.native_effects(&selected)?;
         // Claim before the first restore effect; the record is held only while
         // it changes, and only the recorded owner may perform this restore.
-        self.claim_installation(&selected, "restore".to_owned())?;
+        let generation = state.active.expect("checked above");
+        let reference = format!("restore:generation:{}:{}", generation.get(), claim_nonce());
+        self.claim_installation(&selected, reference.clone())?;
         match marduk_core::deployment::restore_with_progress(
             &mut self.journal,
             &mut port,
@@ -1057,18 +1066,17 @@ impl Workspace {
             |event| feed.emit(event),
         ) {
             Ok(status) => {
-                // The restore is the journal's answer; a release that fails
-                // leaves an extra refusal behind, never a wrong write. No
-                // other catalog may claim this installation while it stands.
+                // Clear only this call's reference: a replay served to a
+                // concurrent call must not erase a newer operation's claim.
                 if let Ok(lease) = self.lease(&selected.installation) {
-                    let _ = lease.release(&self.app_data);
+                    let _ = lease.clear_if(&self.app_data, Some(&reference));
                 }
                 Ok(RestoreResult::Operation {
                     operation: operation(status),
                 })
             }
             Err(DeployError::NoActiveDeployment) => {
-                self.release_if_idle(&selected);
+                self.release_if_idle(&selected, Some(&reference));
                 Ok(RestoreResult::NoActiveDeployment {
                     code: Code::NoActiveDeployment,
                 })
@@ -1089,6 +1097,18 @@ impl Workspace {
     fn lease(&self, installation: &RootIdentity) -> Result<InstallationLease, WireError> {
         let key = hex(&installation.installation_key());
         InstallationLease::open(&self.lease_root, &key).map_err(lease_error)
+    }
+
+    /// The record as written, when one exists. Unlike [`Self::lease_owner`]
+    /// this keeps the reference, so a caller can clear exactly what it read.
+    fn lease_record(&self, installation: &RootIdentity) -> Result<Option<LeaseRecord>, WireError> {
+        let key = hex(&installation.installation_key());
+        let Some(lease) =
+            InstallationLease::open_existing(&self.lease_root, &key).map_err(lease_error)?
+        else {
+            return Ok(None);
+        };
+        lease.read().map_err(lease_error)
     }
 
     /// The recorded owner of this installation, when a record exists.
@@ -1146,15 +1166,16 @@ impl Workspace {
     }
 
     /// Clear this catalog's record once its journal records neither pending
-    /// work nor an active generation for the installation. A foreign record is
-    /// never cleared.
-    fn release_if_idle(&mut self, selected: &SelectedInstallation) {
+    /// work nor an active generation for the installation, and only when the
+    /// record still carries `reference`. A record a newer operation wrote is
+    /// left intact.
+    fn release_if_idle(&mut self, selected: &SelectedInstallation, reference: Option<&str>) {
         let idle = match self.journal.root_state(&selected.data) {
             Ok(state) => state.pending.is_none() && state.active.is_none(),
             Err(_) => false,
         };
         if idle && let Ok(lease) = self.lease(&selected.installation) {
-            let _ = lease.release(&self.app_data);
+            let _ = lease.clear_if(&self.app_data, reference);
         }
     }
 
@@ -1230,23 +1251,35 @@ impl Workspace {
     /// work; the availability rule is owned by `docs/contracts/m1-clients.md`.
     fn recover_pending(&mut self) -> Result<Option<Operation>, WireError> {
         let selected = self.selected_pair()?;
-        // No pending operation means no native work. Answer before opening the
-        // port so a clean but unqualified root reports `None`, not a volume
-        // refusal.
         let state = self
             .journal
             .root_state(&selected.data)
             .map_err(deploy_error)?;
+        // Examine the lease before answering. A process can exit between
+        // claiming the lease and recording an operation, leaving a record and
+        // an idle journal; returning `None` without looking would block the
+        // installation forever.
+        let record = self.lease_record(&selected.installation)?;
+        if let Some(record) = &record
+            && record.app_data != self.app_data
+        {
+            return Err(foreign_deployment(&record.app_data));
+        }
         if state.pending.is_none() {
+            // No native work. An owned record with nothing active is exactly
+            // the claim-without-journal crash: clear only the reference this
+            // call read. An active generation keeps its record.
+            if state.active.is_none()
+                && let Some(record) = record
+                && let Ok(lease) = self.lease(&selected.installation)
+            {
+                let _ = lease.clear_if(&self.app_data, record.reference.as_deref());
+            }
             return Ok(None);
         }
-        // Recovery performs public writes, so only the recorded owner may run
-        // it.
-        if let Some(owner) = self.foreign_owner(&selected)? {
-            return Err(foreign_deployment(&owner));
-        }
         let mut port = self.native_effects(&selected)?;
-        self.claim_installation(&selected, "recovery".to_owned())?;
+        let reference = format!("recovery:{}", claim_nonce());
+        self.claim_installation(&selected, reference.clone())?;
         let recovered = marduk_core::recovery::recover_pending(
             &mut self.journal,
             &mut port,
@@ -1263,7 +1296,7 @@ impl Workspace {
                             format!("generation:{}", generation.get()),
                         );
                     }
-                    _ => self.release_if_idle(&selected),
+                    _ => self.release_if_idle(&selected, Some(&reference)),
                 }
                 Ok(status.map(operation))
             }
@@ -1742,6 +1775,18 @@ fn hex(bytes: &[u8]) -> String {
         write!(&mut output, "{byte:02x}").expect("writing to a string cannot fail");
     }
     output
+}
+
+/// A reference unique to one operation call, so clearing it cannot remove a
+/// record a newer call wrote. The process id separates catalogs, and the
+/// counter keeps two calls in one process distinct even within one clock tick.
+fn claim_nonce() -> String {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{nanos}-{sequence}", std::process::id())
 }
 
 #[cfg(test)]
